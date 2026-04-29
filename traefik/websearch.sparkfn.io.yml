@@ -1,7 +1,7 @@
 http:
   routers:
     websearch-sparkfn:
-      rule: "Host(`websearch.sparkfn.io`)"
+      rule: "Host(`websearch.sparkfn.io`) && (Path(`/search`) || Path(`/health`) || PathPrefix(`/docs`) || Path(`/openapi.json`))"
       entryPoints:
         - websecure
       service: websearch-sparkfn
@@ -9,7 +9,7 @@ http:
         certResolver: cloudflare
 
     websearch-sparkfn-http:
-      rule: "Host(`websearch.sparkfn.io`)"
+      rule: "Host(`websearch.sparkfn.io`) && (Path(`/search`) || Path(`/health`) || PathPrefix(`/docs`) || Path(`/openapi.json`))"
       entryPoints:
         - web
       service: websearch-sparkfn

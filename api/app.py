@@ -10,6 +10,7 @@ import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Security
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
+from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import JSONResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
@@ -28,6 +29,8 @@ app = FastAPI(
     title="AI Search API",
     version="0.1.0",
     description="Searches SearXNG, extracts candidate pages through Crawl4AI, and reranks extracted content.",
+    docs_url=None,
+    openapi_url=None,
 )
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
@@ -167,6 +170,18 @@ def health():
     )
 
 
+@app.get("/docs", include_in_schema=False)
+def docs(request: Request):
+    title = "AI Crawl API" if api_surface(request) == "crawl" else "AI Search API"
+    return get_swagger_ui_html(openapi_url="/openapi.json", title=f"{title} - Swagger UI")
+
+
+@app.get("/openapi.json", include_in_schema=False)
+def openapi(request: Request):
+    surface = api_surface(request)
+    return filtered_openapi(surface)
+
+
 @app.post("/search", response_model=SearchEnvelope, responses=SEARCH_ERROR_RESPONSES, dependencies=[Depends(require_api_key)])
 async def search(request: SearchRequest):
     async with httpx.AsyncClient(timeout=60, follow_redirects=False) as client:
@@ -302,6 +317,24 @@ def build_crawl_payload(request: CrawlRequest):
     if request.extraction_config:
         payload["extraction_config"] = request.extraction_config
     return payload
+
+
+def api_surface(request: Request):
+    host = request.headers.get("host", "").split(":", 1)[0].lower()
+    if host == "webcrawl.sparkfn.io":
+        return "crawl"
+    return "search"
+
+
+def filtered_openapi(surface: Literal["search", "crawl"]):
+    schema = app.openapi()
+    allowed_paths = {"crawl": {"/crawl"}, "search": {"/health", "/search"}}[surface]
+    schema = dict(schema)
+    schema["paths"] = {path: value for path, value in schema["paths"].items() if path in allowed_paths}
+    if surface == "crawl":
+        schema["title"] = "AI Crawl API"
+        schema["description"] = "Extracts public web pages through an authenticated Crawl4AI-backed API."
+    return schema
 
 
 def extract_crawl_content(payload, preferred_format: str = "markdown"):

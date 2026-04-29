@@ -44,8 +44,8 @@ docker compose up -d --build
 
 ## OpenAPI / Swagger
 
-- Swagger UI: `https://websearch.sparkfn.io/docs` or `https://webcrawl.sparkfn.io/docs`
-- OpenAPI JSON: `https://websearch.sparkfn.io/openapi.json` or `https://webcrawl.sparkfn.io/openapi.json`
+- Swagger UI: `https://websearch.sparkfn.io/docs` shows search endpoints; `https://webcrawl.sparkfn.io/docs` shows crawl endpoints.
+- OpenAPI JSON: `https://websearch.sparkfn.io/openapi.json` shows search endpoints; `https://webcrawl.sparkfn.io/openapi.json` shows crawl endpoints.
 
 All API responses use a consistent envelope.
 
@@ -73,7 +73,7 @@ Error:
 
 ## Authentication
 
-`/health`, `/docs`, and `/openapi.json` are public. `/search` requires:
+`/health`, `/docs`, and `/openapi.json` are public on `websearch.sparkfn.io`. `/docs` and `/openapi.json` are public on `webcrawl.sparkfn.io`. `/search` and `/crawl` require:
 
 ```http
 X-API-Key: <WEBSEARCH_API_KEY>
