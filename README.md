@@ -44,8 +44,8 @@ docker compose up -d --build
 
 ## OpenAPI / Swagger
 
-- Swagger UI: `https://websearch.sparkfn.io/docs`
-- OpenAPI JSON: `https://websearch.sparkfn.io/openapi.json`
+- Swagger UI: `https://websearch.sparkfn.io/docs` or `https://webcrawl.sparkfn.io/docs`
+- OpenAPI JSON: `https://websearch.sparkfn.io/openapi.json` or `https://webcrawl.sparkfn.io/openapi.json`
 
 All API responses use a consistent envelope.
 

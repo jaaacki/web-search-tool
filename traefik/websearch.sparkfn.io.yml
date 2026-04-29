@@ -18,7 +18,7 @@ http:
       priority: 100
 
     webcrawl-sparkfn:
-      rule: "Host(`webcrawl.sparkfn.io`) && Path(`/crawl`)"
+      rule: "Host(`webcrawl.sparkfn.io`) && (Path(`/crawl`) || Path(`/docs`) || Path(`/openapi.json`))"
       entryPoints:
         - websecure
       service: websearch-sparkfn
@@ -26,7 +26,7 @@ http:
         certResolver: cloudflare
 
     webcrawl-sparkfn-http:
-      rule: "Host(`webcrawl.sparkfn.io`) && Path(`/crawl`)"
+      rule: "Host(`webcrawl.sparkfn.io`) && (Path(`/crawl`) || Path(`/docs`) || Path(`/openapi.json`))"
       entryPoints:
         - web
       service: websearch-sparkfn
