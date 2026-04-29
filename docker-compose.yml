@@ -1,36 +1,43 @@
 services:
   searxng:
     image: searxng/searxng:latest
-    ports:
-      - "127.0.0.1:8080:8080"
+    expose:
+      - "8080"
     volumes:
       - ./searxng:/etc/searxng:rw
+      - ./data/searxng:/var/cache/searxng:rw
     environment:
-      - SEARXNG_BASE_URL=http://localhost:8080/
+      - SEARXNG_BASE_URL=https://websearch.sparkfn.io/searxng/
       - SEARXNG_SECRET=${SEARXNG_SECRET:?set SEARXNG_SECRET in .env}
     restart: unless-stopped
+    networks:
+      - internal
 
   crawl4ai:
     image: unclecode/crawl4ai:latest
-    ports:
-      - "127.0.0.1:11235:11235"
+    expose:
+      - "11235"
     env_file:
-      - ./crawl4ai/.llm.env
+      - ./data/crawl4ai/.llm.env
     shm_size: "2gb"
     restart: unless-stopped
+    networks:
+      - internal
 
   reranker:
     build: ./reranker
-    ports:
-      - "127.0.0.1:7997:7997"
+    expose:
+      - "7997"
     environment:
       - MODEL_ID=${RERANKER_MODEL_ID:-lexical-idf}
     restart: unless-stopped
+    networks:
+      - internal
 
   api:
     build: ./api
-    ports:
-      - "127.0.0.1:8000:8000"
+    expose:
+      - "8000"
     environment:
       - SEARXNG_URL=http://searxng:8080
       - CRAWL4AI_URL=http://crawl4ai:11235
@@ -45,3 +52,25 @@ services:
       - crawl4ai
       - reranker
     restart: unless-stopped
+    networks:
+      - internal
+      - traefik
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=traefik"
+      - "traefik.http.routers.websearchsparkfnio-http.rule=Host(`websearch.sparkfn.io`)"
+      - "traefik.http.routers.websearchsparkfnio-http.entrypoints=web"
+      - "traefik.http.middlewares.websearchsparkfnio-https-redirect.redirectscheme.scheme=https"
+      - "traefik.http.routers.websearchsparkfnio-http.middlewares=websearchsparkfnio-https-redirect"
+      - "traefik.http.routers.websearchsparkfnio.rule=Host(`websearch.sparkfn.io`)"
+      - "traefik.http.routers.websearchsparkfnio.entrypoints=web,websecure"
+      - "traefik.http.routers.websearchsparkfnio.service=websearchsparkfnio-service"
+      - "traefik.http.routers.websearchsparkfnio.tls.certresolver=production"
+      - "traefik.http.services.websearchsparkfnio-service.loadbalancer.server.port=8000"
+      - "traefik.http.services.websearchsparkfnio-service.loadbalancer.server.scheme=http"
+      - "traefik.http.services.websearchsparkfnio-service.loadbalancer.passhostheader=true"
+
+networks:
+  internal:
+  traefik:
+    external: true

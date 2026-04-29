@@ -1,32 +1,43 @@
 # AI web search stack
 
-Self-hosted stack:
+Self-hosted stack for `websearch.sparkfn.io`:
 
-- `searxng`: finds candidate URLs.
-- `crawl4ai`: dedicated Crawl4AI container for this stack.
-- `reranker`: lightweight lexical reranker API.
-- `api`: OpenAPI/Swagger-compatible search API exposed on `127.0.0.1:8000`.
+- `api`: OpenAPI/Swagger-compatible search API exposed through Traefik.
+- `searxng`: internal URL discovery service.
+- `crawl4ai`: internal page extraction service.
+- `reranker`: internal lightweight lexical reranker API.
 
-All published ports bind to `127.0.0.1` by default. Do not expose these services directly to the internet without authentication and a reverse proxy.
+Only `api` is routed by Traefik. Internal services use Docker `expose` only and are not host-published.
 
-## Start
+## Required files
 
-Create `.env` first:
+Create `.env`:
 
 ```bash
 cp .env.example .env
 ```
 
-Edit `SEARXNG_SECRET` to a long random value, then start:
+Edit `SEARXNG_SECRET` to a long random value.
+
+Create runtime data/config directories:
 
 ```bash
-docker compose up --build
+mkdir -p data/searxng data/crawl4ai
+cp data.crawl4ai.llm.env.example data/crawl4ai/.llm.env
+```
+
+All persistent/runtime data belongs under `./data`. The Compose file does not use named Docker volumes.
+
+## Deploy
+
+```bash
+docker compose up -d --build
 ```
 
 ## OpenAPI / Swagger
 
-- Swagger UI: `http://localhost:8000/docs`
-- OpenAPI JSON: `http://localhost:8000/openapi.json`
+- Swagger UI: `https://websearch.sparkfn.io/docs`
+- OpenAPI JSON: `https://websearch.sparkfn.io/openapi.json`
 
 All API responses use a consistent envelope.
 
@@ -55,11 +66,11 @@ Error:
 ## API endpoint
 
 ```bash
-curl 'http://localhost:8000/health'
+curl 'https://websearch.sparkfn.io/health'
 ```
 
 ```bash
-curl -X POST 'http://localhost:8000/search' \
+curl -X POST 'https://websearch.sparkfn.io/search' \
   -H 'content-type: application/json' \
   -d '{"query":"open source web search engines", "max_results": 5}'
 ```
@@ -67,35 +78,19 @@ curl -X POST 'http://localhost:8000/search' \
 Shortcut:
 
 ```bash
-curl 'http://localhost:8000/search?q=open%20source%20web%20search%20engines'
+curl 'https://websearch.sparkfn.io/search?q=open%20source%20web%20search%20engines'
 ```
 
-## Direct component endpoints
+## Local component debugging
 
-These are bound to localhost for debugging only.
-
-### SearXNG
+Internal services are not published to host ports. To debug them on the server, exec through Compose:
 
 ```bash
-curl 'http://localhost:8080/search?q=open%20source%20search&format=json'
-```
-
-### Crawl4AI
-
-```bash
-curl -X POST 'http://localhost:11235/crawl' \
-  -H 'content-type: application/json' \
-  -d '{"urls":["https://example.com"]}'
-```
-
-### Reranker
-
-```bash
-curl -X POST 'http://localhost:7997/rerank' \
-  -H 'content-type: application/json' \
-  -d '{"query":"web search", "documents":["SearXNG is a metasearch engine", "Bananas are yellow"], "top_k": 1}'
+docker compose exec searxng wget -qO- 'http://localhost:8080/search?q=test&format=json'
+docker compose exec crawl4ai wget -qO- 'http://localhost:11235/monitor/health'
+docker compose exec reranker python -c 'print("reranker container ok")'
 ```
 
 ## Crawl4AI config
 
-This stack has its own `crawl4ai/.llm.env`. Add provider keys there only if you use Crawl4AI features that require LLM credentials.
+This stack uses `data/crawl4ai/.llm.env`. Add provider keys there only if you use Crawl4AI features that require LLM credentials.
