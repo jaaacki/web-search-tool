@@ -76,12 +76,15 @@ class SearchEnvelope(BaseModel):
     data: SearchData
 
 
-ERROR_RESPONSES = {
-    401: {"model": ErrorEnvelope},
-    400: {"model": ErrorEnvelope},
-    422: {"model": ErrorEnvelope},
-    502: {"model": ErrorEnvelope},
-    500: {"model": ErrorEnvelope},
+SEARCH_ERROR_RESPONSES = {
+    401: {"model": ErrorEnvelope, "description": "Missing or invalid API key"},
+    422: {"model": ErrorEnvelope, "description": "Request validation failed"},
+    502: {"model": ErrorEnvelope, "description": "Upstream search/crawl service failed"},
+    500: {"model": ErrorEnvelope, "description": "Internal server error"},
+}
+
+HEALTH_ERROR_RESPONSES = {
+    500: {"model": ErrorEnvelope, "description": "Internal server error"},
 }
 
 
@@ -121,7 +124,7 @@ async def unhandled_error_handler(_: Request, exc: Exception):
     return error_response(500, "internal_error", "Internal server error", {"type": type(exc).__name__})
 
 
-@app.get("/health", response_model=HealthEnvelope, responses=ERROR_RESPONSES)
+@app.get("/health", response_model=HealthEnvelope, responses=HEALTH_ERROR_RESPONSES)
 def health():
     return HealthEnvelope(
         data=HealthData(
@@ -134,7 +137,7 @@ def health():
     )
 
 
-@app.post("/search", response_model=SearchEnvelope, responses=ERROR_RESPONSES, dependencies=[Depends(require_api_key)])
+@app.post("/search", response_model=SearchEnvelope, responses=SEARCH_ERROR_RESPONSES, dependencies=[Depends(require_api_key)])
 async def search(request: SearchRequest):
     async with httpx.AsyncClient(timeout=60, follow_redirects=False) as client:
         candidates = await search_searxng(client, request.query, request.candidates)
@@ -157,7 +160,7 @@ async def search(request: SearchRequest):
     return search_response(request.query, ranked)
 
 
-@app.get("/search", response_model=SearchEnvelope, responses=ERROR_RESPONSES, dependencies=[Depends(require_api_key)])
+@app.get("/search", response_model=SearchEnvelope, responses=SEARCH_ERROR_RESPONSES, dependencies=[Depends(require_api_key)])
 async def search_get(
     q: str = Query(min_length=1),
     max_results: int = Query(default=MAX_RESULTS, ge=1, le=20),
