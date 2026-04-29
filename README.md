@@ -1,13 +1,13 @@
 # AI web search stack
 
-Self-hosted stack for `websearch.sparkfn.io`:
+Self-hosted stack for `websearch.sparkfn.io` and controlled headless crawling at `webcrawl.sparkfn.io`:
 
-- `api`: OpenAPI/Swagger-compatible search API exposed through Traefik.
+- `api`: OpenAPI/Swagger-compatible search and crawl API exposed through Traefik.
 - `searxng`: internal URL discovery service.
-- `crawl4ai`: internal page extraction service.
+- `crawl4ai`: internal page extraction service used by the API.
 - `reranker`: internal lightweight lexical reranker API.
 
-Only `api` is routed by Traefik through `traefik/websearch.sparkfn.io.yml`. Internal services use Docker `expose` only and are not host-published.
+`api` is routed by Traefik through `traefik/websearch.sparkfn.io.yml`. `webcrawl.sparkfn.io` only routes `POST /crawl` to the API; Crawl4AI itself remains internal-only. Internal services use Docker `expose` only and are not host-published.
 
 ## Required files
 
@@ -81,7 +81,7 @@ X-API-Key: <WEBSEARCH_API_KEY>
 
 Invalid or missing API keys return the same error envelope format with `code: "unauthorized"`.
 
-## API endpoint
+## API endpoints
 
 ```bash
 curl 'https://websearch.sparkfn.io/health'
@@ -94,12 +94,30 @@ curl -X POST 'https://websearch.sparkfn.io/search' \
   -d '{"query":"open source web search engines", "max_results": 5}'
 ```
 
-Shortcut:
+Search shortcut:
 
 ```bash
 curl 'https://websearch.sparkfn.io/search?q=open%20source%20web%20search%20engines' \
   -H 'X-API-Key: <WEBSEARCH_API_KEY>'
 ```
+
+Headless crawl:
+
+```bash
+curl -X POST 'https://webcrawl.sparkfn.io/crawl' \
+  -H 'content-type: application/json' \
+  -H 'X-API-Key: <WEBSEARCH_API_KEY>' \
+  -d '{"url":"https://example.com", "content_format":"markdown"}'
+```
+
+`/crawl` supports these Crawl4AI pass-through fields while keeping Crawl4AI private:
+
+- `content_format`: `markdown`, `cleaned_html`, `text`, or `html`.
+- `cache_mode`: optional Crawl4AI cache mode value.
+- `browser_config`: optional Crawl4AI browser config object.
+- `crawler_config`: optional Crawl4AI crawler config object.
+- `extraction_config`: optional Crawl4AI extraction config object.
+- `crawl_options`: optional top-level Crawl4AI options object.
 
 ## Local component debugging
 

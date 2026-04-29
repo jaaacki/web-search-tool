@@ -76,10 +76,40 @@ class SearchEnvelope(BaseModel):
     data: SearchData
 
 
+CrawlOptionValue = str | int | float | bool | None | list[Any] | dict[str, Any]
+
+
+class CrawlRequest(BaseModel):
+    url: str = Field(min_length=1, examples=["https://example.com"])
+    content_format: Literal["markdown", "cleaned_html", "text", "html"] = "markdown"
+    cache_mode: str | None = None
+    browser_config: dict[str, Any] = Field(default_factory=dict)
+    crawler_config: dict[str, Any] = Field(default_factory=dict)
+    extraction_config: dict[str, Any] = Field(default_factory=dict)
+    crawl_options: dict[str, CrawlOptionValue] = Field(default_factory=dict)
+
+
+class CrawlData(BaseModel):
+    url: str
+    content: str
+
+
+class CrawlEnvelope(BaseModel):
+    ok: Literal[True] = True
+    data: CrawlData
+
+
 SEARCH_ERROR_RESPONSES = {
     401: {"model": ErrorEnvelope, "description": "Missing or invalid API key"},
     422: {"model": ErrorEnvelope, "description": "Request validation failed"},
     502: {"model": ErrorEnvelope, "description": "Upstream search/crawl service failed"},
+    500: {"model": ErrorEnvelope, "description": "Internal server error"},
+}
+
+CRAWL_ERROR_RESPONSES = {
+    401: {"model": ErrorEnvelope, "description": "Missing or invalid API key"},
+    422: {"model": ErrorEnvelope, "description": "Request validation failed"},
+    502: {"model": ErrorEnvelope, "description": "Upstream crawl service failed"},
     500: {"model": ErrorEnvelope, "description": "Internal server error"},
 }
 
@@ -169,6 +199,14 @@ async def search_get(
     return await search(SearchRequest(query=q, max_results=max_results, candidates=candidates))
 
 
+@app.post("/crawl", response_model=CrawlEnvelope, responses=CRAWL_ERROR_RESPONSES, dependencies=[Depends(require_api_key)])
+async def crawl(request: CrawlRequest):
+    async with httpx.AsyncClient(timeout=90, follow_redirects=False) as client:
+        result = await crawl_direct_url(client, request)
+
+    return CrawlEnvelope(data=CrawlData(url=result["url"], content=result["content"]))
+
+
 async def search_searxng(client: httpx.AsyncClient, query: str, limit: int):
     try:
         response = await client.get(
@@ -211,14 +249,8 @@ async def crawl_url(client: httpx.AsyncClient, result: dict):
         return None
 
     try:
-        response = await client.post(
-            f"{CRAWL4AI_URL}/crawl",
-            json={"urls": [result["url"]]},
-            timeout=90,
-        )
-        response.raise_for_status()
-        payload = response.json()
-    except (httpx.HTTPError, ValueError):
+        payload = await call_crawl4ai(client, {"urls": [result["url"]]})
+    except AppError:
         return None
 
     crawled_url = extract_crawled_url(payload)
@@ -231,10 +263,51 @@ async def crawl_url(client: httpx.AsyncClient, result: dict):
     return {**result, "content": content}
 
 
-def extract_crawl_content(payload):
+async def crawl_direct_url(client: httpx.AsyncClient, request: CrawlRequest):
+    if not await is_allowed_public_url(request.url):
+        raise AppError(422, "invalid_url", "URL must be a public http(s) URL")
+
+    payload = await call_crawl4ai(client, build_crawl_payload(request))
+    crawled_url = extract_crawled_url(payload) or request.url
+    if not await is_allowed_public_url(crawled_url):
+        raise AppError(422, "invalid_crawled_url", "Crawled URL must be a public http(s) URL")
+
+    content = extract_crawl_content(payload, request.content_format)
+    if not content:
+        raise AppError(502, "empty_crawl_result", "Crawl4AI did not return extractable content")
+
+    return {"url": crawled_url, "content": content}
+
+
+async def call_crawl4ai(client: httpx.AsyncClient, payload: dict[str, Any]):
+    try:
+        response = await client.post(f"{CRAWL4AI_URL}/crawl", json=payload, timeout=90)
+        response.raise_for_status()
+        return response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise AppError(502, "crawl4ai_error", "Crawl4AI crawl failed", {"error": str(exc)}) from exc
+
+
+def build_crawl_payload(request: CrawlRequest):
+    payload: dict[str, Any] = {"urls": [request.url]}
+    for key, value in request.crawl_options.items():
+        if key not in {"url", "urls"}:
+            payload[key] = value
+    if request.cache_mode is not None:
+        payload["cache_mode"] = request.cache_mode
+    if request.browser_config:
+        payload["browser_config"] = request.browser_config
+    if request.crawler_config:
+        payload["crawler_config"] = request.crawler_config
+    if request.extraction_config:
+        payload["extraction_config"] = request.extraction_config
+    return payload
+
+
+def extract_crawl_content(payload, preferred_format: str = "markdown"):
     if isinstance(payload, list):
         for item in payload:
-            content = extract_crawl_content(item)
+            content = extract_crawl_content(item, preferred_format)
             if content:
                 return content
         return ""
@@ -242,7 +315,8 @@ def extract_crawl_content(payload):
     if not isinstance(payload, dict):
         return ""
 
-    for key in ("markdown", "cleaned_html", "text", "content", "html"):
+    format_keys = [preferred_format, "markdown", "cleaned_html", "text", "content", "html"]
+    for key in dict.fromkeys(format_keys):
         value = payload.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
@@ -252,7 +326,7 @@ def extract_crawl_content(payload):
                 return nested.strip()
 
     for key in ("result", "results", "data"):
-        content = extract_crawl_content(payload.get(key))
+        content = extract_crawl_content(payload.get(key), preferred_format)
         if content:
             return content
 

@@ -17,6 +17,23 @@ http:
         - websearch-sparkfn-redirect
       priority: 100
 
+    webcrawl-sparkfn:
+      rule: "Host(`webcrawl.sparkfn.io`) && Path(`/crawl`)"
+      entryPoints:
+        - websecure
+      service: websearch-sparkfn
+      tls:
+        certResolver: cloudflare
+
+    webcrawl-sparkfn-http:
+      rule: "Host(`webcrawl.sparkfn.io`) && Path(`/crawl`)"
+      entryPoints:
+        - web
+      service: websearch-sparkfn
+      middlewares:
+        - websearch-sparkfn-redirect
+      priority: 100
+
   middlewares:
     websearch-sparkfn-redirect:
       redirectScheme:
