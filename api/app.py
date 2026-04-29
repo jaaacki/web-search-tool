@@ -617,7 +617,13 @@ def api_surface(request: Request):
 def filtered_openapi(surface: Literal["search", "crawl"]):
     schema = deepcopy(app.openapi())
     allowed_paths = {"crawl": {"/crawl"}, "search": {"/health", "/search"}}[surface]
+    allowed_components = {
+        "crawl": {"CrawlData", "CrawlEnvelope", "CrawlRequest", "ErrorDetail", "ErrorEnvelope", "HTTPValidationError", "ValidationError"},
+        "search": {"ErrorDetail", "ErrorEnvelope", "HTTPValidationError", "HealthData", "HealthEnvelope", "SearchData", "SearchEnvelope", "SearchRequest", "SearchResult", "ValidationError"},
+    }[surface]
     schema["paths"] = {path: value for path, value in schema["paths"].items() if path in allowed_paths}
+    schemas = schema.get("components", {}).get("schemas", {})
+    schema.get("components", {})["schemas"] = {name: value for name, value in schemas.items() if name in allowed_components}
     if surface == "crawl":
         schema["info"]["title"] = "SparkFN Web Crawl API"
         schema["info"]["description"] = (
