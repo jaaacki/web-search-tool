@@ -1,0 +1,29 @@
+http:
+  routers:
+    websearch-sparkfn:
+      rule: "Host(`websearch.sparkfn.io`)"
+      entryPoints:
+        - websecure
+      service: websearch-sparkfn
+      tls:
+        certResolver: cloudflare
+
+    websearch-sparkfn-http:
+      rule: "Host(`websearch.sparkfn.io`)"
+      entryPoints:
+        - web
+      service: websearch-sparkfn
+      middlewares:
+        - websearch-sparkfn-redirect
+      priority: 100
+
+  middlewares:
+    websearch-sparkfn-redirect:
+      redirectScheme:
+        scheme: https
+
+  services:
+    websearch-sparkfn:
+      loadBalancer:
+        servers:
+          - url: "http://websearch-sparkfn-api:8000"

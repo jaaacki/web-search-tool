@@ -7,7 +7,7 @@ Self-hosted stack for `websearch.sparkfn.io`:
 - `crawl4ai`: internal page extraction service.
 - `reranker`: internal lightweight lexical reranker API.
 
-Only `api` is routed by Traefik. Internal services use Docker `expose` only and are not host-published.
+Only `api` is routed by Traefik through `traefik/websearch.sparkfn.io.yml`. Internal services use Docker `expose` only and are not host-published.
 
 ## Required files
 
@@ -29,6 +29,14 @@ cp data.crawl4ai.llm.env.example data/crawl4ai/.llm.env
 All persistent/runtime data belongs under `./data`. The Compose file does not use named Docker volumes.
 
 ## Deploy
+
+Install/update the Traefik dynamic config on the server:
+
+```bash
+cp traefik/websearch.sparkfn.io.yml /home/docker/traefik/dynamic/websearch.sparkfn.io.yml
+```
+
+Then start the stack:
 
 ```bash
 docker compose up -d --build
