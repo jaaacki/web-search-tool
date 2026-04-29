@@ -17,7 +17,7 @@ Create `.env`:
 cp .env.example .env
 ```
 
-Edit `SEARXNG_SECRET` to a long random value.
+Edit `SEARXNG_SECRET` and `WEBSEARCH_API_KEY` to long random values.
 
 Create runtime data/config directories:
 
@@ -71,6 +71,16 @@ Error:
 }
 ```
 
+## Authentication
+
+`/health`, `/docs`, and `/openapi.json` are public. `/search` requires:
+
+```http
+X-API-Key: <WEBSEARCH_API_KEY>
+```
+
+Invalid or missing API keys return the same error envelope format with `code: "unauthorized"`.
+
 ## API endpoint
 
 ```bash
@@ -80,13 +90,15 @@ curl 'https://websearch.sparkfn.io/health'
 ```bash
 curl -X POST 'https://websearch.sparkfn.io/search' \
   -H 'content-type: application/json' \
+  -H 'X-API-Key: <WEBSEARCH_API_KEY>' \
   -d '{"query":"open source web search engines", "max_results": 5}'
 ```
 
 Shortcut:
 
 ```bash
-curl 'https://websearch.sparkfn.io/search?q=open%20source%20web%20search%20engines'
+curl 'https://websearch.sparkfn.io/search?q=open%20source%20web%20search%20engines' \
+  -H 'X-API-Key: <WEBSEARCH_API_KEY>'
 ```
 
 ## Local component debugging

@@ -48,6 +48,7 @@ services:
       - CHUNK_SIZE=${CHUNK_SIZE:-1800}
       - CHUNKS_PER_PAGE=${CHUNKS_PER_PAGE:-3}
       - CRAWL_CONCURRENCY=${CRAWL_CONCURRENCY:-3}
+      - WEBSEARCH_API_KEY=${WEBSEARCH_API_KEY:?set WEBSEARCH_API_KEY in .env}
     depends_on:
       - searxng
       - crawl4ai

@@ -1,15 +1,17 @@
 import asyncio
 import ipaddress
 import os
+import secrets
 import socket
 from typing import Any, Literal
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Security
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from fastapi.encoders import jsonable_encoder
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
 SEARXNG_URL = os.getenv("SEARXNG_URL", "http://searxng:8080").rstrip("/")
@@ -20,12 +22,14 @@ MAX_RESULTS = int(os.getenv("MAX_RESULTS", "5"))
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1800"))
 CHUNKS_PER_PAGE = int(os.getenv("CHUNKS_PER_PAGE", "3"))
 CRAWL_CONCURRENCY = int(os.getenv("CRAWL_CONCURRENCY", "3"))
+WEBSEARCH_API_KEY = os.getenv("WEBSEARCH_API_KEY", "")
 
 app = FastAPI(
     title="AI Search API",
     version="0.1.0",
     description="Searches SearXNG, extracts candidate pages through Crawl4AI, and reranks extracted content.",
 )
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
 class ErrorDetail(BaseModel):
@@ -73,6 +77,7 @@ class SearchEnvelope(BaseModel):
 
 
 ERROR_RESPONSES = {
+    401: {"model": ErrorEnvelope},
     400: {"model": ErrorEnvelope},
     422: {"model": ErrorEnvelope},
     502: {"model": ErrorEnvelope},
@@ -86,6 +91,13 @@ class AppError(Exception):
         self.code = code
         self.message = message
         self.details = details
+
+
+async def require_api_key(x_api_key: str | None = Security(api_key_header)):
+    if not WEBSEARCH_API_KEY:
+        raise AppError(500, "api_key_not_configured", "WEBSEARCH_API_KEY is not configured")
+    if not x_api_key or not secrets.compare_digest(x_api_key, WEBSEARCH_API_KEY):
+        raise AppError(401, "unauthorized", "A valid X-API-Key header is required")
 
 
 @app.exception_handler(AppError)
@@ -122,7 +134,7 @@ def health():
     )
 
 
-@app.post("/search", response_model=SearchEnvelope, responses=ERROR_RESPONSES)
+@app.post("/search", response_model=SearchEnvelope, responses=ERROR_RESPONSES, dependencies=[Depends(require_api_key)])
 async def search(request: SearchRequest):
     async with httpx.AsyncClient(timeout=60, follow_redirects=False) as client:
         candidates = await search_searxng(client, request.query, request.candidates)
@@ -145,7 +157,7 @@ async def search(request: SearchRequest):
     return search_response(request.query, ranked)
 
 
-@app.get("/search", response_model=SearchEnvelope, responses=ERROR_RESPONSES)
+@app.get("/search", response_model=SearchEnvelope, responses=ERROR_RESPONSES, dependencies=[Depends(require_api_key)])
 async def search_get(
     q: str = Query(min_length=1),
     max_results: int = Query(default=MAX_RESULTS, ge=1, le=20),
