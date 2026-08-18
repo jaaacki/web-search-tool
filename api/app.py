@@ -337,7 +337,7 @@ async def unhandled_error_handler(_: Request, exc: Exception):
     responses=HEALTH_ERROR_RESPONSES,
     summary="Check service health",
     description=(
-        "Public diagnostic endpoint for the search API host. It confirms the API process is running and reports the internal "
+        "Public diagnostic endpoint for the search and crawl API hosts. It confirms the API process is running and reports the internal "
         "service URLs configured for SearXNG, Crawl4AI, and the reranker. Do not use this endpoint for search or crawl work."
     ),
     operation_id="check_health",
@@ -619,9 +619,9 @@ def api_surface(request: Request):
 
 def filtered_openapi(surface: Literal["search", "crawl"]):
     schema = deepcopy(app.openapi())
-    allowed_paths = {"crawl": {"/crawl"}, "search": {"/health", "/search"}}[surface]
+    allowed_paths = {"crawl": {"/crawl", "/health"}, "search": {"/health", "/search"}}[surface]
     allowed_components = {
-        "crawl": {"CrawlData", "CrawlEnvelope", "CrawlRequest", "ErrorDetail", "ErrorEnvelope", "HTTPValidationError", "ValidationError"},
+        "crawl": {"CrawlData", "CrawlEnvelope", "CrawlRequest", "ErrorDetail", "ErrorEnvelope", "HTTPValidationError", "HealthData", "HealthEnvelope", "ValidationError"},
         "search": {"ErrorDetail", "ErrorEnvelope", "HTTPValidationError", "HealthData", "HealthEnvelope", "SearchData", "SearchEnvelope", "SearchRequest", "SearchResult", "ValidationError"},
     }[surface]
     schema["paths"] = {path: value for path, value in schema["paths"].items() if path in allowed_paths}
@@ -642,7 +642,7 @@ def filtered_openapi(surface: Literal["search", "crawl"]):
         schema["x-ai-usage"] = {
             "when_to_use": "Use when you already know the exact URL and need extracted page content.",
             "when_not_to_use": "Do not use for web search, discovery, private network probing, or arbitrary Crawl4AI administration.",
-            "authentication": "Send X-API-Key with every /crawl request.",
+            "authentication": "Send X-API-Key with every /crawl request. /health is public.",
             "recommended_request": {"url": "https://example.com", "content_format": "markdown"},
             "recovery": {
                 "401": "Add or correct X-API-Key.",

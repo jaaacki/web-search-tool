@@ -73,7 +73,7 @@ Error:
 
 ## Authentication
 
-`/health`, `/docs`, and `/openapi.json` are public on `websearch.sparkfn.io`. `/docs` and `/openapi.json` are public on `webcrawl.sparkfn.io`. `/search` and `/crawl` require:
+`/health`, `/docs`, and `/openapi.json` are public on both `websearch.sparkfn.io` and `webcrawl.sparkfn.io`. `/search` and `/crawl` require:
 
 ```http
 X-API-Key: <WEBSEARCH_API_KEY>
@@ -85,6 +85,7 @@ Invalid or missing API keys return the same error envelope format with `code: "u
 
 ```bash
 curl 'https://websearch.sparkfn.io/health'
+curl 'https://webcrawl.sparkfn.io/health'
 ```
 
 ```bash
