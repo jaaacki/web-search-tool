@@ -19,6 +19,11 @@ services:
       - "11235"
     env_file:
       - ./data/crawl4ai/.llm.env
+    environment:
+      # crawl4ai >=0.9 binds gunicorn to 127.0.0.1 by default; the api
+      # container must reach it over the internal network.
+      - GUNICORN_BIND=0.0.0.0:11235
+      - CRAWL4AI_API_TOKEN=${CRAWL4AI_API_TOKEN:?set CRAWL4AI_API_TOKEN in .env}
     shm_size: "2gb"
     restart: unless-stopped
     networks:
@@ -48,6 +53,7 @@ services:
       - CHUNK_SIZE=${CHUNK_SIZE:-1800}
       - CHUNKS_PER_PAGE=${CHUNKS_PER_PAGE:-3}
       - CRAWL_CONCURRENCY=${CRAWL_CONCURRENCY:-3}
+      - CRAWL4AI_API_TOKEN=${CRAWL4AI_API_TOKEN:?set CRAWL4AI_API_TOKEN in .env}
       - WEBSEARCH_API_KEY=${WEBSEARCH_API_KEY:?set WEBSEARCH_API_KEY in .env}
     depends_on:
       - searxng

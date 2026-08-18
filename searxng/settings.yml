@@ -11,3 +11,14 @@ search:
   formats:
     - html
     - json
+
+# Issue pc-tools#980: the default engine set (brave, duckduckgo, google,
+# startpage, qwant, karmasearch) was entirely blocked/CAPTCHA'd from this
+# host's egress IP, so every search returned 200 with zero results until a
+# restart cleared the suspensions. bing and mojeek verified working from
+# this IP on 2026-08-18; enabled as resilient fallbacks.
+engines:
+  - name: bing
+    disabled: false
+  - name: mojeek
+    disabled: false
