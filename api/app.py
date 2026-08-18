@@ -18,6 +18,9 @@ from pydantic import BaseModel, Field
 
 SEARXNG_URL = os.getenv("SEARXNG_URL", "http://searxng:8080").rstrip("/")
 CRAWL4AI_URL = os.getenv("CRAWL4AI_URL", "http://crawl4ai:11235").rstrip("/")
+# crawl4ai >=0.9 refuses to bind non-loopback without an API token; send it as a bearer header.
+CRAWL4AI_API_TOKEN = os.getenv("CRAWL4AI_API_TOKEN", "")
+CRAWL4AI_HEADERS = {"Authorization": "Bearer " + CRAWL4AI_API_TOKEN} if CRAWL4AI_API_TOKEN else {}
 RERANKER_URL = os.getenv("RERANKER_URL", "http://reranker:7997").rstrip("/")
 SEARCH_CANDIDATES = int(os.getenv("SEARCH_CANDIDATES", "10"))
 MAX_RESULTS = int(os.getenv("MAX_RESULTS", "5"))
@@ -584,7 +587,7 @@ async def crawl_direct_url(client: httpx.AsyncClient, request: CrawlRequest):
 
 async def call_crawl4ai(client: httpx.AsyncClient, payload: dict[str, Any]):
     try:
-        response = await client.post(f"{CRAWL4AI_URL}/crawl", json=payload, timeout=90)
+        response = await client.post(f"{CRAWL4AI_URL}/crawl", json=payload, timeout=90, headers=CRAWL4AI_HEADERS)
         response.raise_for_status()
         return response.json()
     except (httpx.HTTPError, ValueError) as exc:
