@@ -12,13 +12,24 @@ search:
     - html
     - json
 
-# Issue pc-tools#980: the default engine set (brave, duckduckgo, google,
-# startpage, qwant, karmasearch) was entirely blocked/CAPTCHA'd from this
-# host's egress IP, so every search returned 200 with zero results until a
-# restart cleared the suspensions. bing and mojeek verified working from
-# this IP on 2026-08-18; enabled as resilient fallbacks.
+outgoing:
+  # Cap per-engine stalls: one dead engine must not stall discovery.
+  request_timeout: 8.0
+  max_request_timeout: 15.0
+
+# NOTE: with use_default_settings: true this section MERGES by engine name —
+# unlisted default engines stay enabled. Discovery is fenced per-request via
+# the `engines` query param in api/app.py instead of enumerating all defaults
+# here. This list only tunes the engines we actually use.
+# bing and mojeek verified working from this IP on 2026-08-18; marginalia
+# (independent index, good long-tail tech recall) added 2026-09-16.
 engines:
   - name: bing
     disabled: false
+    timeout: 8.0
   - name: mojeek
     disabled: false
+    timeout: 8.0
+  - name: marginalia
+    disabled: false
+    timeout: 8.0

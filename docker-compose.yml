@@ -1,6 +1,6 @@
 services:
   searxng:
-    image: searxng/searxng:latest
+    image: searxng/searxng:2026.9.16-461f174b0
     expose:
       - "8080"
     volumes:
@@ -12,9 +12,15 @@ services:
     restart: unless-stopped
     networks:
       - internal
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
   crawl4ai:
-    image: unclecode/crawl4ai:latest
+    image: unclecode/crawl4ai:0.9.3
     expose:
       - "11235"
     env_file:
@@ -28,6 +34,12 @@ services:
     restart: unless-stopped
     networks:
       - internal
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:11235/monitor/health')\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
 
   reranker:
     build: ./reranker
@@ -38,6 +50,12 @@ services:
     restart: unless-stopped
     networks:
       - internal
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:7997/health')\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
   api:
     build: ./api
@@ -56,13 +74,22 @@ services:
       - CRAWL4AI_API_TOKEN=${CRAWL4AI_API_TOKEN:?set CRAWL4AI_API_TOKEN in .env}
       - WEBSEARCH_API_KEY=${WEBSEARCH_API_KEY:?set WEBSEARCH_API_KEY in .env}
     depends_on:
-      - searxng
-      - crawl4ai
-      - reranker
+      searxng:
+        condition: service_healthy
+      crawl4ai:
+        condition: service_healthy
+      reranker:
+        condition: service_healthy
     restart: unless-stopped
     networks:
       - internal
       - traefik
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
 networks:
   internal:
