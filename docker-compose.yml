@@ -35,7 +35,8 @@ services:
     networks:
       - internal
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:11235/monitor/health')\""]
+      # 0.9.x auth-gates every endpoint incl. /monitor/health: send the token.
+      test: ["CMD-SHELL", "python -c \"import os,urllib.request; q=urllib.request.Request('http://localhost:11235/monitor/health', headers={'Authorization': 'Bearer '+os.environ['CRAWL4AI_API_TOKEN']}); urllib.request.urlopen(q)\""]
       interval: 30s
       timeout: 5s
       retries: 3
