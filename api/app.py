@@ -1,8 +1,10 @@
 import asyncio
 import ipaddress
+import logging
 import os
 import secrets
 import socket
+from contextlib import asynccontextmanager
 from copy import deepcopy
 from typing import Any, Literal
 from urllib.parse import urlparse
@@ -26,12 +28,54 @@ SEARCH_CANDIDATES = int(os.getenv("SEARCH_CANDIDATES", "10"))
 MAX_RESULTS = int(os.getenv("MAX_RESULTS", "5"))
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1800"))
 CHUNKS_PER_PAGE = int(os.getenv("CHUNKS_PER_PAGE", "3"))
-CRAWL_CONCURRENCY = int(os.getenv("CRAWL_CONCURRENCY", "3"))
+CRAWL_CONCURRENCY = int(os.getenv("CRAWL_CONCURRENCY", "8"))
 WEBSEARCH_API_KEY = os.getenv("WEBSEARCH_API_KEY", "")
+# Optional Brave Search API keys (comma-separated) for primary discovery.
+# Empty = SearXNG-only discovery, exactly today's behavior.
+BRAVE_API_KEYS = tuple(key.strip() for key in os.getenv("BRAVE_API_KEYS", "").split(",") if key.strip())
+BRAVE_SEARCH_URL = os.getenv("BRAVE_SEARCH_URL", "https://api.search.brave.com/res/v1/web/search").rstrip("/")
+BRAVE_TIMEOUT = float(os.getenv("BRAVE_TIMEOUT", "8"))
+# Fences SearXNG discovery per request: settings.yml merges with defaults, so
+# the allowlist lives here where every search routes through.
+SEARXNG_ENGINES = os.getenv("SEARXNG_ENGINES", "bing,mojeek,marginalia")
+DISCOVERY_TIMEOUT = float(os.getenv("DISCOVERY_TIMEOUT", "20"))
+CRAWL_TIMEOUT = float(os.getenv("CRAWL_TIMEOUT", "45"))
+RERANK_TIMEOUT = float(os.getenv("RERANK_TIMEOUT", "8"))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "300"))
+
+logger = logging.getLogger("websearch")
+
+_shared_client: httpx.AsyncClient | None = None
+_client_lock = asyncio.Lock()
+
+
+async def get_client() -> httpx.AsyncClient:
+    global _shared_client
+    if _shared_client is None:
+        async with _client_lock:
+            if _shared_client is None:
+                _shared_client = httpx.AsyncClient(
+                    timeout=60,
+                    follow_redirects=False,
+                    limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
+                )
+    return _shared_client
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    global _shared_client
+    await get_client()  # pre-warm the upstream connection pool
+    yield
+    if _shared_client is not None:
+        await _shared_client.aclose()
+        _shared_client = None
+
 
 app = FastAPI(
     title="SparkFN Web Search and Crawl API",
     version="0.1.0",
+    lifespan=lifespan,
     description=(
         "Authenticated APIs for AI agents and MCP/CLI tools. "
         "Use the host-specific OpenAPI documents: websearch.sparkfn.io exposes search, "
@@ -403,23 +447,34 @@ def openapi(request: Request):
     },
 )
 async def search(request: SearchRequest):
-    async with httpx.AsyncClient(timeout=60, follow_redirects=False) as client:
-        candidates = await search_searxng(client, request.query, request.candidates)
-        if not candidates:
-            return search_response(request.query, [])
-
-        semaphore = asyncio.Semaphore(CRAWL_CONCURRENCY)
-        pages = await asyncio.gather(
-            *(crawl_with_limit(semaphore, client, result) for result in candidates),
-            return_exceptions=True,
+    client = await get_client()
+    try:
+        candidates = await asyncio.wait_for(
+            discover_candidates(client, request.query, request.candidates),
+            timeout=DISCOVERY_TIMEOUT,
         )
+    except asyncio.TimeoutError:
+        logger.warning("discovery timed out after %.0fs; trying searxng directly", DISCOVERY_TIMEOUT)
+        try:
+            candidates = await asyncio.wait_for(
+                search_searxng(client, request.query, request.candidates), timeout=10
+            )
+        except (asyncio.TimeoutError, AppError) as exc:
+            logger.warning("searxng fallback also failed (%r)", exc)
+            candidates = []
+    if not candidates:
+        return search_response(request.query, [])
 
-        documents = [page for page in pages if isinstance(page, dict) and page.get("content")]
-        if not documents:
-            return search_response(request.query, [])
+    try:
+        pages = await asyncio.wait_for(crawl_all(client, candidates), timeout=CRAWL_TIMEOUT)
+    except asyncio.TimeoutError:
+        logger.warning("crawl timed out after %.0fs", CRAWL_TIMEOUT)
+        pages = []
+    if not pages:
+        return search_response(request.query, [])
 
-        chunks = chunk_documents(documents)
-        ranked = await rerank(client, request.query, chunks, request.max_results)
+    chunks = chunk_documents(pages)
+    ranked = await rerank(client, request.query, chunks, request.max_results)
 
     return search_response(request.query, ranked)
 
@@ -507,26 +562,139 @@ async def search_get(
     },
 )
 async def crawl(request: CrawlRequest):
-    async with httpx.AsyncClient(timeout=90, follow_redirects=False) as client:
-        result = await crawl_direct_url(client, request)
+    client = await get_client()
+    result = await crawl_direct_url(client, request)
 
     return CrawlEnvelope(data=CrawlData(url=result["url"], content=result["content"]))
 
 
-async def search_searxng(client: httpx.AsyncClient, query: str, limit: int):
-    try:
-        response = await client.get(
-            f"{SEARXNG_URL}/search",
-            params={"q": query, "format": "json"},
-        )
-        response.raise_for_status()
-        payload = response.json()
-    except (httpx.HTTPError, ValueError) as exc:
-        raise AppError(502, "searxng_error", "SearXNG search failed", {"error": str(exc)}) from exc
+class _BraveKeyError(Exception):
+    def __init__(self, reason: str, cooldown: float):
+        super().__init__(reason)
+        self.reason = reason
+        self.cooldown = cooldown
 
+
+class BraveKeyPool:
+    """Round-robin Brave keys with per-key cooldowns. One sick key never blocks the healthy ones."""
+
+    def __init__(self, keys: tuple[str, ...]):
+        self._keys = list(keys)
+        self._index = 0
+        self._lock = asyncio.Lock()
+        self._cooled_until = [0.0] * len(self._keys)
+        # ponytail: in-memory counters reset on restart; persist when real metrics exist
+        self._calls = [0] * len(self._keys)
+
+    def __bool__(self):
+        return bool(self._keys)
+
+    async def search(self, client: httpx.AsyncClient, query: str, limit: int):
+        """Candidate dicts, or None when the whole pool is unusable (caller falls back)."""
+        tried = 0
+        while tried < len(self._keys):
+            key_idx = await self._take_key()
+            if key_idx is None:
+                logger.warning("brave pool exhausted (all %d keys cooling)", len(self._keys))
+                return None
+            tried += 1
+            try:
+                results = await self._search_with_key(client, key_idx, query, limit)
+            except _BraveKeyError as exc:
+                self._cool(key_idx, exc.cooldown)
+                logger.warning("brave key %d failed (%s), cooling %.0fs", key_idx, exc.reason, exc.cooldown)
+                continue
+            self._calls[key_idx] += 1
+            logger.info("brave key %d ok (%d candidates, %d calls)", key_idx, len(results), self._calls[key_idx])
+            return results
+        return None
+
+    async def _take_key(self):
+        async with self._lock:
+            now = asyncio.get_running_loop().time()
+            for _ in self._keys:
+                idx = self._index
+                self._index = (self._index + 1) % len(self._keys)
+                if self._cooled_until[idx] <= now:
+                    return idx
+        return None
+
+    def _cool(self, key_idx: int, cooldown: float):
+        self._cooled_until[key_idx] = asyncio.get_running_loop().time() + max(cooldown, 0.0)
+
+    async def _search_with_key(self, client: httpx.AsyncClient, key_idx: int, query: str, limit: int):
+        items: list[dict] = []
+        offset = 0
+        try:
+            while len(items) < limit and offset < limit:
+                count = min(limit - len(items), 20)  # Brave page cap
+                response = await client.get(
+                    BRAVE_SEARCH_URL,
+                    params={"q": query, "count": count, "offset": offset, "text_decorations": False},
+                    headers={"X-Subscription-Token": self._keys[key_idx], "Accept": "application/json"},
+                    timeout=BRAVE_TIMEOUT,
+                )
+                if response.status_code == 429:
+                    raise _BraveKeyError("rate_limited", _retry_after(response, 300.0))
+                if response.status_code in (401, 403):
+                    raise _BraveKeyError(f"http_{response.status_code}", 86400.0)
+                if 400 <= response.status_code < 500:
+                    # Bad request, not a sick key (e.g. paging past Brave's
+                    # offset cap): keep what we have instead of burning the pool.
+                    logger.warning("brave key %d bad request (http_%d), stopping paging", key_idx, response.status_code)
+                    break
+                response.raise_for_status()
+                page = (response.json().get("web") or {}).get("results") or []
+                if not page:
+                    break
+                items.extend(page)
+                offset += len(page)
+        except _BraveKeyError:
+            raise
+        except (httpx.HTTPError, ValueError) as exc:
+            raise _BraveKeyError(str(exc), 60.0) from exc
+        return items
+
+
+def _retry_after(response: httpx.Response, default: float) -> float:
+    try:
+        return max(float(response.headers.get("Retry-After", default)), 0.0)
+    except (TypeError, ValueError):
+        return default
+
+
+BRAVE_POOL = BraveKeyPool(BRAVE_API_KEYS)
+
+
+async def discover_candidates(client: httpx.AsyncClient, query: str, limit: int):
+    if BRAVE_POOL:
+        try:
+            brave = await BRAVE_POOL.search(client, query, limit)
+        except Exception as exc:  # never let the primary provider break search; SearXNG is the fallback
+            logger.warning("brave pool error (%r), falling back to searxng", exc)
+            brave = None
+        if brave:
+            shaped = await shape_candidates(brave, limit, snippet_key="description")
+            if len(shaped) < limit:  # Brave pages cap out; top up the shortfall from SearXNG
+                try:
+                    extra = await search_searxng(client, query, limit)
+                except AppError as exc:
+                    logger.warning("searxng top-up failed (%s)", exc.code)
+                    extra = []
+                seen_urls = {item["url"] for item in shaped}
+                shaped.extend(item for item in extra if item["url"] not in seen_urls)
+                shaped = shaped[:limit]
+            if shaped:
+                return shaped
+    return await search_searxng(client, query, limit)
+
+
+async def shape_candidates(items, limit: int, snippet_key: str = "content"):
     seen = set()
     results = []
-    for item in payload.get("results", []):
+    for item in items:
+        if not isinstance(item, dict):
+            continue
         url = item.get("url")
         if not isinstance(url, str) or url in seen:
             continue
@@ -537,12 +705,83 @@ async def search_searxng(client: httpx.AsyncClient, query: str, limit: int):
             {
                 "title": item.get("title") or urlparse(url).netloc or url,
                 "url": url,
-                "snippet": item.get("content") or "",
+                "snippet": item.get(snippet_key) or "",
             }
         )
         if len(results) >= limit:
             break
     return results
+
+
+async def search_searxng(client: httpx.AsyncClient, query: str, limit: int):
+    try:
+        response = await client.get(
+            f"{SEARXNG_URL}/search",
+            params={"q": query, "format": "json", "engines": SEARXNG_ENGINES},
+            timeout=10,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise AppError(502, "searxng_error", "SearXNG search failed", {"error": str(exc)}) from exc
+
+    return await shape_candidates(payload.get("results", []), limit)
+
+
+async def crawl_all(client: httpx.AsyncClient, candidates: list[dict]):
+    """One bulk Crawl4AI call for the search path; per-URL fallback if bulk fails."""
+    flags = await asyncio.gather(*(is_allowed_public_url(item["url"]) for item in candidates))
+    allowed = [item for item, ok in zip(candidates, flags) if ok]
+    if not allowed:
+        return []
+
+    pages = await _bulk_crawl(client, allowed)
+    if not pages:  # transport failure OR zero parsed content: per-URL is the known-good shape
+        if pages is None:
+            logger.warning("bulk crawl failed, falling back to per-URL")
+        else:
+            logger.warning("bulk crawl returned no usable pages, falling back to per-URL")
+        semaphore = asyncio.Semaphore(CRAWL_CONCURRENCY)
+        results = await asyncio.gather(
+            *(crawl_with_limit(semaphore, client, item) for item in allowed),
+            return_exceptions=True,
+        )
+        pages = [page for page in results if isinstance(page, dict) and page.get("content")]
+    return pages
+
+
+async def _bulk_crawl(client: httpx.AsyncClient, candidates: list[dict]):
+    """Bulk crawl, mapped back to candidates. [] = no content; None = transport failure."""
+    try:
+        payload = await call_crawl4ai(client, {"urls": [item["url"] for item in candidates]})
+    except AppError:
+        return None
+
+    items = payload.get("results", payload) if isinstance(payload, dict) else payload
+    if not isinstance(items, list):
+        items = [items]
+
+    by_url = {item["url"]: item for item in candidates}
+    claimed = set(by_url)
+    crawled_urls = [extract_crawled_url(item) for item in items]
+    contents = [extract_crawl_content(item) for item in items]
+    used = [False] * len(items)
+    pages = []
+    for candidate in candidates:
+        idx = next((i for i, url in enumerate(crawled_urls) if not used[i] and url == candidate["url"]), None)
+        if idx is None:  # redirected/normalized URL no other candidate claims
+            idx = next(
+                (i for i, url in enumerate(crawled_urls) if not used[i] and url and url not in claimed and contents[i]),
+                None,
+            )
+        if idx is None or not contents[idx]:
+            continue
+        used[idx] = True
+        url = crawled_urls[idx] or candidate["url"]
+        if url != candidate["url"] and not await is_allowed_public_url(url):
+            continue
+        pages.append({**candidate, "url": url, "content": contents[idx]})
+    return pages
 
 
 async def crawl_with_limit(semaphore: asyncio.Semaphore, client: httpx.AsyncClient, result: dict):
@@ -695,13 +934,13 @@ def extract_crawl_content(payload, preferred_format: str = "markdown"):
     if not isinstance(payload, dict):
         return ""
 
-    format_keys = [preferred_format, "markdown", "cleaned_html", "text", "content", "html"]
+    format_keys = [preferred_format, "markdown", "fit_markdown", "cleaned_html", "text", "content", "html"]
     for key in dict.fromkeys(format_keys):
         value = payload.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
         if isinstance(value, dict):
-            nested = value.get("raw_markdown") or value.get("fit_markdown") or value.get("content")
+            nested = value.get("fit_markdown") or value.get("raw_markdown") or value.get("content")
             if isinstance(nested, str) and nested.strip():
                 return nested.strip()
 
@@ -746,28 +985,40 @@ def chunk_documents(documents: list[dict]):
         start = 0
         page_chunks = 0
         while start < len(text) and page_chunks < CHUNKS_PER_PAGE:
-            chunk = text[start : start + CHUNK_SIZE].strip()
+            end = min(start + CHUNK_SIZE, len(text))
+            if end < len(text):  # snap to a sentence/line boundary past the midpoint
+                snap = max(text.rfind(". ", start, end), text.rfind("\n", start, end))
+                if snap > start + CHUNK_SIZE // 2:
+                    end = snap + 1
+            chunk = text[start:end].strip()
             if chunk:
                 chunks.append({**document, "content": chunk})
                 page_chunks += 1
-            start += CHUNK_SIZE
+            if end <= start:
+                break
+            start = end if end >= len(text) else max(end - CHUNK_OVERLAP, start + 1)
     return chunks
 
 
 async def rerank(client: httpx.AsyncClient, query: str, chunks: list[dict], top_k: int):
+    if not chunks:
+        return []
+    # Over-fetch: URL-dedupe below keeps one chunk per page, so top_k chunks
+    # can collapse to fewer than top_k results without this.
+    fetch_k = min(len(chunks), max(top_k * 3, top_k + 5))
     try:
         response = await client.post(
             f"{RERANKER_URL}/rerank",
             json={
                 "query": query,
                 "documents": [chunk["content"] for chunk in chunks],
-                "top_k": top_k,
+                "top_k": fetch_k,
             },
-            timeout=30,
+            timeout=RERANK_TIMEOUT,
         )
         response.raise_for_status()
         ranked = response.json().get("results", [])
-    except (httpx.HTTPError, ValueError, TypeError, AttributeError):
+    except (httpx.HTTPError, ValueError, TypeError, AttributeError, asyncio.TimeoutError):
         ranked = [{"index": index, "score": None} for index in range(len(chunks))]
 
     results = []
@@ -797,31 +1048,42 @@ async def rerank(client: httpx.AsyncClient, query: str, chunks: list[dict], top_
     return results
 
 
+_dns_cache: dict[str, tuple[float, bool]] = {}
+_dns_lock = asyncio.Lock()
+DNS_TTL = 60.0
+
+
 async def is_allowed_public_url(url: str):
-    return await asyncio.to_thread(is_public_http_url, url)
-
-
-def is_public_http_url(url: str):
     parsed = urlparse(url)
+    if not _url_prefix_ok(parsed):
+        return False
+    hostname = (parsed.hostname or "").rstrip(".").lower()
+    async with _dns_lock:
+        hit = _dns_cache.get(hostname)
+    now = asyncio.get_running_loop().time()
+    if hit is None or hit[0] <= now:
+        verdict = await asyncio.to_thread(_host_resolves_public, hostname, parsed.port)
+        async with _dns_lock:
+            _dns_cache[hostname] = (asyncio.get_running_loop().time() + DNS_TTL, verdict)
+        return verdict
+    return hit[1]
+
+
+def _url_prefix_ok(parsed) -> bool:
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         return False
     if parsed.username or parsed.password:
         return False
-
     hostname = parsed.hostname.rstrip(".").lower()
-    if hostname in {"localhost", "localhost.localdomain"} or hostname.endswith(".localhost"):
-        return False
+    return not (hostname in {"localhost", "localhost.localdomain"} or hostname.endswith(".localhost"))
 
+
+def _host_resolves_public(hostname: str, port) -> bool:
     try:
-        addresses = socket.getaddrinfo(hostname, parsed.port, type=socket.SOCK_STREAM)
+        addresses = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
     except socket.gaierror:
         return False
-
-    for address in addresses:
-        ip = ipaddress.ip_address(address[4][0])
-        if not is_public_ip(ip):
-            return False
-    return True
+    return all(is_public_ip(ipaddress.ip_address(address[4][0])) for address in addresses)
 
 
 def is_public_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address):

@@ -15,4 +15,4 @@ COPY --chown=app:app app.py .
 
 USER app
 EXPOSE 7997
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7997"]
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7997", "--workers", "2"]
