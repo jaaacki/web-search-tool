@@ -44,6 +44,11 @@ RERANK_TIMEOUT = float(os.getenv("RERANK_TIMEOUT", "8"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "300"))
 
 logger = logging.getLogger("websearch")
+if not logger.handlers:  # uvicorn only configures its own loggers; without this our INFO is swallowed
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+    logger.addHandler(_handler)
+logger.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
 
 _shared_client: httpx.AsyncClient | None = None
 _client_lock = asyncio.Lock()
