@@ -454,8 +454,14 @@ async def search(request: SearchRequest):
             timeout=DISCOVERY_TIMEOUT,
         )
     except asyncio.TimeoutError:
-        logger.warning("discovery timed out after %.0fs", DISCOVERY_TIMEOUT)
-        candidates = []
+        logger.warning("discovery timed out after %.0fs; trying searxng directly", DISCOVERY_TIMEOUT)
+        try:
+            candidates = await asyncio.wait_for(
+                search_searxng(client, request.query, request.candidates), timeout=10
+            )
+        except (asyncio.TimeoutError, AppError) as exc:
+            logger.warning("searxng fallback also failed (%r)", exc)
+            candidates = []
     if not candidates:
         return search_response(request.query, [])
 
@@ -632,6 +638,11 @@ class BraveKeyPool:
                     raise _BraveKeyError("rate_limited", _retry_after(response, 300.0))
                 if response.status_code in (401, 403):
                     raise _BraveKeyError(f"http_{response.status_code}", 86400.0)
+                if 400 <= response.status_code < 500:
+                    # Bad request, not a sick key (e.g. paging past Brave's
+                    # offset cap): keep what we have instead of burning the pool.
+                    logger.warning("brave key %d bad request (http_%d), stopping paging", key_idx, response.status_code)
+                    break
                 response.raise_for_status()
                 page = (response.json().get("web") or {}).get("results") or []
                 if not page:
@@ -664,6 +675,15 @@ async def discover_candidates(client: httpx.AsyncClient, query: str, limit: int)
             brave = None
         if brave:
             shaped = await shape_candidates(brave, limit, snippet_key="description")
+            if len(shaped) < limit:  # Brave pages cap out; top up the shortfall from SearXNG
+                try:
+                    extra = await search_searxng(client, query, limit)
+                except AppError as exc:
+                    logger.warning("searxng top-up failed (%s)", exc.code)
+                    extra = []
+                seen_urls = {item["url"] for item in shaped}
+                shaped.extend(item for item in extra if item["url"] not in seen_urls)
+                shaped = shaped[:limit]
             if shaped:
                 return shaped
     return await search_searxng(client, query, limit)
@@ -716,7 +736,11 @@ async def crawl_all(client: httpx.AsyncClient, candidates: list[dict]):
         return []
 
     pages = await _bulk_crawl(client, allowed)
-    if pages is None:
+    if not pages:  # transport failure OR zero parsed content: per-URL is the known-good shape
+        if pages is None:
+            logger.warning("bulk crawl failed, falling back to per-URL")
+        else:
+            logger.warning("bulk crawl returned no usable pages, falling back to per-URL")
         semaphore = asyncio.Semaphore(CRAWL_CONCURRENCY)
         results = await asyncio.gather(
             *(crawl_with_limit(semaphore, client, item) for item in allowed),
@@ -730,8 +754,7 @@ async def _bulk_crawl(client: httpx.AsyncClient, candidates: list[dict]):
     """Bulk crawl, mapped back to candidates. [] = no content; None = transport failure."""
     try:
         payload = await call_crawl4ai(client, {"urls": [item["url"] for item in candidates]})
-    except AppError as exc:
-        logger.warning("bulk crawl failed (%s), falling back to per-URL", exc.code)
+    except AppError:
         return None
 
     items = payload.get("results", payload) if isinstance(payload, dict) else payload
@@ -978,9 +1001,11 @@ def chunk_documents(documents: list[dict]):
 
 
 async def rerank(client: httpx.AsyncClient, query: str, chunks: list[dict], top_k: int):
+    if not chunks:
+        return []
     # Over-fetch: URL-dedupe below keeps one chunk per page, so top_k chunks
     # can collapse to fewer than top_k results without this.
-    fetch_k = min(len(chunks), max(top_k * 3, top_k + 5)) if chunks else 0
+    fetch_k = min(len(chunks), max(top_k * 3, top_k + 5))
     try:
         response = await client.post(
             f"{RERANKER_URL}/rerank",

@@ -73,6 +73,7 @@ services:
       - CRAWL_CONCURRENCY=${CRAWL_CONCURRENCY:-3}
       - CRAWL4AI_API_TOKEN=${CRAWL4AI_API_TOKEN:?set CRAWL4AI_API_TOKEN in .env}
       - WEBSEARCH_API_KEY=${WEBSEARCH_API_KEY:?set WEBSEARCH_API_KEY in .env}
+      - BRAVE_API_KEYS=${BRAVE_API_KEYS:-}
     depends_on:
       searxng:
         condition: service_healthy
