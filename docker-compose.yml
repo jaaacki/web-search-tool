@@ -43,20 +43,34 @@ services:
       start_period: 120s
 
   reranker:
-    build: ./reranker
+    # Off-the-shelf cross-encoder server (TEI). `cpu-<ver>` is the amd64 tag; arm64
+    # hosts must set RERANKER_IMAGE to the `cpu-arm64-<ver>` tag.
+    image: ${RERANKER_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cpu-1.9.4}
+    command:
+      - --model-id
+      - ${RERANKER_MODEL_ID:-mixedbread-ai/mxbai-rerank-xsmall-v1}
+      - --revision
+      - ${RERANKER_MODEL_REVISION:-b5c6e9da73abc3711f593f705371cdbe9e0fe422}
+      - --port
+      - "7997"
+      # The api batches at RERANK_BATCH (default 32) documents per request; keep in step.
+      - --max-client-batch-size
+      - "32"
     expose:
       - "7997"
-    environment:
-      - MODEL_ID=${RERANKER_MODEL_ID:-lexical-idf}
+    volumes:
+      - ./data/reranker:/data
     restart: unless-stopped
     networks:
       - internal
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:7997/health')\""]
+      test: ["CMD", "curl", "-fsS", "http://localhost:7997/health"]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 30s
+      # First boot downloads the model into ./data/reranker before /health passes:
+      # 91s measured cold (279MB of weights), 300s leaves room for a slow link.
+      start_period: 300s
 
   api:
     build: ./api
