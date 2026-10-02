@@ -1,9 +1,13 @@
 import asyncio
 import ipaddress
 import logging
+import math
 import os
+import re
 import secrets
 import socket
+import time
+from collections import Counter
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from typing import Any, Literal
@@ -16,7 +20,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import JSONResponse
 from fastapi.security import APIKeyHeader
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 SEARXNG_URL = os.getenv("SEARXNG_URL", "http://searxng:8080").rstrip("/")
 CRAWL4AI_URL = os.getenv("CRAWL4AI_URL", "http://crawl4ai:11235").rstrip("/")
@@ -27,7 +31,11 @@ RERANKER_URL = os.getenv("RERANKER_URL", "http://reranker:7997").rstrip("/")
 SEARCH_CANDIDATES = int(os.getenv("SEARCH_CANDIDATES", "10"))
 MAX_RESULTS = int(os.getenv("MAX_RESULTS", "5"))
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1800"))
-CHUNKS_PER_PAGE = int(os.getenv("CHUNKS_PER_PAGE", "3"))
+# Whole-page chunking budget per crawled page. The old first-N-chunks limit kept
+# roughly the nav bar of each page; this caps what one page can cost instead.
+MAX_PAGE_CHARS = int(os.getenv("MAX_PAGE_CHARS", "60000"))
+# `fit_markdown` below this length means pruning ate the page, so fall back to raw.
+MIN_FIT_MARKDOWN_CHARS = 300
 CRAWL_CONCURRENCY = int(os.getenv("CRAWL_CONCURRENCY", "8"))
 # Chrome version the Crawl4AI image bundles (Chrome for Testing 153.0.8010.12 in 0.9.4).
 # The UA we send has to match the engine that renders the page, so bump this with the image.
@@ -43,8 +51,20 @@ BRAVE_TIMEOUT = float(os.getenv("BRAVE_TIMEOUT", "8"))
 SEARXNG_ENGINES = os.getenv("SEARXNG_ENGINES", "bing,mojeek,marginalia")
 DISCOVERY_TIMEOUT = float(os.getenv("DISCOVERY_TIMEOUT", "20"))
 CRAWL_TIMEOUT = float(os.getenv("CRAWL_TIMEOUT", "45"))
-RERANK_TIMEOUT = float(os.getenv("RERANK_TIMEOUT", "8"))
+RERANK_TIMEOUT = float(os.getenv("RERANK_TIMEOUT", "4"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "300"))
+# Cheapest chunks the cross-encoder sees: lexical prefilter keeps this many.
+RERANK_PREFILTER = int(os.getenv("RERANK_PREFILTER", "20"))
+# Characters per passage sent to the cross-encoder. Its cost scales with tokens, and the
+# head of a chunk carries the match; results still return the whole chunk.
+RERANK_MAX_CHARS = int(os.getenv("RERANK_MAX_CHARS", "1000"))
+# Documents per cross-encoder request; must not exceed the server's max client batch size.
+RERANK_BATCH = int(os.getenv("RERANK_BATCH", "32"))
+# How much the page's discovery position counts against the cross-encoder score.
+RERANK_WEIGHT = float(os.getenv("RERANK_WEIGHT", "0.2"))
+# Reciprocal-rank smoothing for the discovery term: rank 0 -> 1.0, rank 60 -> 0.5.
+RERANK_RRF_K = 60
+TOKEN_RE = re.compile(r"[\w-]+", re.UNICODE)
 
 logger = logging.getLogger("websearch")
 if not logger.handlers:  # uvicorn only configures its own loggers; without this our INFO is swallowed
@@ -52,6 +72,12 @@ if not logger.handlers:  # uvicorn only configures its own loggers; without this
     _handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
     logger.addHandler(_handler)
 logger.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
+
+
+def _ms(since: float, until: float | None = None) -> float:
+    """Milliseconds since `since`, or between `since` and `until`."""
+    return ((time.perf_counter() if until is None else until) - since) * 1000
+
 
 _shared_client: httpx.AsyncClient | None = None
 _client_lock = asyncio.Lock()
@@ -193,6 +219,11 @@ CrawlOptionValue = str | int | float | bool | None | list[Any] | dict[str, Any]
 
 
 class CrawlRequest(BaseModel):
+    # Unknown fields are refused rather than dropped: `extraction_config` was
+    # removed here, and silently ignoring it (or a typo) is the same failure
+    # mode #10 fixed upstream.
+    model_config = ConfigDict(extra="forbid")
+
     url: str = Field(
         min_length=1,
         description=(
@@ -211,8 +242,12 @@ class CrawlRequest(BaseModel):
     )
     cache_mode: str | None = Field(
         default=None,
-        description="Optional Crawl4AI cache mode value passed through as `cache_mode`. Leave null unless you know the Crawl4AI cache semantics you need.",
-        examples=["BYPASS"],
+        description=(
+            "Optional Crawl4AI cache mode, folded into `crawler_config.cache_mode` where Crawl4AI reads it. One of "
+            "`enabled`, `disabled`, `read_only`, `write_only`, `bypass` (case-insensitive); an explicit `crawler_config.cache_mode` wins over "
+            "this field. Leave null for the Crawl4AI default."
+        ),
+        examples=["bypass"],
     )
     browser_config: dict[str, Any] = Field(
         default_factory=dict,
@@ -225,27 +260,29 @@ class CrawlRequest(BaseModel):
     crawler_config: dict[str, Any] = Field(
         default_factory=dict,
         description=(
-            "Crawl4AI crawler/run options. Each key must be in the server allowlist *and* each value a plain scalar or list of scalars; "
-            "anything else is rejected with 422 `validation_error` naming the offending key. Nested objects (including `{\"type\": ...}` "
-            "typed-object wrappers) and LLM/proxy/browser/JS keys such as `llm_config`, `proxy_config`, `check_robots_txt`, "
-            "`link_preview_config`, `js_code` and `user_data_dir` are never forwarded. `wait_for` must be a CSS selector prefixed with "
-            "`css:`, and `max_retries` is capped at 2."
+            "Crawl4AI crawler/run options, where Crawl4AI actually reads them. Each key must be in the server allowlist *and* each value a "
+            "plain scalar or list of scalars; anything else is rejected with 422 `validation_error` naming the offending key. Nested objects "
+            "(including `{\"type\": ...}` typed-object wrappers) and LLM/proxy/browser/JS keys such as `llm_config`, `proxy_config`, "
+            "`check_robots_txt`, `link_preview_config`, `js_code` and `user_data_dir` are never forwarded. `wait_for` must be a CSS selector "
+            "prefixed with `css:`, and `max_retries` is capped at 2. Wins over `crawl_options` and `cache_mode` on conflict."
         ),
         examples=[{"wait_until": "networkidle", "css_selector": "main"}],
     )
     extraction_config: dict[str, Any] = Field(
         default_factory=dict,
+        deprecated=True,
         description=(
-            "Extraction options, validated against the same scalar allowlist as `crawler_config`. Crawl4AI 0.9.4's `/crawl` takes extraction "
-            "settings inside `crawler_config`, so this field is validated and forwarded but not honoured upstream; prefer `crawler_config`."
+            "Deprecated and unsupported. Crawl4AI takes extraction settings in `crawler_config`, and this field was never honoured, so it is "
+            "accepted only when empty: a non-empty value is rejected with 422 `validation_error`. Use `crawler_config`."
         ),
         examples=[{}],
     )
     crawl_options: dict[str, CrawlOptionValue] = Field(
         default_factory=dict,
         description=(
-            "Top-level Crawl4AI options, validated against the same scalar allowlist as `crawler_config`. `url` and `urls` are rejected "
-            "so callers cannot bypass URL validation. Prefer the named fields above."
+            "Crawler options merged into `crawler_config` before it is sent (Crawl4AI 0.9.x ignores top-level options, so passing them here "
+            "as before would silently do nothing). Validated against the same scalar allowlist; `url` and `urls` are rejected so callers "
+            "cannot bypass URL validation. `crawler_config` wins on conflict."
         ),
         examples=[{"screenshot": False, "word_count_threshold": 10}],
     )
@@ -468,6 +505,7 @@ def openapi(request: Request):
 )
 async def search(request: SearchRequest):
     client = await get_client()
+    started = time.perf_counter()
     try:
         candidates = await asyncio.wait_for(
             discover_candidates(client, request.query, request.candidates),
@@ -483,18 +521,30 @@ async def search(request: SearchRequest):
             logger.warning("searxng fallback also failed (%r)", exc)
             candidates = []
     if not candidates:
+        logger.info("search q=%r results=0 elapsed=%.0fms stage=discovery", request.query, _ms(started))
         return search_response(request.query, [])
 
+    discovered = time.perf_counter()
     try:
         pages = await asyncio.wait_for(crawl_all(client, candidates), timeout=CRAWL_TIMEOUT)
     except asyncio.TimeoutError:
         logger.warning("crawl timed out after %.0fs", CRAWL_TIMEOUT)
         pages = []
     if not pages:
+        logger.info(
+            "search q=%r candidates=%d results=0 discovery=%.0fms crawl=%.0fms elapsed=%.0fms",
+            request.query, len(candidates), _ms(started, discovered), _ms(discovered), _ms(started),
+        )
         return search_response(request.query, [])
 
+    crawled = time.perf_counter()
     chunks = chunk_documents(pages)
-    ranked = await rerank(client, request.query, chunks, request.max_results)
+    ranked, rerank_path = await rerank(client, request.query, chunks, request.max_results)
+    logger.info(
+        "search q=%r candidates=%d pages=%d chunks=%d results=%d discovery=%.0fms crawl=%.0fms rerank=%.0fms elapsed=%.0fms rerank_path=%s",
+        request.query, len(candidates), len(pages), len(chunks), len(ranked),
+        _ms(started, discovered), _ms(discovered, crawled), _ms(crawled), _ms(started), rerank_path,
+    )
 
     return search_response(request.query, ranked)
 
@@ -770,10 +820,29 @@ async def crawl_all(client: httpx.AsyncClient, candidates: list[dict]):
     return pages
 
 
+# Search-path crawler config. Without a markdown generator the response carries no
+# `fit_markdown` at all and every caller gets the raw page, nav and cookie banners
+# included. The typed objects are the server's own, not caller input, so they are
+# allowed to be more than the scalar shapes the /crawl allowlist accepts.
+SEARCH_CRAWLER_CONFIG = {
+    "excluded_tags": ["nav", "footer", "header", "aside", "form"],
+    "remove_overlay_elements": True,
+    "markdown_generator": {
+        "type": "DefaultMarkdownGenerator",
+        "params": {
+            "content_filter": {"type": "PruningContentFilter", "params": {}},
+            "options": {"ignore_links": True},
+        },
+    },
+}
+
+
 async def _bulk_crawl(client: httpx.AsyncClient, candidates: list[dict]):
     """Bulk crawl, mapped back to candidates. [] = no content; None = transport failure."""
     try:
-        payload = await call_crawl4ai(client, {"urls": [item["url"] for item in candidates]})
+        payload = await call_crawl4ai(
+            client, {"urls": [item["url"] for item in candidates], "crawler_config": SEARCH_CRAWLER_CONFIG}
+        )
     except AppError:
         return None
 
@@ -814,7 +883,11 @@ async def crawl_url(client: httpx.AsyncClient, result: dict):
         return None
 
     try:
-        payload = await call_crawl4ai(client, {"urls": [result["url"]]})
+        # Same cleaned extraction as the bulk call: this is the per-URL fallback,
+        # and without the config it would quietly hand back raw nav markdown.
+        payload = await call_crawl4ai(
+            client, {"urls": [result["url"]], "crawler_config": SEARCH_CRAWLER_CONFIG}
+        )
     except AppError:
         return None
 
@@ -908,7 +981,10 @@ async def call_crawl4ai(client: httpx.AsyncClient, payload: dict[str, Any]):
 # configs as Provenance.UNTRUSTED regardless of the bearer token, but that gate
 # silently *drops* unknown fields; the API edge must reject loudly instead, and
 # never forward a key that can reach an LLM, proxy, browser or JS sink.
-CRAWL_PASSTHROUGH_FIELDS = ("crawler_config", "crawl_options", "extraction_config")
+CRAWL_PASSTHROUGH_FIELDS = ("crawler_config", "crawl_options")
+
+# Crawl4AI's CacheMode enum, which is what the typed form below must carry.
+CRAWL_CACHE_MODES = ("enabled", "disabled", "read_only", "write_only", "bypass")
 
 CRAWL_ALLOWED_KEYS = frozenset({
     # timing / waiting
@@ -971,6 +1047,8 @@ def _crawl_value_violation(key: str, value: Any) -> str | None:
         isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= CRAWL_MAX_RETRIES
     ):
         return f"'max_retries' must be an integer between 0 and {CRAWL_MAX_RETRIES}"
+    if key == "cache_mode" and not (isinstance(value, str) and value.lower() in CRAWL_CACHE_MODES):
+        return f"'cache_mode' must be one of: {', '.join(CRAWL_CACHE_MODES)}"
     return None
 
 
@@ -981,6 +1059,17 @@ def validate_crawl_passthrough(request: CrawlRequest) -> None:
     a `{"type": ...}` typed-object wrapper, so any dict at any depth is refused.
     """
     problems: list[dict[str, Any]] = []
+    if request.cache_mode is not None and request.cache_mode.lower() not in CRAWL_CACHE_MODES:
+        problems.append(
+            _crawl_violation(["cache_mode"], f"'cache_mode' must be one of: {', '.join(CRAWL_CACHE_MODES)}")
+        )
+    if request.extraction_config:
+        problems.append(
+            _crawl_violation(
+                ["extraction_config"],
+                "extraction_config is deprecated and unsupported; leave it empty and use crawler_config",
+            )
+        )
     if request.browser_config:
         problems.append(
             _crawl_violation(
@@ -1014,18 +1103,27 @@ def validate_crawl_passthrough(request: CrawlRequest) -> None:
 
 def build_crawl_payload(request: CrawlRequest):
     validate_crawl_passthrough(request)
-    payload: dict[str, Any] = {"urls": [request.url]}
-    for key, value in request.crawl_options.items():
-        if key not in {"url", "urls"}:
-            payload[key] = value
+
+    # Crawl4AI 0.9.x reads crawler settings only from `crawler_config` and drops
+    # any other top-level key, so crawl_options and cache_mode are folded in
+    # here. An explicit crawler_config value still wins over both.
+    crawler_config: dict[str, Any] = dict(request.crawl_options)
     if request.cache_mode is not None:
-        payload["cache_mode"] = request.cache_mode
-    if request.browser_config:
-        payload["browser_config"] = request.browser_config
-    if request.crawler_config:
-        payload["crawler_config"] = request.crawler_config
-    if request.extraction_config:
-        payload["extraction_config"] = request.extraction_config
+        crawler_config["cache_mode"] = request.cache_mode
+    crawler_config.update(request.crawler_config)
+
+    if "cache_mode" in crawler_config:
+        # CacheMode is an Enum and the server does not coerce a bare string, so
+        # "bypass" sent as a plain scalar would silently never engage the cache.
+        # Only the typed form works (verified against the 0.9.4 server:
+        # cache_status goes "miss" -> "hit" for the typed form, stays "miss" for
+        # the scalar).
+        mode = crawler_config["cache_mode"]
+        crawler_config["cache_mode"] = {"type": "CacheMode", "params": mode.lower() if isinstance(mode, str) else mode}
+
+    payload: dict[str, Any] = {"urls": [request.url]}
+    if crawler_config:
+        payload["crawler_config"] = crawler_config
     return payload
 
 
@@ -1120,7 +1218,13 @@ def extract_crawl_content(payload, preferred_format: str = "markdown"):
         if isinstance(value, str) and value.strip():
             return value.strip()
         if isinstance(value, dict):
-            nested = value.get("fit_markdown") or value.get("raw_markdown") or value.get("content")
+            # Prefer the pruned markdown, but a fit result shorter than
+            # MIN_FIT_MARKDOWN_CHARS means the filter ate the page: raw prose
+            # beats a two-line "fit".
+            fit = value.get("fit_markdown")
+            if isinstance(fit, str) and len(fit.strip()) >= MIN_FIT_MARKDOWN_CHARS:
+                return fit.strip()
+            nested = value.get("raw_markdown") or fit or value.get("content")
             if isinstance(nested, str) and nested.strip():
                 return nested.strip()
 
@@ -1155,16 +1259,52 @@ def extract_crawled_url(payload):
     return None
 
 
+MARKDOWN_LINK_RE = re.compile(r"!?\[[^\]]*\]\([^)\s]*\)")
+URL_RE = re.compile(r"https?://\S+")
+
+
+def strip_boilerplate_lines(text: str) -> str:
+    """Drop lines that carry no prose: markdown link/image runs and short menu stubs.
+
+    ponytail: word-count heuristic, not a parser. It can drop a genuine two-word
+    line, so headings and anything with a digit (answer-bearing numbers) are kept,
+    and the eval set is what decides whether it over-prunes.
+    """
+    lines = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # Links nest ("[ ![logo](img) ](page)"), so strip targets as well and ask
+        # only whether any word character survives.
+        if not any(character.isalnum() for character in URL_RE.sub("", MARKDOWN_LINK_RE.sub("", stripped))):
+            continue  # links/images only
+        if (
+            len(stripped) <= 24
+            and len(stripped.split()) <= 2
+            and not stripped.startswith("#")
+            and not any(character.isdigit() for character in stripped)
+        ):
+            continue  # menu stub: "Docs", "Pricing", "Skip to content"
+        lines.append(stripped)
+    return "\n".join(lines)
+
+
 def chunk_documents(documents: list[dict]):
+    """Chunk the whole cleaned page, capped per page, not just its first chunks.
+
+    The old limit kept the first CHUNKS_PER_PAGE chunks, which on a typical page is
+    the nav bar and cookie banner, so relevant text further down never reached the
+    reranker at all.
+    """
     chunks = []
     for document in documents:
-        text = "\n".join(line.strip() for line in document["content"].splitlines() if line.strip())
+        text = strip_boilerplate_lines(document["content"])[:MAX_PAGE_CHARS]
         if not text:
             continue
 
         start = 0
-        page_chunks = 0
-        while start < len(text) and page_chunks < CHUNKS_PER_PAGE:
+        while start < len(text):
             end = min(start + CHUNK_SIZE, len(text))
             if end < len(text):  # snap to a sentence/line boundary past the midpoint
                 snap = max(text.rfind(". ", start, end), text.rfind("\n", start, end))
@@ -1173,42 +1313,139 @@ def chunk_documents(documents: list[dict]):
             chunk = text[start:end].strip()
             if chunk:
                 chunks.append({**document, "content": chunk})
-                page_chunks += 1
             if end <= start:
                 break
             start = end if end >= len(text) else max(end - CHUNK_OVERLAP, start + 1)
     return chunks
 
 
-async def rerank(client: httpx.AsyncClient, query: str, chunks: list[dict], top_k: int):
-    if not chunks:
-        return []
-    # Over-fetch: URL-dedupe below keeps one chunk per page, so top_k chunks
-    # can collapse to fewer than top_k results without this.
-    fetch_k = min(len(chunks), max(top_k * 3, top_k + 5))
+def tokenize(text: str) -> list[str]:
+    return [token.lower() for token in TOKEN_RE.findall(text)]
+
+
+def lexical_scores(query: str, documents: list[str]) -> list[float]:
+    """BM25-ish word-overlap score per document, normalised so the best one is 1.0.
+
+    Only has to be a good enough prefilter for the cross-encoder stage below.
+    """
+    query_tokens = tokenize(query)
+    if not query_tokens:
+        return [0.0 for _ in documents]
+
+    counts = [Counter(tokenize(document)) for document in documents]
+    document_frequencies = Counter(token for count in counts for token in count)
+    document_count = max(len(documents), 1)
+    query_counts = Counter(query_tokens)
+
+    raw_scores = []
+    for count in counts:
+        length_norm = math.sqrt(max(sum(count.values()), 1))
+        score = 0.0
+        for token, query_count in query_counts.items():
+            term_frequency = count[token]
+            if not term_frequency:
+                continue
+            idf = math.log((document_count + 1) / (document_frequencies[token] + 0.5)) + 1
+            score += query_count * math.log1p(term_frequency) * idf
+        raw_scores.append(score / length_norm)
+
+    max_score = max(raw_scores, default=0.0)
+    if max_score <= 0:
+        return raw_scores
+    return [score / max_score for score in raw_scores]
+
+
+def discovery_ranks(chunks: list[dict]) -> dict[str, int]:
+    """Page position in the discovery order, per URL.
+
+    Candidates are crawled in discovery-rank order and chunk_documents() preserves
+    that order, so a URL's first chunk is its discovery position.
+    """
+    ranks: dict[str, int] = {}
+    for chunk in chunks:
+        ranks.setdefault(chunk["url"], len(ranks))
+    return ranks
+
+
+def fused_score(cross_encoder_score: float, discovery_rank: int, weight: float) -> float:
+    """Blend the cross-encoder score with a reciprocal rank of the discovery position.
+
+    RRF_K / (RRF_K + rank) is the usual 1/(60+rank) decay rescaled to [0, 1], so both
+    terms are comparable and `weight` reads directly as "how much does engine rank buy".
+    """
+    discovery = RERANK_RRF_K / (RERANK_RRF_K + discovery_rank)
+    return (1 - weight) * cross_encoder_score + weight * discovery
+
+
+async def cross_encode(client: httpx.AsyncClient, query: str, documents: list[str]):
+    """Cross-encoder score for every document, in input order; None if unavailable.
+
+    Returning None (rather than zeros) is what sends the caller to the lexical-order
+    fallback instead of a silently-wrong all-equal ranking.
+    """
+    batches = [documents[i : i + RERANK_BATCH] for i in range(0, len(documents), RERANK_BATCH)]
     try:
-        response = await client.post(
-            f"{RERANKER_URL}/rerank",
-            json={
-                "query": query,
-                "documents": [chunk["content"] for chunk in chunks],
-                "top_k": fetch_k,
-            },
-            timeout=RERANK_TIMEOUT,
+        responses = await asyncio.gather(
+            *(
+                client.post(
+                    f"{RERANKER_URL}/rerank",
+                    json={"query": query, "texts": batch},
+                    timeout=RERANK_TIMEOUT,
+                )
+                for batch in batches
+            )
         )
-        response.raise_for_status()
-        ranked = response.json().get("results", [])
-    except (httpx.HTTPError, ValueError, TypeError, AttributeError, asyncio.TimeoutError):
-        ranked = [{"index": index, "score": None} for index in range(len(chunks))]
+        scores: list[float] = []
+        for response, batch in zip(responses, batches):
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, list):
+                raise ValueError(f"unexpected rerank payload: {payload!r}")
+            batch_scores = [0.0] * len(batch)
+            for item in payload:
+                index, score = item.get("index"), item.get("score")
+                if isinstance(index, int) and 0 <= index < len(batch_scores) and isinstance(score, (int, float)):
+                    batch_scores[index] = float(score)
+            scores.extend(batch_scores)
+        return scores
+    except (httpx.HTTPError, ValueError, TypeError, AttributeError, asyncio.TimeoutError) as exc:
+        logger.warning("cross-encoder rerank failed (%r); using lexical order", exc)
+        return None
+
+
+async def rerank(client: httpx.AsyncClient, query: str, chunks: list[dict], top_k: int):
+    """Two-stage rerank. Returns (results, path) where path names the ranking that won."""
+    if not chunks:
+        return [], "empty"
+
+    # Stage 1: cheap lexical pass decides which chunks the cross-encoder sees at all.
+    lexical = lexical_scores(query, [chunk["content"] for chunk in chunks])
+    by_lexical = sorted(range(len(chunks)), key=lambda index: lexical[index], reverse=True)
+    head, tail = by_lexical[:RERANK_PREFILTER], by_lexical[RERANK_PREFILTER:]
+
+    # Stage 2: cross-encoder over the prefiltered head, blended with discovery rank.
+    passages = [chunks[index]["content"][:RERANK_MAX_CHARS] for index in head]
+    cross_encoder = await cross_encode(client, query, passages)
+    if cross_encoder is None:
+        order = [(index, None) for index in by_lexical]
+        path = "lexical-fallback"
+    else:
+        path = "cross-encoder"
+        ranks = discovery_ranks(chunks)
+        scored = sorted(
+            (
+                (index, round(fused_score(score, ranks[chunks[index]["url"]], RERANK_WEIGHT), 6))
+                for index, score in zip(head, cross_encoder)
+            ),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        # Chunks the prefilter dropped rank behind every scored chunk, best-lexical first.
+        order = scored + [(index, None) for index in tail]
 
     results = []
     seen_urls = set()
-    for item in ranked:
-        if not isinstance(item, dict):
-            continue
-        index = item.get("index")
-        if not isinstance(index, int) or index < 0 or index >= len(chunks):
-            continue
+    for index, score in order:
         chunk = chunks[index]
         if chunk["url"] in seen_urls:
             continue
@@ -1219,13 +1456,13 @@ async def rerank(client: httpx.AsyncClient, query: str, chunks: list[dict], top_
                 url=chunk["url"],
                 snippet=chunk.get("snippet", ""),
                 content=chunk["content"],
-                score=item.get("score") if isinstance(item.get("score"), (int, float)) else None,
+                score=score,
             )
         )
         if len(results) >= top_k:
             break
 
-    return results
+    return results, path
 
 
 _dns_cache: dict[str, tuple[float, bool]] = {}
