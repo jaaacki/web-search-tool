@@ -53,13 +53,17 @@ DISCOVERY_TIMEOUT = float(os.getenv("DISCOVERY_TIMEOUT", "20"))
 CRAWL_TIMEOUT = float(os.getenv("CRAWL_TIMEOUT", "45"))
 RERANK_TIMEOUT = float(os.getenv("RERANK_TIMEOUT", "4"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "300"))
-# Cheapest chunks the cross-encoder sees: lexical prefilter keeps this many.
-RERANK_PREFILTER = int(os.getenv("RERANK_PREFILTER", "20"))
+# Cheapest chunks the cross-encoder sees: lexical prefilter keeps this many. Sized so a
+# CPU-only box finishes inside RERANK_TIMEOUT -- see the measurements on #27.
+RERANK_PREFILTER = int(os.getenv("RERANK_PREFILTER", "10"))
 # Characters per passage sent to the cross-encoder. Its cost scales with tokens, and the
 # head of a chunk carries the match; results still return the whole chunk.
-RERANK_MAX_CHARS = int(os.getenv("RERANK_MAX_CHARS", "1000"))
+RERANK_MAX_CHARS = int(os.getenv("RERANK_MAX_CHARS", "512"))
 # Documents per cross-encoder request; must not exceed the server's max client batch size.
 RERANK_BATCH = int(os.getenv("RERANK_BATCH", "32"))
+# After a cross-encoder failure the breaker stays open this long, ranking lexically:
+# otherwise slow hardware pays the timeout on every single search.
+RERANK_COOLDOWN = float(os.getenv("RERANK_COOLDOWN", "300"))
 # How much the page's discovery position counts against the cross-encoder score.
 RERANK_WEIGHT = float(os.getenv("RERANK_WEIGHT", "0.2"))
 # Reciprocal-rank smoothing for the discovery term: rank 0 -> 1.0, rank 60 -> 0.5.
@@ -1416,12 +1420,41 @@ def fused_score(cross_encoder_score: float, discovery_rank: int, weight: float) 
     return (1 - weight) * cross_encoder_score + weight * discovery
 
 
+# ponytail: breaker state is per process, so each uvicorn worker trips and recovers on
+# its own and a restart clears it. Fine for one failing upstream; share the state (redis
+# or a sidecar) only if the workers ever disagreeing actually matters.
+_rerank_skip_until = 0.0
+
+
+def rerank_available() -> bool:
+    """False while the breaker is open; logs the single transition back to available."""
+    global _rerank_skip_until
+    if _rerank_skip_until and time.monotonic() >= _rerank_skip_until:
+        _rerank_skip_until = 0.0
+        logger.info("rerank circuit breaker closed; trying the cross-encoder again")
+    return not _rerank_skip_until
+
+
+def trip_rerank_breaker(reason) -> None:
+    """Stop calling the cross-encoder for RERANK_COOLDOWN; logs once per opening."""
+    global _rerank_skip_until
+    if not _rerank_skip_until:
+        logger.warning(
+            "rerank circuit breaker opened (%r); skipping the cross-encoder for %.0fs",
+            reason, RERANK_COOLDOWN,
+        )
+    _rerank_skip_until = time.monotonic() + RERANK_COOLDOWN
+
+
 async def cross_encode(client: httpx.AsyncClient, query: str, documents: list[str]):
     """Cross-encoder score for every document, in input order; None if unavailable.
 
     Returning None (rather than zeros) is what sends the caller to the lexical-order
     fallback instead of a silently-wrong all-equal ranking.
     """
+    if not rerank_available():
+        return None
+
     batches = [documents[i : i + RERANK_BATCH] for i in range(0, len(documents), RERANK_BATCH)]
     try:
         responses = await asyncio.gather(
@@ -1449,6 +1482,7 @@ async def cross_encode(client: httpx.AsyncClient, query: str, documents: list[st
         return scores
     except (httpx.HTTPError, ValueError, TypeError, AttributeError, asyncio.TimeoutError) as exc:
         logger.warning("cross-encoder rerank failed (%r); using lexical order", exc)
+        trip_rerank_breaker(exc)
         return None
 
 
