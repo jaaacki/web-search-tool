@@ -37,6 +37,9 @@ MAX_PAGE_CHARS = int(os.getenv("MAX_PAGE_CHARS", "60000"))
 # `fit_markdown` below this length means pruning ate the page, so fall back to raw.
 MIN_FIT_MARKDOWN_CHARS = 300
 CRAWL_CONCURRENCY = int(os.getenv("CRAWL_CONCURRENCY", "8"))
+# Chrome version the Crawl4AI image bundles (Chrome for Testing 153.0.8010.12 in 0.9.4).
+# The UA we send has to match the engine that renders the page, so bump this with the image.
+CRAWL4AI_CHROMIUM_VERSION = os.getenv("CRAWL4AI_CHROMIUM_VERSION", "153.0.8010.12")
 WEBSEARCH_API_KEY = os.getenv("WEBSEARCH_API_KEY", "")
 # Optional Brave Search API keys (comma-separated) for primary discovery.
 # Empty = SearXNG-only discovery, exactly today's behavior.
@@ -914,7 +917,58 @@ async def crawl_direct_url(client: httpx.AsyncClient, request: CrawlRequest):
     return {"url": crawled_url, "content": content}
 
 
+# Server-owned crawl defaults, applied to every payload in call_crawl4ai().
+#
+# These cannot come from the server's own config.yml: /crawl builds its browser from
+# the request (`BrowserConfig.load(request["browser_config"])`) and never reads
+# `crawler.browser.kwargs`, so a mounted config changes nothing for the crawl path.
+# They cannot come from a caller either -- /crawl may not send browser_config at all,
+# and the stealth crawler keys are absent from CRAWL_ALLOWED_KEYS.
+#
+# Worth having regardless of anti-bot effect: crawl4ai's own defaults send Chrome/116
+# while the image renders with Chrome 153, and leave the "HeadlessChrome" token in
+# the UA untouched by enable_stealth.
+STEALTH_BROWSER_CONFIG = {
+    "enable_stealth": True,
+    "user_agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+        f"Chrome/{CRAWL4AI_CHROMIUM_VERSION} Safari/537.36"
+    ),
+    "viewport_width": 1920,
+    "viewport_height": 1080,
+}
+STEALTH_CRAWLER_CONFIG = {
+    "remove_overlay_elements": True,
+    "wait_until": "domcontentloaded",
+    "delay_before_return_html": 0.2,
+    "max_retries": 1,
+    # One locale/timezone for every crawl: inconsistent values are themselves a signal.
+    "locale": "en-US",
+    "timezone_id": "America/New_York",
+    # Deliberately absent: `magic` and `override_navigator`. The server loads this
+    # dict as Provenance.UNTRUSTED and rejects both with a 400 that fails the whole
+    # crawl, and the server-side base_config cannot set them either (they default to
+    # False, and base_config only fills values that are None or ""). They are
+    # unreachable in crawl4ai 0.9.4 unless the image itself sets them.
+}
+
+
+def with_stealth_defaults(payload: dict[str, Any]) -> dict[str, Any]:
+    """Add the server's crawl defaults; anything the caller set wins.
+
+    Fill-only, matching crawl4ai's own `crawler.base_config` semantics, so the scalars
+    /crawl is allowed to tune (wait_until, max_retries, locale, ...) keep working.
+    """
+    for key, defaults in (
+        ("browser_config", STEALTH_BROWSER_CONFIG),
+        ("crawler_config", STEALTH_CRAWLER_CONFIG),
+    ):
+        payload[key] = {**defaults, **payload.get(key, {})}
+    return payload
+
+
 async def call_crawl4ai(client: httpx.AsyncClient, payload: dict[str, Any]):
+    payload = with_stealth_defaults(payload)
     try:
         response = await client.post(f"{CRAWL4AI_URL}/crawl", json=payload, timeout=90, headers=CRAWL4AI_HEADERS)
         response.raise_for_status()

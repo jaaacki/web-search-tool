@@ -116,10 +116,26 @@ curl -X POST 'https://webcrawl.sparkfn.io/crawl' \
 
 - `content_format`: `markdown`, `cleaned_html`, `text`, or `html`.
 - `cache_mode`: optional Crawl4AI cache mode value.
-- `browser_config`: optional Crawl4AI browser config object.
-- `crawler_config`: optional Crawl4AI crawler config object.
-- `extraction_config`: optional Crawl4AI extraction config object.
-- `crawl_options`: optional top-level Crawl4AI options object.
+- `crawler_config`: optional Crawl4AI crawler/run options. Only keys on the server allowlist are
+  forwarded, and only as plain scalars or lists of scalars.
+- `crawl_options`: top-level Crawl4AI options, merged into `crawler_config` before it is sent
+  (`crawler_config` wins on conflict), under the same allowlist.
+- `browser_config` is **not** accepted from the public API: the server owns browser and stealth
+  settings, so any value returns 422.
+- `extraction_config` is deprecated and ignored. It is accepted only when empty (`{}` or omitted);
+  a non-empty value returns 422. Put extraction settings in `crawler_config`.
+
+## Crawl stealth defaults
+
+The API fills every crawl — search-path and `/crawl` — with server-owned browser settings:
+`enable_stealth`, a user agent matching the Chrome the Crawl4AI image actually renders with,
+a fixed viewport/locale/timezone, `remove_overlay_elements`, and a small post-load delay. Callers
+cannot change or disable these, and the fill only adds keys a caller left unset.
+
+`CRAWL4AI_CHROMIUM_VERSION` in `.env` must be bumped together with the Crawl4AI image tag: it is the
+Chrome version in the UA string, and a UA that disagrees with the engine is itself a signal.
+
+These defaults do not defeat a Cloudflare JS challenge or a DataDome captcha — see #15.
 
 ## Local component debugging
 
