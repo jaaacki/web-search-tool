@@ -239,6 +239,15 @@ class CrawlRequest(BaseModel):
         ),
         examples=[{"wait_until": "networkidle", "css_selector": "main"}],
     )
+    extraction_config: dict[str, Any] = Field(
+        default_factory=dict,
+        deprecated=True,
+        description=(
+            "Deprecated and unsupported. Crawl4AI takes extraction settings in `crawler_config`, and this field was never honoured, so it is "
+            "accepted only when empty: a non-empty value is rejected with 422 `validation_error`. Use `crawler_config`."
+        ),
+        examples=[{}],
+    )
     crawl_options: dict[str, CrawlOptionValue] = Field(
         default_factory=dict,
         description=(
@@ -937,6 +946,13 @@ def validate_crawl_passthrough(request: CrawlRequest) -> None:
     if request.cache_mode is not None and request.cache_mode.lower() not in CRAWL_CACHE_MODES:
         problems.append(
             _crawl_violation(["cache_mode"], f"'cache_mode' must be one of: {', '.join(CRAWL_CACHE_MODES)}")
+        )
+    if request.extraction_config:
+        problems.append(
+            _crawl_violation(
+                ["extraction_config"],
+                "extraction_config is deprecated and unsupported; leave it empty and use crawler_config",
+            )
         )
     if request.browser_config:
         problems.append(

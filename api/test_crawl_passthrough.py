@@ -50,13 +50,12 @@ FORBIDDEN = [
     ("crawl_options", {"wait_for": "js:1"}),
 ]
 
-# Removed in #17: the field is gone, so pydantic must refuse it outright rather
-# than ignore it.
-REMOVED_FIELDS = [
-    ("extraction_config", {"proxy_config": {"server": "http://evil"}}),
-    ("extraction_config", {}),
-    ("crawl_option", {"screenshot": True}),
-]
+# Deprecated in #17: accepted only when empty, so a caller that still sends it
+# does not start failing over a field that was never honoured.
+DEPRECATED_EMPTY = [("extraction_config", {})]
+
+# Unknown fields are refused outright rather than ignored.
+REMOVED_FIELDS = [("crawl_option", {"screenshot": True})]
 
 
 def request(field: str, config: dict) -> CrawlRequest:
@@ -85,6 +84,13 @@ def demo() -> None:
 
     for field, config in FORBIDDEN:
         rejects(field, config)
+
+    for field, config in DEPRECATED_EMPTY:
+        validate_crawl_passthrough(request(field, config))
+
+    # A non-empty deprecated field is refused, with the key named.
+    detail = rejects("extraction_config", {"proxy_config": {"server": "http://evil"}})
+    assert detail["loc"] == ["extraction_config"], detail
 
     for field, config in REMOVED_FIELDS:
         try:
