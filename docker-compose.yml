@@ -20,7 +20,7 @@ services:
       start_period: 30s
 
   crawl4ai:
-    image: unclecode/crawl4ai:0.9.3
+    image: unclecode/crawl4ai:0.9.4
     expose:
       - "11235"
     env_file:
