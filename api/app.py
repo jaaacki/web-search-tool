@@ -1,9 +1,13 @@
 import asyncio
 import ipaddress
 import logging
+import math
 import os
+import re
 import secrets
 import socket
+import time
+from collections import Counter
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from typing import Any, Literal
@@ -40,8 +44,20 @@ BRAVE_TIMEOUT = float(os.getenv("BRAVE_TIMEOUT", "8"))
 SEARXNG_ENGINES = os.getenv("SEARXNG_ENGINES", "bing,mojeek,marginalia")
 DISCOVERY_TIMEOUT = float(os.getenv("DISCOVERY_TIMEOUT", "20"))
 CRAWL_TIMEOUT = float(os.getenv("CRAWL_TIMEOUT", "45"))
-RERANK_TIMEOUT = float(os.getenv("RERANK_TIMEOUT", "8"))
+RERANK_TIMEOUT = float(os.getenv("RERANK_TIMEOUT", "4"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "300"))
+# Cheapest chunks the cross-encoder sees: lexical prefilter keeps this many.
+RERANK_PREFILTER = int(os.getenv("RERANK_PREFILTER", "20"))
+# Characters per passage sent to the cross-encoder. Its cost scales with tokens, and the
+# head of a chunk carries the match; results still return the whole chunk.
+RERANK_MAX_CHARS = int(os.getenv("RERANK_MAX_CHARS", "1000"))
+# Documents per cross-encoder request; must not exceed the server's max client batch size.
+RERANK_BATCH = int(os.getenv("RERANK_BATCH", "32"))
+# How much the page's discovery position counts against the cross-encoder score.
+RERANK_WEIGHT = float(os.getenv("RERANK_WEIGHT", "0.2"))
+# Reciprocal-rank smoothing for the discovery term: rank 0 -> 1.0, rank 60 -> 0.5.
+RERANK_RRF_K = 60
+TOKEN_RE = re.compile(r"[\w-]+", re.UNICODE)
 
 logger = logging.getLogger("websearch")
 if not logger.handlers:  # uvicorn only configures its own loggers; without this our INFO is swallowed
@@ -49,6 +65,12 @@ if not logger.handlers:  # uvicorn only configures its own loggers; without this
     _handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
     logger.addHandler(_handler)
 logger.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
+
+
+def _ms(since: float, until: float | None = None) -> float:
+    """Milliseconds since `since`, or between `since` and `until`."""
+    return ((time.perf_counter() if until is None else until) - since) * 1000
+
 
 _shared_client: httpx.AsyncClient | None = None
 _client_lock = asyncio.Lock()
@@ -476,6 +498,7 @@ def openapi(request: Request):
 )
 async def search(request: SearchRequest):
     client = await get_client()
+    started = time.perf_counter()
     try:
         candidates = await asyncio.wait_for(
             discover_candidates(client, request.query, request.candidates),
@@ -491,18 +514,30 @@ async def search(request: SearchRequest):
             logger.warning("searxng fallback also failed (%r)", exc)
             candidates = []
     if not candidates:
+        logger.info("search q=%r results=0 elapsed=%.0fms stage=discovery", request.query, _ms(started))
         return search_response(request.query, [])
 
+    discovered = time.perf_counter()
     try:
         pages = await asyncio.wait_for(crawl_all(client, candidates), timeout=CRAWL_TIMEOUT)
     except asyncio.TimeoutError:
         logger.warning("crawl timed out after %.0fs", CRAWL_TIMEOUT)
         pages = []
     if not pages:
+        logger.info(
+            "search q=%r candidates=%d results=0 discovery=%.0fms crawl=%.0fms elapsed=%.0fms",
+            request.query, len(candidates), _ms(started, discovered), _ms(discovered), _ms(started),
+        )
         return search_response(request.query, [])
 
+    crawled = time.perf_counter()
     chunks = chunk_documents(pages)
-    ranked = await rerank(client, request.query, chunks, request.max_results)
+    ranked, rerank_path = await rerank(client, request.query, chunks, request.max_results)
+    logger.info(
+        "search q=%r candidates=%d pages=%d chunks=%d results=%d discovery=%.0fms crawl=%.0fms rerank=%.0fms elapsed=%.0fms rerank_path=%s",
+        request.query, len(candidates), len(pages), len(chunks), len(ranked),
+        _ms(started, discovered), _ms(discovered, crawled), _ms(crawled), _ms(started), rerank_path,
+    )
 
     return search_response(request.query, ranked)
 
@@ -1162,35 +1197,133 @@ def chunk_documents(documents: list[dict]):
     return chunks
 
 
-async def rerank(client: httpx.AsyncClient, query: str, chunks: list[dict], top_k: int):
-    if not chunks:
-        return []
-    # Over-fetch: URL-dedupe below keeps one chunk per page, so top_k chunks
-    # can collapse to fewer than top_k results without this.
-    fetch_k = min(len(chunks), max(top_k * 3, top_k + 5))
+def tokenize(text: str) -> list[str]:
+    return [token.lower() for token in TOKEN_RE.findall(text)]
+
+
+def lexical_scores(query: str, documents: list[str]) -> list[float]:
+    """BM25-ish word-overlap score per document, normalised so the best one is 1.0.
+
+    Only has to be a good enough prefilter for the cross-encoder stage below.
+    """
+    query_tokens = tokenize(query)
+    if not query_tokens:
+        return [0.0 for _ in documents]
+
+    counts = [Counter(tokenize(document)) for document in documents]
+    document_frequencies = Counter(token for count in counts for token in count)
+    document_count = max(len(documents), 1)
+    query_counts = Counter(query_tokens)
+
+    raw_scores = []
+    for count in counts:
+        length_norm = math.sqrt(max(sum(count.values()), 1))
+        score = 0.0
+        for token, query_count in query_counts.items():
+            term_frequency = count[token]
+            if not term_frequency:
+                continue
+            idf = math.log((document_count + 1) / (document_frequencies[token] + 0.5)) + 1
+            score += query_count * math.log1p(term_frequency) * idf
+        raw_scores.append(score / length_norm)
+
+    max_score = max(raw_scores, default=0.0)
+    if max_score <= 0:
+        return raw_scores
+    return [score / max_score for score in raw_scores]
+
+
+def discovery_ranks(chunks: list[dict]) -> dict[str, int]:
+    """Page position in the discovery order, per URL.
+
+    Candidates are crawled in discovery-rank order and chunk_documents() preserves
+    that order, so a URL's first chunk is its discovery position.
+    """
+    ranks: dict[str, int] = {}
+    for chunk in chunks:
+        ranks.setdefault(chunk["url"], len(ranks))
+    return ranks
+
+
+def fused_score(cross_encoder_score: float, discovery_rank: int, weight: float) -> float:
+    """Blend the cross-encoder score with a reciprocal rank of the discovery position.
+
+    RRF_K / (RRF_K + rank) is the usual 1/(60+rank) decay rescaled to [0, 1], so both
+    terms are comparable and `weight` reads directly as "how much does engine rank buy".
+    """
+    discovery = RERANK_RRF_K / (RERANK_RRF_K + discovery_rank)
+    return (1 - weight) * cross_encoder_score + weight * discovery
+
+
+async def cross_encode(client: httpx.AsyncClient, query: str, documents: list[str]):
+    """Cross-encoder score for every document, in input order; None if unavailable.
+
+    Returning None (rather than zeros) is what sends the caller to the lexical-order
+    fallback instead of a silently-wrong all-equal ranking.
+    """
+    batches = [documents[i : i + RERANK_BATCH] for i in range(0, len(documents), RERANK_BATCH)]
     try:
-        response = await client.post(
-            f"{RERANKER_URL}/rerank",
-            json={
-                "query": query,
-                "documents": [chunk["content"] for chunk in chunks],
-                "top_k": fetch_k,
-            },
-            timeout=RERANK_TIMEOUT,
+        responses = await asyncio.gather(
+            *(
+                client.post(
+                    f"{RERANKER_URL}/rerank",
+                    json={"query": query, "texts": batch},
+                    timeout=RERANK_TIMEOUT,
+                )
+                for batch in batches
+            )
         )
-        response.raise_for_status()
-        ranked = response.json().get("results", [])
-    except (httpx.HTTPError, ValueError, TypeError, AttributeError, asyncio.TimeoutError):
-        ranked = [{"index": index, "score": None} for index in range(len(chunks))]
+        scores: list[float] = []
+        for response, batch in zip(responses, batches):
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, list):
+                raise ValueError(f"unexpected rerank payload: {payload!r}")
+            batch_scores = [0.0] * len(batch)
+            for item in payload:
+                index, score = item.get("index"), item.get("score")
+                if isinstance(index, int) and 0 <= index < len(batch_scores) and isinstance(score, (int, float)):
+                    batch_scores[index] = float(score)
+            scores.extend(batch_scores)
+        return scores
+    except (httpx.HTTPError, ValueError, TypeError, AttributeError, asyncio.TimeoutError) as exc:
+        logger.warning("cross-encoder rerank failed (%r); using lexical order", exc)
+        return None
+
+
+async def rerank(client: httpx.AsyncClient, query: str, chunks: list[dict], top_k: int):
+    """Two-stage rerank. Returns (results, path) where path names the ranking that won."""
+    if not chunks:
+        return [], "empty"
+
+    # Stage 1: cheap lexical pass decides which chunks the cross-encoder sees at all.
+    lexical = lexical_scores(query, [chunk["content"] for chunk in chunks])
+    by_lexical = sorted(range(len(chunks)), key=lambda index: lexical[index], reverse=True)
+    head, tail = by_lexical[:RERANK_PREFILTER], by_lexical[RERANK_PREFILTER:]
+
+    # Stage 2: cross-encoder over the prefiltered head, blended with discovery rank.
+    passages = [chunks[index]["content"][:RERANK_MAX_CHARS] for index in head]
+    cross_encoder = await cross_encode(client, query, passages)
+    if cross_encoder is None:
+        order = [(index, None) for index in by_lexical]
+        path = "lexical-fallback"
+    else:
+        path = "cross-encoder"
+        ranks = discovery_ranks(chunks)
+        scored = sorted(
+            (
+                (index, round(fused_score(score, ranks[chunks[index]["url"]], RERANK_WEIGHT), 6))
+                for index, score in zip(head, cross_encoder)
+            ),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        # Chunks the prefilter dropped rank behind every scored chunk, best-lexical first.
+        order = scored + [(index, None) for index in tail]
 
     results = []
     seen_urls = set()
-    for item in ranked:
-        if not isinstance(item, dict):
-            continue
-        index = item.get("index")
-        if not isinstance(index, int) or index < 0 or index >= len(chunks):
-            continue
+    for index, score in order:
         chunk = chunks[index]
         if chunk["url"] in seen_urls:
             continue
@@ -1201,13 +1334,13 @@ async def rerank(client: httpx.AsyncClient, query: str, chunks: list[dict], top_
                 url=chunk["url"],
                 snippet=chunk.get("snippet", ""),
                 content=chunk["content"],
-                score=item.get("score") if isinstance(item.get("score"), (int, float)) else None,
+                score=score,
             )
         )
         if len(results) >= top_k:
             break
 
-    return results
+    return results, path
 
 
 _dns_cache: dict[str, tuple[float, bool]] = {}
