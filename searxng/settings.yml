@@ -21,15 +21,24 @@ outgoing:
 # unlisted default engines stay enabled. Discovery is fenced per-request via
 # the `engines` query param in api/app.py instead of enumerating all defaults
 # here. This list only tunes the engines we actually use.
-# bing and mojeek verified working from this IP on 2026-08-18; marginalia
-# (independent index, good long-tail tech recall) added 2026-09-16.
+#
+# This set must stay in sync with SEARXNG_ENGINES in api/app.py.
+# All four verified enabled in /config and returning results on 2026-10-02.
+# mojeek and marginalia are deliberately absent: the image marks them
+# `inactive: true` (mojeek needs a Proof-of-Work CAPTCHA, marginalia needs an
+# API key), and `inactive` is NOT overridable here — unlike `disabled`, it
+# keeps the engine out of /config entirely, so naming it silently shrinks the
+# engine set rather than failing. Check /config before adding an engine.
 engines:
   - name: bing
     disabled: false
     timeout: 8.0
-  - name: mojeek
+  - name: brave
     disabled: false
     timeout: 8.0
-  - name: marginalia
+  - name: duckduckgo
+    disabled: false
+    timeout: 8.0
+  - name: google cse
     disabled: false
     timeout: 8.0
