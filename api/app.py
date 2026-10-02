@@ -16,7 +16,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import JSONResponse
 from fastapi.security import APIKeyHeader
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 SEARXNG_URL = os.getenv("SEARXNG_URL", "http://searxng:8080").rstrip("/")
 CRAWL4AI_URL = os.getenv("CRAWL4AI_URL", "http://crawl4ai:11235").rstrip("/")
@@ -190,6 +190,11 @@ CrawlOptionValue = str | int | float | bool | None | list[Any] | dict[str, Any]
 
 
 class CrawlRequest(BaseModel):
+    # Unknown fields are refused rather than dropped: `extraction_config` was
+    # removed here, and silently ignoring it (or a typo) is the same failure
+    # mode #10 fixed upstream.
+    model_config = ConfigDict(extra="forbid")
+
     url: str = Field(
         min_length=1,
         description=(
@@ -208,8 +213,12 @@ class CrawlRequest(BaseModel):
     )
     cache_mode: str | None = Field(
         default=None,
-        description="Optional Crawl4AI cache mode value passed through as `cache_mode`. Leave null unless you know the Crawl4AI cache semantics you need.",
-        examples=["BYPASS"],
+        description=(
+            "Optional Crawl4AI cache mode, folded into `crawler_config.cache_mode` where Crawl4AI reads it. One of "
+            "`enabled`, `disabled`, `read_only`, `write_only`, `bypass` (case-insensitive); an explicit `crawler_config.cache_mode` wins over "
+            "this field. Leave null for the Crawl4AI default."
+        ),
+        examples=["bypass"],
     )
     browser_config: dict[str, Any] = Field(
         default_factory=dict,
@@ -222,27 +231,20 @@ class CrawlRequest(BaseModel):
     crawler_config: dict[str, Any] = Field(
         default_factory=dict,
         description=(
-            "Crawl4AI crawler/run options. Each key must be in the server allowlist *and* each value a plain scalar or list of scalars; "
-            "anything else is rejected with 422 `validation_error` naming the offending key. Nested objects (including `{\"type\": ...}` "
-            "typed-object wrappers) and LLM/proxy/browser/JS keys such as `llm_config`, `proxy_config`, `check_robots_txt`, "
-            "`link_preview_config`, `js_code` and `user_data_dir` are never forwarded. `wait_for` must be a CSS selector prefixed with "
-            "`css:`, and `max_retries` is capped at 2."
+            "Crawl4AI crawler/run options, where Crawl4AI actually reads them. Each key must be in the server allowlist *and* each value a "
+            "plain scalar or list of scalars; anything else is rejected with 422 `validation_error` naming the offending key. Nested objects "
+            "(including `{\"type\": ...}` typed-object wrappers) and LLM/proxy/browser/JS keys such as `llm_config`, `proxy_config`, "
+            "`check_robots_txt`, `link_preview_config`, `js_code` and `user_data_dir` are never forwarded. `wait_for` must be a CSS selector "
+            "prefixed with `css:`, and `max_retries` is capped at 2. Wins over `crawl_options` and `cache_mode` on conflict."
         ),
         examples=[{"wait_until": "networkidle", "css_selector": "main"}],
-    )
-    extraction_config: dict[str, Any] = Field(
-        default_factory=dict,
-        description=(
-            "Extraction options, validated against the same scalar allowlist as `crawler_config`. Crawl4AI 0.9.4's `/crawl` takes extraction "
-            "settings inside `crawler_config`, so this field is validated and forwarded but not honoured upstream; prefer `crawler_config`."
-        ),
-        examples=[{}],
     )
     crawl_options: dict[str, CrawlOptionValue] = Field(
         default_factory=dict,
         description=(
-            "Top-level Crawl4AI options, validated against the same scalar allowlist as `crawler_config`. `url` and `urls` are rejected "
-            "so callers cannot bypass URL validation. Prefer the named fields above."
+            "Crawler options merged into `crawler_config` before it is sent (Crawl4AI 0.9.x ignores top-level options, so passing them here "
+            "as before would silently do nothing). Validated against the same scalar allowlist; `url` and `urls` are rejected so callers "
+            "cannot bypass URL validation. `crawler_config` wins on conflict."
         ),
         examples=[{"screenshot": False, "word_count_threshold": 10}],
     )
@@ -854,7 +856,10 @@ async def call_crawl4ai(client: httpx.AsyncClient, payload: dict[str, Any]):
 # configs as Provenance.UNTRUSTED regardless of the bearer token, but that gate
 # silently *drops* unknown fields; the API edge must reject loudly instead, and
 # never forward a key that can reach an LLM, proxy, browser or JS sink.
-CRAWL_PASSTHROUGH_FIELDS = ("crawler_config", "crawl_options", "extraction_config")
+CRAWL_PASSTHROUGH_FIELDS = ("crawler_config", "crawl_options")
+
+# Crawl4AI's CacheMode enum, which is what the typed form below must carry.
+CRAWL_CACHE_MODES = ("enabled", "disabled", "read_only", "write_only", "bypass")
 
 CRAWL_ALLOWED_KEYS = frozenset({
     # timing / waiting
@@ -917,6 +922,8 @@ def _crawl_value_violation(key: str, value: Any) -> str | None:
         isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= CRAWL_MAX_RETRIES
     ):
         return f"'max_retries' must be an integer between 0 and {CRAWL_MAX_RETRIES}"
+    if key == "cache_mode" and not (isinstance(value, str) and value.lower() in CRAWL_CACHE_MODES):
+        return f"'cache_mode' must be one of: {', '.join(CRAWL_CACHE_MODES)}"
     return None
 
 
@@ -927,6 +934,10 @@ def validate_crawl_passthrough(request: CrawlRequest) -> None:
     a `{"type": ...}` typed-object wrapper, so any dict at any depth is refused.
     """
     problems: list[dict[str, Any]] = []
+    if request.cache_mode is not None and request.cache_mode.lower() not in CRAWL_CACHE_MODES:
+        problems.append(
+            _crawl_violation(["cache_mode"], f"'cache_mode' must be one of: {', '.join(CRAWL_CACHE_MODES)}")
+        )
     if request.browser_config:
         problems.append(
             _crawl_violation(
@@ -960,18 +971,27 @@ def validate_crawl_passthrough(request: CrawlRequest) -> None:
 
 def build_crawl_payload(request: CrawlRequest):
     validate_crawl_passthrough(request)
-    payload: dict[str, Any] = {"urls": [request.url]}
-    for key, value in request.crawl_options.items():
-        if key not in {"url", "urls"}:
-            payload[key] = value
+
+    # Crawl4AI 0.9.x reads crawler settings only from `crawler_config` and drops
+    # any other top-level key, so crawl_options and cache_mode are folded in
+    # here. An explicit crawler_config value still wins over both.
+    crawler_config: dict[str, Any] = dict(request.crawl_options)
     if request.cache_mode is not None:
-        payload["cache_mode"] = request.cache_mode
-    if request.browser_config:
-        payload["browser_config"] = request.browser_config
-    if request.crawler_config:
-        payload["crawler_config"] = request.crawler_config
-    if request.extraction_config:
-        payload["extraction_config"] = request.extraction_config
+        crawler_config["cache_mode"] = request.cache_mode
+    crawler_config.update(request.crawler_config)
+
+    if "cache_mode" in crawler_config:
+        # CacheMode is an Enum and the server does not coerce a bare string, so
+        # "bypass" sent as a plain scalar would silently never engage the cache.
+        # Only the typed form works (verified against the 0.9.4 server:
+        # cache_status goes "miss" -> "hit" for the typed form, stays "miss" for
+        # the scalar).
+        mode = crawler_config["cache_mode"]
+        crawler_config["cache_mode"] = {"type": "CacheMode", "params": mode.lower() if isinstance(mode, str) else mode}
+
+    payload: dict[str, Any] = {"urls": [request.url]}
+    if crawler_config:
+        payload["crawler_config"] = crawler_config
     return payload
 
 
