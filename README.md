@@ -120,8 +120,10 @@ curl -X POST 'https://webcrawl.sparkfn.io/crawl' \
   forwarded, and only as plain scalars or lists of scalars.
 - `crawl_options`: top-level Crawl4AI options, merged into `crawler_config` before it is sent
   (`crawler_config` wins on conflict), under the same allowlist.
-- `browser_config` and `extraction_config` are **not** accepted from the public API: the server owns
-  browser and stealth settings, and extraction belongs in `crawler_config`. Either one returns 422.
+- `browser_config` is **not** accepted from the public API: the server owns browser and stealth
+  settings, so any value returns 422.
+- `extraction_config` is deprecated and ignored. It is accepted only when empty (`{}` or omitted);
+  a non-empty value returns 422. Put extraction settings in `crawler_config`.
 
 ## Crawl stealth defaults
 
