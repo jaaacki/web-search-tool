@@ -1,30 +1,30 @@
-{"q": "crawl4ai cache_mode options", "expect_domains": ["docs.crawl4ai.com"], "expect_terms": ["cache_mode"]}
-{"q": "python urllib.request timeout parameter", "expect_domains": ["docs.python.org"], "expect_terms": ["timeout"]}
+{"q": "crawl4ai cache_mode options", "expect_domains": ["docs.crawl4ai.com"], "expect_terms": ["BYPASS"]}
+{"q": "python urllib.request timeout parameter", "expect_domains": ["docs.python.org"], "expect_terms": ["socket"]}
 {"q": "fastapi dependency injection yield cleanup", "expect_domains": ["fastapi.tiangolo.com"], "expect_terms": ["Depends"]}
-{"q": "docker compose healthcheck depends_on service_healthy", "expect_domains": ["docs.docker.com"], "expect_terms": ["service_healthy"]}
-{"q": "searxng settings.yml engines list configuration", "expect_domains": ["docs.searxng.org"], "expect_terms": ["engines"]}
-{"q": "uvicorn workers gunicorn multiple processes", "expect_domains": ["www.uvicorn.org"], "expect_terms": ["workers"]}
-{"q": "postgresql jsonb gin index", "expect_domains": ["www.postgresql.org"], "expect_terms": ["GIN"]}
-{"q": "nginx proxy_pass websocket upgrade headers", "expect_domains": ["nginx.org"], "expect_terms": ["Upgrade"]}
-{"q": "redis expire key ttl command", "expect_domains": ["redis.io"], "expect_terms": ["EXPIRE"]}
-{"q": "kubernetes liveness probe vs readiness probe", "expect_domains": ["kubernetes.io"], "expect_terms": ["readiness"]}
+{"q": "docker compose healthcheck depends_on service_healthy", "expect_domains": ["docs.docker.com"], "expect_terms": ["start_period"]}
+{"q": "searxng settings.yml engines list configuration", "expect_domains": ["docs.searxng.org"], "expect_terms": ["use_default_settings"]}
+{"q": "uvicorn workers gunicorn multiple processes", "expect_domains": ["www.uvicorn.org"], "expect_terms": ["--workers"]}
+{"q": "postgresql jsonb gin index", "expect_domains": ["www.postgresql.org"], "expect_terms": ["jsonb_path_ops"]}
+{"q": "nginx proxy_pass websocket upgrade headers", "expect_domains": ["nginx.org"], "expect_terms": ["101"]}
+{"q": "redis expire key ttl command", "expect_domains": ["redis.io"], "expect_terms": ["seconds"]}
+{"q": "kubernetes liveness probe vs readiness probe", "expect_domains": ["kubernetes.io"], "expect_terms": ["restart"]}
 {"q": "boiling point of ethanol", "expect_domains": ["en.wikipedia.org", "www.britannica.com"], "expect_terms": ["78"]}
 {"q": "speed of light in vacuum value", "expect_domains": ["en.wikipedia.org"], "expect_terms": ["299"]}
 {"q": "who wrote pride and prejudice", "expect_domains": ["en.wikipedia.org"], "expect_terms": ["Austen"]}
 {"q": "capital city of australia", "expect_domains": ["en.wikipedia.org"], "expect_terms": ["Canberra"]}
-{"q": "chemical symbol for tungsten", "expect_domains": ["en.wikipedia.org"], "expect_terms": ["tungsten"]}
+{"q": "chemical symbol for tungsten", "expect_domains": ["en.wikipedia.org"], "expect_terms": ["74"]}
 {"q": "how many bones in the human body", "expect_domains": ["en.wikipedia.org", "www.britannica.com"], "expect_terms": ["206"]}
-{"q": "how tall is mount everest in metres", "expect_domains": ["en.wikipedia.org"], "expect_terms": ["8,848", "8848"]}
+{"q": "how tall is mount everest in metres", "expect_domains": ["en.wikipedia.org"], "expect_terms": ["8,848"]}
 {"q": "when was the eiffel tower completed", "expect_domains": ["en.wikipedia.org"], "expect_terms": ["1889"]}
-{"q": "crawl4ai release notes changelog", "expect_domains": ["github.com"], "expect_terms": ["crawl4ai"]}
-{"q": "python 3.14 release what's new", "expect_domains": ["docs.python.org", "www.python.org"], "expect_terms": ["3.14"]}
-{"q": "cloudflare workers free tier limits", "expect_domains": ["developers.cloudflare.com"], "expect_terms": ["requests"]}
-{"q": "hetzner cloud cx22 vps price", "expect_domains": ["www.hetzner.com"], "expect_terms": ["CX22"]}
-{"q": "digitalocean droplet pricing per month", "expect_domains": ["www.digitalocean.com"], "expect_terms": ["per month"]}
-{"q": "anthropic claude api pricing per million tokens", "expect_domains": ["www.anthropic.com", "docs.anthropic.com"], "expect_terms": ["million"]}
-{"q": "github actions runner image deprecation schedule", "expect_domains": ["github.blog", "docs.github.com"], "expect_terms": ["deprecat"]}
-{"q": "chrome net::ERR_CONNECTION_RESET docker container", "expect_domains": ["stackoverflow.com", "github.com"], "expect_terms": ["ERR_CONNECTION_RESET"]}
-{"q": "searxng bing engine rate limit too many requests", "expect_domains": ["github.com", "docs.searxng.org"], "expect_terms": ["rate limit", "limited"]}
-{"q": "headless chromium memory usage tuning flags", "expect_domains": ["github.com", "stackoverflow.com"], "expect_terms": ["memory"]}
-{"q": "traefik letsencrypt cloudflare dns challenge wildcard certificate", "expect_domains": ["doc.traefik.io"], "expect_terms": ["dnsChallenge", "wildcard"]}
-{"q": "systemd restart on failure start limit burst", "expect_domains": ["www.freedesktop.org", "man7.org"], "expect_terms": ["StartLimitBurst", "burst"]}
+{"q": "crawl4ai release notes changelog", "expect_domains": ["github.com"], "expect_terms": ["0.9"]}
+{"q": "python 3.14 release what's new", "expect_domains": ["docs.python.org", "www.python.org"], "expect_terms": ["free-threading"]}
+{"q": "cloudflare workers free tier limits", "expect_domains": ["developers.cloudflare.com"], "expect_terms": ["100,000"]}
+{"q": "hetzner cloud cx22 vps price", "expect_domains": ["www.hetzner.com"], "expect_terms": ["€"]}
+{"q": "digitalocean droplet pricing per month", "expect_domains": ["www.digitalocean.com"], "expect_terms": ["$6"]}
+{"q": "anthropic claude api pricing per million tokens", "expect_domains": ["www.anthropic.com", "docs.anthropic.com"], "expect_terms": ["MTok"]}
+{"q": "github actions runner image deprecation schedule", "expect_domains": ["github.blog", "docs.github.com"], "expect_terms": ["ubuntu-20.04"]}
+{"q": "chrome net::ERR_CONNECTION_RESET docker container", "expect_domains": ["stackoverflow.com", "github.com"], "expect_terms": ["mtu"]}
+{"q": "searxng bing engine rate limit too many requests", "expect_domains": ["github.com", "docs.searxng.org"], "expect_terms": ["suspended"]}
+{"q": "headless chromium memory usage tuning flags", "expect_domains": ["github.com", "stackoverflow.com"], "expect_terms": ["dev-shm"]}
+{"q": "traefik letsencrypt cloudflare dns challenge wildcard certificate", "expect_domains": ["doc.traefik.io"], "expect_terms": ["dnsChallenge"]}
+{"q": "systemd restart on failure start limit burst", "expect_domains": ["www.freedesktop.org", "man7.org"], "expect_terms": ["StartLimitBurst"]}

@@ -53,13 +53,21 @@ def search(base, key, query, depth=None):
     }
 
 
-def domain_of(url):
-    host = urllib.parse.urlparse(url).netloc.split("@")[-1].split(":")[0].lower()
+def normalize_domain(value):
+    """Reduce a URL or a bare domain to a comparable host: lower case, no www."""
+    host = urllib.parse.urlparse(value if "//" in value else f"//{value}").netloc or value
+    host = host.split("@")[-1].split(":")[0].lower()
     return host[4:] if host.startswith("www.") else host
 
 
+def domain_hit(url, expected):
+    """Exact host, or a subdomain of an expected domain (docs.x.org counts for x.org)."""
+    host = normalize_domain(url)
+    return any(host == want or host.endswith(f".{want}") for want in map(normalize_domain, expected))
+
+
 def score(batch, query):
-    expected = set(query["expect_domains"])
+    expected = query["expect_domains"]
     top = batch["results"][:TOP_N]
     terms = [term.lower() for term in query["expect_terms"]]
 
@@ -72,7 +80,7 @@ def score(batch, query):
         "latency": batch["latency"],
         "error": batch["error"],
         "results": len(batch["results"]),
-        "domain_hit@5": any(domain_of(result.get("url", "")) in expected for result in top),
+        "domain_hit@5": any(domain_hit(result.get("url", ""), expected) for result in top),
         "term_hit@1": bool(top) and hit(0),
         "term_hit@5": any(hit(index) for index in range(len(top))),
         "empty": not batch["results"],
@@ -145,6 +153,12 @@ def main():
         parser.error("--base and --key are required unless --compare is used")
 
     queries = [json.loads(line) for line in args.queries.read_text().splitlines() if line.strip()]
+    for query in queries:
+        # A term already in the query is matched by nav junk and by any page that
+        # echoes the question, so it cannot show whether an answer was retrieved.
+        for term in query["expect_terms"]:
+            if term.lower() in query["q"].lower():
+                raise SystemExit(f"expect_term {term!r} appears in its own query {query['q']!r}: terms must be answer-bearing")
     print(f"{len(queries)} queries against {args.base}" + (f" depth={args.depth}" if args.depth else ""))
     started = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
