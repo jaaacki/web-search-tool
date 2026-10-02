@@ -5,7 +5,8 @@ Self-hosted stack for `websearch.sparkfn.io` and controlled headless crawling at
 - `api`: OpenAPI/Swagger-compatible search and crawl API exposed through Traefik.
 - `searxng`: internal URL discovery service.
 - `crawl4ai`: internal page extraction service used by the API.
-- `reranker`: internal lightweight lexical reranker API.
+- `reranker`: internal cross-encoder reranking service (Hugging Face TEI). The API's lexical
+  prefilter lives in `api/app.py`; this container only scores query/document pairs.
 
 `api` is routed by Traefik through `traefik/websearch.sparkfn.io.yml`. `webcrawl.sparkfn.io` only routes `POST /crawl` to the API; Crawl4AI itself remains internal-only. Internal services use Docker `expose` only and are not host-published.
 
@@ -127,7 +128,7 @@ Internal services are not published to host ports. To debug them on the server, 
 ```bash
 docker compose exec searxng wget -qO- 'http://localhost:8080/search?q=test&format=json'
 docker compose exec crawl4ai wget -qO- 'http://localhost:11235/monitor/health'
-docker compose exec reranker python -c 'print("reranker container ok")'
+docker compose exec reranker curl -fsS http://localhost:7997/health
 ```
 
 ## Crawl4AI config
