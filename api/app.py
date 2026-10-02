@@ -225,7 +225,8 @@ class CrawlRequest(BaseModel):
             "Crawl4AI crawler/run options. Each key must be in the server allowlist *and* each value a plain scalar or list of scalars; "
             "anything else is rejected with 422 `validation_error` naming the offending key. Nested objects (including `{\"type\": ...}` "
             "typed-object wrappers) and LLM/proxy/browser/JS keys such as `llm_config`, `proxy_config`, `check_robots_txt`, "
-            "`link_preview_config`, `js_code` and `user_data_dir` are never forwarded."
+            "`link_preview_config`, `js_code` and `user_data_dir` are never forwarded. `wait_for` must be a CSS selector prefixed with "
+            "`css:`, and `max_retries` is capped at 2."
         ),
         examples=[{"wait_until": "networkidle", "css_selector": "main"}],
     )
@@ -889,6 +890,7 @@ CRAWL_FORBIDDEN_KEYS = frozenset({
 
 _CRAWL_SCALARS = (str, bool, int, float)
 CRAWL_ALLOWED_KEYS_HINT = ", ".join(sorted(CRAWL_ALLOWED_KEYS))
+CRAWL_MAX_RETRIES = 2
 
 
 def _crawl_violation(loc: list[str], message: str) -> dict[str, Any]:
@@ -902,6 +904,20 @@ def _is_plain_crawl_value(value: Any) -> bool:
     return isinstance(value, list) and all(
         item is None or isinstance(item, _CRAWL_SCALARS) for item in value
     )
+
+
+def _crawl_value_violation(key: str, value: Any) -> str | None:
+    """Extra rules for values that are plain scalars but still dangerous."""
+    if key == "wait_for" and not (isinstance(value, str) and value.startswith("css:")):
+        # smart_wait() runs anything that is not a `css:` selector as JavaScript
+        # (`js:` prefix, a bare `() =>`/`function`, or any other value wrapped in
+        # `() => { ... }`), so `wait_for` is a JS sink like `js_code`.
+        return "'wait_for' must be a CSS selector prefixed with 'css:'; JavaScript wait conditions are not accepted"
+    if key == "max_retries" and not (
+        isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= CRAWL_MAX_RETRIES
+    ):
+        return f"'max_retries' must be an integer between 0 and {CRAWL_MAX_RETRIES}"
+    return None
 
 
 def validate_crawl_passthrough(request: CrawlRequest) -> None:
@@ -936,6 +952,8 @@ def validate_crawl_passthrough(request: CrawlRequest) -> None:
                 )
             elif not _is_plain_crawl_value(value):
                 problems.append(_crawl_violation(loc, f"'{key}' must be a scalar or list of scalars"))
+            elif (violation := _crawl_value_violation(key, value)) is not None:
+                problems.append(_crawl_violation(loc, violation))
     if problems:
         raise AppError(422, "validation_error", "Request validation failed", problems)
 

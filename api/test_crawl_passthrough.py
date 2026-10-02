@@ -11,56 +11,75 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from app import AppError, CrawlRequest, validate_crawl_passthrough
 
-ALLOWED_KEYS = {
-    "wait_until": "networkidle",
-    "css_selector": "main",
-    "page_timeout": 30000,
-    "screenshot": False,
-    "excluded_tags": ["script", "style"],
-    "exclude_domains": ["example.com"],
-    "cache_mode": "BYPASS",
+ALLOWED = {
+    "crawler_config": [
+        {"wait_until": "networkidle"},
+        {"css_selector": "main"},
+        {"page_timeout": 30000},
+        {"screenshot": False},
+        {"excluded_tags": ["script", "style"]},
+        {"exclude_domains": ["example.com"]},
+        {"cache_mode": "BYPASS"},
+        {"wait_for": "css:main article"},
+        {"max_retries": 2},
+    ],
+    "crawl_options": [{"screenshot": True}, {"css_selector": "h1"}],
+    "extraction_config": [{"word_count_threshold": 10}],
 }
 
-FORBIDDEN_KEYS = {
-    "crawler_config": {"check_robots_txt": True},
-    "crawler_config.link_preview": {"link_preview_config": {"url": "http://169.254.169.254/"}},
-    "crawler_config.typed_wrapper": {"x": {"type": "dict", "value": {}}},
-    "crawler_config.typed_under_allowed": {"css_selector": {"type": "dict", "value": "h1"}},
-    "crawler_config.typed_in_list": {"excluded_tags": [{"type": "dict", "value": {}}]},
-    "crawler_config.llm_config": {"llm_config": {}},
-    "crawler_config.js_code": {"js_code": "fetch('/')"},
-    "crawler_config.browser_user_data_dir": {"user_data_dir": "/tmp/x"},
-    "crawled_options.browser_prefix": {"browser_type": "chromium"},
-    "extraction_config.proxy_config": {"proxy_config": {"server": "http://evil"}},
-}
+# (field, config) -> the request must be refused with 422 validation_error.
+FORBIDDEN = [
+    ("crawler_config", {"check_robots_txt": True}),
+    ("crawler_config", {"link_preview_config": {"url": "http://169.254.169.254/"}}),
+    ("crawler_config", {"x": {"type": "dict", "value": {}}}),
+    ("crawler_config", {"css_selector": {"type": "dict", "value": "h1"}}),
+    ("crawler_config", {"excluded_tags": [{"type": "dict", "value": {}}]}),
+    ("crawler_config", {"llm_config": {}}),
+    ("crawler_config", {"js_code": "fetch('/')"}),
+    ("crawler_config", {"user_data_dir": "/tmp/x"}),
+    ("crawler_config", {"wait_for": "js:() => fetch('http://169.254.169.254/')"}),
+    ("crawler_config", {"wait_for": "() => true"}),
+    ("crawler_config", {"wait_for": "fetch('http://169.254.169.254/')"}),
+    ("crawler_config", {"max_retries": 3}),
+    ("crawl_options", {"llm_config": {}}),
+    ("crawl_options", {"urls": ["http://169.254.169.254/"]}),
+    ("crawl_options", {"browser_type": "chromium"}),
+    ("crawl_options", {"user_data_dir": "/tmp/x"}),
+    ("extraction_config", {"proxy_config": {"server": "http://evil"}}),
+    ("extraction_config", {"wait_for": "js:1"}),
+]
 
 
-def rejects(request: CrawlRequest) -> dict:
+def request(field: str, config: dict) -> CrawlRequest:
+    return CrawlRequest(url="https://example.com", **{field: config})
+
+
+def rejects(field: str, config: dict) -> dict:
     try:
-        validate_crawl_passthrough(request)
+        validate_crawl_passthrough(request(field, config))
     except AppError as exc:
         assert (exc.status_code, exc.code) == (422, "validation_error"), (exc.status_code, exc.code)
-        return exc.details[0]
-    raise AssertionError("expected 422 validation_error")
+        detail = exc.details[0]
+        assert detail["loc"][0] == field, detail
+        assert detail["type"] == "value_error", detail
+        return detail
+    raise AssertionError(f"expected 422 for {field}: {config}")
 
 
 def demo() -> None:
-    for key, value in ALLOWED_KEYS.items():
-        validate_crawl_passthrough(CrawlRequest(url="https://example.com", crawler_config={key: value}))
+    for field, configs in ALLOWED.items():
+        for config in configs:
+            validate_crawl_passthrough(request(field, config))
 
-    for label, config in FORBIDDEN_KEYS.items():
-        detail = rejects(CrawlRequest(url="https://example.com", crawler_config=config))
-        assert detail["loc"][0] == "crawler_config", (label, detail)
-        assert detail["type"] == "value_error", (label, detail)
+    for field, config in FORBIDDEN:
+        rejects(field, config)
 
-    assert rejects(CrawlRequest(url="https://example.com", browser_config={"headless": True}))["loc"] == ["browser_config"]
-    assert rejects(CrawlRequest(url="https://example.com", crawl_options={"llm_config": {}}))["loc"] == [
-        "crawl_options",
-        "llm_config",
-    ]
-    assert rejects(CrawlRequest(url="https://example.com", crawl_options={"urls": ["http://x"]}))["loc"][1] == "urls"
-    assert rejects(CrawlRequest(url="https://example.com", crawler_config={"nope": 1}))["loc"][1] == "nope"
-    assert "allowed keys:" in rejects(CrawlRequest(url="https://example.com", crawler_config={"nope": 1}))["msg"]
+    assert rejects("crawler_config", {"wait_for": "js:1"})["loc"] == ["crawler_config", "wait_for"]
+    assert rejects("crawler_config", {"max_retries": 3})["loc"] == ["crawler_config", "max_retries"]
+    assert rejects("crawler_config", {"browser_config": {"headless": True}})["loc"][1] == "browser_config"
+    assert rejects("crawler_config", {"browser_type": "chromium"})["loc"][1] == "browser_type"
+    assert "allowed keys:" in rejects("crawler_config", {"nope": 1})["msg"]
+    assert rejects("browser_config", {"headless": True})["loc"] == ["browser_config"]
 
     assert CrawlRequest(url="https://example.com").browser_config == {}
     print("crawl passthrough allowlist: ok")
