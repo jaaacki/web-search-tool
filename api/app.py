@@ -47,8 +47,11 @@ BRAVE_API_KEYS = tuple(key.strip() for key in os.getenv("BRAVE_API_KEYS", "").sp
 BRAVE_SEARCH_URL = os.getenv("BRAVE_SEARCH_URL", "https://api.search.brave.com/res/v1/web/search").rstrip("/")
 BRAVE_TIMEOUT = float(os.getenv("BRAVE_TIMEOUT", "8"))
 # Fences SearXNG discovery per request: settings.yml merges with defaults, so
-# the allowlist lives here where every search routes through.
-SEARXNG_ENGINES = os.getenv("SEARXNG_ENGINES", "bing,mojeek,marginalia")
+# the allowlist lives here where every search routes through. Every engine named
+# here must be active in the pinned image - an engine the image marks `inactive`
+# is absent from /config and can never be re-enabled by config, which silently
+# collapses discovery onto the remaining engines.
+SEARXNG_ENGINES = os.getenv("SEARXNG_ENGINES", "bing,brave,duckduckgo,google cse")
 DISCOVERY_TIMEOUT = float(os.getenv("DISCOVERY_TIMEOUT", "20"))
 CRAWL_TIMEOUT = float(os.getenv("CRAWL_TIMEOUT", "45"))
 RERANK_TIMEOUT = float(os.getenv("RERANK_TIMEOUT", "4"))
@@ -818,6 +821,11 @@ async def search_searxng(client: httpx.AsyncClient, query: str, limit: int):
         payload = response.json()
     except (httpx.HTTPError, ValueError) as exc:
         raise AppError(502, "searxng_error", "SearXNG search failed", {"error": str(exc)}) from exc
+
+    unresponsive = payload.get("unresponsive_engines") or []
+    if unresponsive:
+        # A dead engine otherwise only shows up as fewer or zero results.
+        logger.warning("searxng engines unresponsive: %s", ", ".join(str(entry) for entry in unresponsive))
 
     return await shape_candidates(payload.get("results", []), limit)
 
