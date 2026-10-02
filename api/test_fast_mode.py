@@ -49,6 +49,13 @@ def test_snippet_pages_use_the_snippet_as_content():
     ]
 
 
+def test_snippetless_results_fall_back_to_the_title():
+    # An empty passage scores nothing, so discovery results with no snippet still
+    # reach the reranker carrying their title. The snippet field stays truthful.
+    pages = app.snippet_pages([{"url": "https://c.example/", "title": "C title", "snippet": ""}])
+    assert pages == [{"url": "https://c.example/", "title": "C title", "snippet": "", "content": "C title"}]
+
+
 def test_short_snippets_survive_to_the_reranker():
     # Basic mode must not run page-boilerplate filtering over snippets: it drops
     # short lines, which is most snippets, including "Another snippet." here.

@@ -819,10 +819,17 @@ def snippet_pages(candidates: list[dict]) -> list[dict]:
     """Basic-depth passages: the discovery snippet stands in for page content.
 
     No crawl happens, which is the whole point of the tier - the caller is picking
-    URLs to follow up, not reading pages.
+    URLs to follow up, not reading pages. Some discovery results carry no snippet
+    at all, and an empty passage gives the reranker nothing to score, so the title
+    is the fallback.
     """
     return [
-        {"url": item["url"], "title": item["title"], "snippet": item["snippet"], "content": item["snippet"]}
+        {
+            "url": item["url"],
+            "title": item["title"],
+            "snippet": item["snippet"],
+            "content": item["snippet"] or item["title"],
+        }
         for item in candidates
     ]
 
