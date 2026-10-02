@@ -95,7 +95,9 @@ services:
       crawl4ai:
         condition: service_healthy
       reranker:
-        condition: service_healthy
+        # Only "started": a reranker still downloading its model must not hold the API
+        # back, since search falls back to lexical order until it is up.
+        condition: service_started
     restart: unless-stopped
     networks:
       - internal
