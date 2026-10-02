@@ -46,6 +46,17 @@ def test_never_sends_keys_the_untrusted_gate_rejects():
     assert not {"magic", "override_navigator"} & set(payload["crawler_config"])
 
 
+def test_search_path_config_keeps_its_keys_and_gains_defaults():
+    """#12's search-path crawler config is authoritative; the fill only adds gaps."""
+    payload = app.with_stealth_defaults({"urls": ["https://a.example"], "crawler_config": app.SEARCH_CRAWLER_CONFIG})
+    merged = payload["crawler_config"]
+    for key, value in app.SEARCH_CRAWLER_CONFIG.items():
+        assert merged[key] == value, f"{key} must survive the fill unchanged"
+    assert merged["markdown_generator"]["params"]["content_filter"]["type"] == "PruningContentFilter"
+    assert merged["locale"] == "en-US", "stealth defaults still fill the keys the search path omits"
+    assert app.SEARCH_CRAWLER_CONFIG.get("locale") is None, "guard: the config above really is unchanged"
+
+
 def test_defaults_are_not_mutated_between_calls():
     app.with_stealth_defaults({"urls": ["https://a.example"], "crawler_config": {"max_retries": 2}})
     assert app.STEALTH_CRAWLER_CONFIG["max_retries"] == 1, "module defaults must not be shared into payloads"
