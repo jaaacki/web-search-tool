@@ -184,6 +184,15 @@ class SearchRequest(BaseModel):
         ),
         examples=[10],
     )
+    depth: Literal["basic", "advanced"] = Field(
+        default="advanced",
+        description=(
+            "How much work each result costs. `advanced` (default) crawls every candidate page and returns a cleaned passage from the page "
+            "itself. `basic` skips crawling and returns the discovery snippet as `content`, so it answers in about a second instead of "
+            "5-45; use it when you only need to choose URLs, and re-query with `advanced` (or crawl the URL) once you need the text."
+        ),
+        examples=["basic"],
+    )
 
 
 class SearchResult(BaseModel):
@@ -525,24 +534,30 @@ async def search(request: SearchRequest):
         return search_response(request.query, [])
 
     discovered = time.perf_counter()
-    try:
-        pages = await asyncio.wait_for(crawl_all(client, candidates), timeout=CRAWL_TIMEOUT)
-    except asyncio.TimeoutError:
-        logger.warning("crawl timed out after %.0fs", CRAWL_TIMEOUT)
-        pages = []
+    if request.depth == "basic":
+        pages = snippet_pages(candidates)
+    else:
+        try:
+            pages = await asyncio.wait_for(crawl_all(client, candidates), timeout=CRAWL_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.warning("crawl timed out after %.0fs", CRAWL_TIMEOUT)
+            pages = []
     if not pages:
         logger.info(
-            "search q=%r candidates=%d results=0 discovery=%.0fms crawl=%.0fms elapsed=%.0fms",
-            request.query, len(candidates), _ms(started, discovered), _ms(discovered), _ms(started),
+            "search q=%r depth=%s candidates=%d results=0 discovery=%.0fms crawl=%.0fms elapsed=%.0fms",
+            request.query, request.depth, len(candidates), _ms(started, discovered), _ms(discovered), _ms(started),
         )
         return search_response(request.query, [])
 
     crawled = time.perf_counter()
-    chunks = chunk_documents(pages)
+    # Basic pages are already the passages: a snippet is a clean summary, and the
+    # boilerplate filter is tuned for page markdown (it drops short lines, which is
+    # most snippets), so they go to the reranker as-is.
+    chunks = pages if request.depth == "basic" else chunk_documents(pages)
     ranked, rerank_path = await rerank(client, request.query, chunks, request.max_results)
     logger.info(
-        "search q=%r candidates=%d pages=%d chunks=%d results=%d discovery=%.0fms crawl=%.0fms rerank=%.0fms elapsed=%.0fms rerank_path=%s",
-        request.query, len(candidates), len(pages), len(chunks), len(ranked),
+        "search q=%r depth=%s candidates=%d pages=%d chunks=%d results=%d discovery=%.0fms crawl=%.0fms rerank=%.0fms elapsed=%.0fms rerank_path=%s",
+        request.query, request.depth, len(candidates), len(pages), len(chunks), len(ranked),
         _ms(started, discovered), _ms(discovered, crawled), _ms(crawled), _ms(started), rerank_path,
     )
 
@@ -586,8 +601,13 @@ async def search_get(
         description="Candidate discovery count before crawling/reranking. Same as SearchRequest.candidates.",
         examples=[10],
     ),
+    depth: Literal["basic", "advanced"] = Query(
+        default="advanced",
+        description="Skip page crawling and return discovery snippets. Same as SearchRequest.depth.",
+        examples=["basic"],
+    ),
 ):
-    return await search(SearchRequest(query=q, max_results=max_results, candidates=candidates))
+    return await search(SearchRequest(query=q, max_results=max_results, candidates=candidates, depth=depth))
 
 
 @app.post(
@@ -796,6 +816,25 @@ async def search_searxng(client: httpx.AsyncClient, query: str, limit: int):
         raise AppError(502, "searxng_error", "SearXNG search failed", {"error": str(exc)}) from exc
 
     return await shape_candidates(payload.get("results", []), limit)
+
+
+def snippet_pages(candidates: list[dict]) -> list[dict]:
+    """Basic-depth passages: the discovery snippet stands in for page content.
+
+    No crawl happens, which is the whole point of the tier - the caller is picking
+    URLs to follow up, not reading pages. Some discovery results carry no snippet
+    at all, and an empty passage gives the reranker nothing to score, so the title
+    is the fallback.
+    """
+    return [
+        {
+            "url": item["url"],
+            "title": item["title"],
+            "snippet": item["snippet"],
+            "content": item["snippet"] or item["title"],
+        }
+        for item in candidates
+    ]
 
 
 async def crawl_all(client: httpx.AsyncClient, candidates: list[dict]):
