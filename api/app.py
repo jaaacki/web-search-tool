@@ -880,7 +880,11 @@ async def crawl_url(client: httpx.AsyncClient, result: dict):
         return None
 
     try:
-        payload = await call_crawl4ai(client, {"urls": [result["url"]]})
+        # Same cleaned extraction as the bulk call: this is the per-URL fallback,
+        # and without the config it would quietly hand back raw nav markdown.
+        payload = await call_crawl4ai(
+            client, {"urls": [result["url"]], "crawler_config": SEARCH_CRAWLER_CONFIG}
+        )
     except AppError:
         return None
 
