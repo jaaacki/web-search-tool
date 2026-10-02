@@ -4,11 +4,14 @@ services:
     expose:
       - "8080"
     volumes:
-      - ./searxng:/etc/searxng:rw
+      # Read-only: config is owned by the host checkout, not the container.
+      - ./searxng:/etc/searxng:ro
       - ./data/searxng:/var/cache/searxng:rw
     environment:
       - SEARXNG_BASE_URL=https://websearch.sparkfn.io/searxng/
       - SEARXNG_SECRET=${SEARXNG_SECRET:?set SEARXNG_SECRET in .env}
+      # The entrypoint otherwise chowns ./searxng to uid 977, which breaks `git pull` on the host (#30).
+      - FORCE_OWNERSHIP=false
     restart: unless-stopped
     networks:
       - internal
