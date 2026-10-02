@@ -213,24 +213,35 @@ class CrawlRequest(BaseModel):
     )
     browser_config: dict[str, Any] = Field(
         default_factory=dict,
-        description="Advanced Crawl4AI browser configuration object passed through unchanged. Leave empty for normal headless crawling.",
-        examples=[{"headless": True}],
+        description=(
+            "Not accepted from the public API. The server owns browser and stealth settings, so any non-empty value is rejected with "
+            "422 `validation_error`. Kept in the schema only so the rejection is explicit rather than a silent drop."
+        ),
+        examples=[{}],
     )
     crawler_config: dict[str, Any] = Field(
         default_factory=dict,
-        description="Advanced Crawl4AI crawler/run configuration object passed through unchanged. Leave empty unless a specific Crawl4AI option is required.",
-        examples=[{"wait_until": "networkidle"}],
+        description=(
+            "Crawl4AI crawler/run options. Each key must be in the server allowlist *and* each value a plain scalar or list of scalars; "
+            "anything else is rejected with 422 `validation_error` naming the offending key. Nested objects (including `{\"type\": ...}` "
+            "typed-object wrappers) and LLM/proxy/browser/JS keys such as `llm_config`, `proxy_config`, `check_robots_txt`, "
+            "`link_preview_config`, `js_code` and `user_data_dir` are never forwarded."
+        ),
+        examples=[{"wait_until": "networkidle", "css_selector": "main"}],
     )
     extraction_config: dict[str, Any] = Field(
         default_factory=dict,
-        description="Advanced Crawl4AI extraction strategy/config object passed through unchanged. Leave empty for general page text extraction.",
+        description=(
+            "Extraction options, validated against the same scalar allowlist as `crawler_config`. Crawl4AI 0.9.4's `/crawl` takes extraction "
+            "settings inside `crawler_config`, so this field is validated and forwarded but not honoured upstream; prefer `crawler_config`."
+        ),
         examples=[{}],
     )
     crawl_options: dict[str, CrawlOptionValue] = Field(
         default_factory=dict,
         description=(
-            "Optional top-level Crawl4AI options passed through unchanged, except `url` and `urls` are ignored so callers cannot bypass URL validation. "
-            "Prefer the named fields above when available."
+            "Top-level Crawl4AI options, validated against the same scalar allowlist as `crawler_config`. `url` and `urls` are rejected "
+            "so callers cannot bypass URL validation. Prefer the named fields above."
         ),
         examples=[{"screenshot": False, "word_count_threshold": 10}],
     )
@@ -838,7 +849,99 @@ async def call_crawl4ai(client: httpx.AsyncClient, payload: dict[str, Any]):
         raise AppError(502, "crawl4ai_error", "Crawl4AI crawl failed", {"error": str(exc)}) from exc
 
 
+# Public /crawl passthrough hardening (#10). Crawl4AI's Docker server loads our
+# configs as Provenance.UNTRUSTED regardless of the bearer token, but that gate
+# silently *drops* unknown fields; the API edge must reject loudly instead, and
+# never forward a key that can reach an LLM, proxy, browser or JS sink.
+CRAWL_PASSTHROUGH_FIELDS = ("crawler_config", "crawl_options", "extraction_config")
+
+CRAWL_ALLOWED_KEYS = frozenset({
+    # timing / waiting
+    "wait_until", "wait_for", "wait_for_timeout", "page_timeout",
+    "delay_before_return_html", "body_visibility_timeout", "mean_delay", "max_range",
+    # content selection / cleaning
+    "word_count_threshold", "css_selector", "excluded_tags", "excluded_selector",
+    "target_elements", "only_text", "keep_data_attributes", "keep_attrs",
+    "remove_forms", "prettiify", "locale", "timezone_id",
+    # rendering / capture
+    "screenshot", "screenshot_wait_for", "scan_full_page", "scroll_delay",
+    "max_scroll_steps", "process_iframes", "flatten_shadow_dom",
+    "remove_overlay_elements", "adjust_viewport_to_content", "pdf", "capture_mhtml",
+    # cache
+    "cache_mode", "bypass_cache", "disable_cache", "no_cache_read", "no_cache_write",
+    # link / image filtering
+    "exclude_external_links", "exclude_internal_links", "exclude_domains",
+    "exclude_social_media_links", "exclude_external_images", "exclude_all_images",
+    "score_links", "preserve_https_for_internal_links",
+    # misc scalars
+    "verbose", "log_console", "method", "max_retries",
+})
+
+CRAWL_FORBIDDEN_KEYS = frozenset({
+    "llm_config", "proxy_config", "proxy_rotation_strategy", "check_robots_txt",
+    "link_preview_config", "js_code", "js_code_before_wait", "c4a_script",
+    "fallback_fetch_function", "user_data_dir", "cdp_url", "storage_state",
+    "extra_args", "init_scripts", "session_id", "deep_crawl_strategy",
+    "extraction_strategy", "scraping_strategy", "markdown_generator",
+    "chunking_strategy", "table_extraction", "virtual_scroll_config",
+    "geolocation", "hooks", "crawler_configs", "url", "urls",
+})
+
+_CRAWL_SCALARS = (str, bool, int, float)
+CRAWL_ALLOWED_KEYS_HINT = ", ".join(sorted(CRAWL_ALLOWED_KEYS))
+
+
+def _crawl_violation(loc: list[str], message: str) -> dict[str, Any]:
+    """One entry in the 422 `details` list, shaped like a pydantic error."""
+    return {"loc": loc, "msg": message, "type": "value_error"}
+
+
+def _is_plain_crawl_value(value: Any) -> bool:
+    if value is None or isinstance(value, _CRAWL_SCALARS):
+        return True
+    return isinstance(value, list) and all(
+        item is None or isinstance(item, _CRAWL_SCALARS) for item in value
+    )
+
+
+def validate_crawl_passthrough(request: CrawlRequest) -> None:
+    """Reject any /crawl config the public surface may not forward.
+
+    Values must be plain scalars (or lists of scalars): a nested object can carry
+    a `{"type": ...}` typed-object wrapper, so any dict at any depth is refused.
+    """
+    problems: list[dict[str, Any]] = []
+    if request.browser_config:
+        problems.append(
+            _crawl_violation(
+                ["browser_config"],
+                "browser_config is not accepted from the public API; the server owns browser settings",
+            )
+        )
+    for field in CRAWL_PASSTHROUGH_FIELDS:
+        for key, value in getattr(request, field).items():
+            loc = [field, key]
+            if key in CRAWL_FORBIDDEN_KEYS or key.startswith("browser_"):
+                problems.append(_crawl_violation(loc, f"'{key}' is not accepted from the public API"))
+            elif key not in CRAWL_ALLOWED_KEYS:
+                problems.append(
+                    _crawl_violation(loc, f"'{key}' is not an allowed key; allowed keys: {CRAWL_ALLOWED_KEYS_HINT}")
+                )
+            elif isinstance(value, dict):
+                problems.append(
+                    _crawl_violation(
+                        loc,
+                        f"'{key}' must be a scalar or list of scalars; nested objects are not accepted (typed-object injection)",
+                    )
+                )
+            elif not _is_plain_crawl_value(value):
+                problems.append(_crawl_violation(loc, f"'{key}' must be a scalar or list of scalars"))
+    if problems:
+        raise AppError(422, "validation_error", "Request validation failed", problems)
+
+
 def build_crawl_payload(request: CrawlRequest):
+    validate_crawl_passthrough(request)
     payload: dict[str, Any] = {"urls": [request.url]}
     for key, value in request.crawl_options.items():
         if key not in {"url", "urls"}:
