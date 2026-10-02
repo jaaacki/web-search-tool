@@ -31,7 +31,11 @@ RERANKER_URL = os.getenv("RERANKER_URL", "http://reranker:7997").rstrip("/")
 SEARCH_CANDIDATES = int(os.getenv("SEARCH_CANDIDATES", "10"))
 MAX_RESULTS = int(os.getenv("MAX_RESULTS", "5"))
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1800"))
-CHUNKS_PER_PAGE = int(os.getenv("CHUNKS_PER_PAGE", "3"))
+# Whole-page chunking budget per crawled page. The old first-N-chunks limit kept
+# roughly the nav bar of each page; this caps what one page can cost instead.
+MAX_PAGE_CHARS = int(os.getenv("MAX_PAGE_CHARS", "60000"))
+# `fit_markdown` below this length means pruning ate the page, so fall back to raw.
+MIN_FIT_MARKDOWN_CHARS = 300
 CRAWL_CONCURRENCY = int(os.getenv("CRAWL_CONCURRENCY", "8"))
 WEBSEARCH_API_KEY = os.getenv("WEBSEARCH_API_KEY", "")
 # Optional Brave Search API keys (comma-separated) for primary discovery.
@@ -813,10 +817,29 @@ async def crawl_all(client: httpx.AsyncClient, candidates: list[dict]):
     return pages
 
 
+# Search-path crawler config. Without a markdown generator the response carries no
+# `fit_markdown` at all and every caller gets the raw page, nav and cookie banners
+# included. The typed objects are the server's own, not caller input, so they are
+# allowed to be more than the scalar shapes the /crawl allowlist accepts.
+SEARCH_CRAWLER_CONFIG = {
+    "excluded_tags": ["nav", "footer", "header", "aside", "form"],
+    "remove_overlay_elements": True,
+    "markdown_generator": {
+        "type": "DefaultMarkdownGenerator",
+        "params": {
+            "content_filter": {"type": "PruningContentFilter", "params": {}},
+            "options": {"ignore_links": True},
+        },
+    },
+}
+
+
 async def _bulk_crawl(client: httpx.AsyncClient, candidates: list[dict]):
     """Bulk crawl, mapped back to candidates. [] = no content; None = transport failure."""
     try:
-        payload = await call_crawl4ai(client, {"urls": [item["url"] for item in candidates]})
+        payload = await call_crawl4ai(
+            client, {"urls": [item["url"] for item in candidates], "crawler_config": SEARCH_CRAWLER_CONFIG}
+        )
     except AppError:
         return None
 
@@ -1137,7 +1160,13 @@ def extract_crawl_content(payload, preferred_format: str = "markdown"):
         if isinstance(value, str) and value.strip():
             return value.strip()
         if isinstance(value, dict):
-            nested = value.get("fit_markdown") or value.get("raw_markdown") or value.get("content")
+            # Prefer the pruned markdown, but a fit result shorter than
+            # MIN_FIT_MARKDOWN_CHARS means the filter ate the page: raw prose
+            # beats a two-line "fit".
+            fit = value.get("fit_markdown")
+            if isinstance(fit, str) and len(fit.strip()) >= MIN_FIT_MARKDOWN_CHARS:
+                return fit.strip()
+            nested = value.get("raw_markdown") or fit or value.get("content")
             if isinstance(nested, str) and nested.strip():
                 return nested.strip()
 
@@ -1172,16 +1201,52 @@ def extract_crawled_url(payload):
     return None
 
 
+MARKDOWN_LINK_RE = re.compile(r"!?\[[^\]]*\]\([^)\s]*\)")
+URL_RE = re.compile(r"https?://\S+")
+
+
+def strip_boilerplate_lines(text: str) -> str:
+    """Drop lines that carry no prose: markdown link/image runs and short menu stubs.
+
+    ponytail: word-count heuristic, not a parser. It can drop a genuine two-word
+    line, so headings and anything with a digit (answer-bearing numbers) are kept,
+    and the eval set is what decides whether it over-prunes.
+    """
+    lines = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # Links nest ("[ ![logo](img) ](page)"), so strip targets as well and ask
+        # only whether any word character survives.
+        if not any(character.isalnum() for character in URL_RE.sub("", MARKDOWN_LINK_RE.sub("", stripped))):
+            continue  # links/images only
+        if (
+            len(stripped) <= 24
+            and len(stripped.split()) <= 2
+            and not stripped.startswith("#")
+            and not any(character.isdigit() for character in stripped)
+        ):
+            continue  # menu stub: "Docs", "Pricing", "Skip to content"
+        lines.append(stripped)
+    return "\n".join(lines)
+
+
 def chunk_documents(documents: list[dict]):
+    """Chunk the whole cleaned page, capped per page, not just its first chunks.
+
+    The old limit kept the first CHUNKS_PER_PAGE chunks, which on a typical page is
+    the nav bar and cookie banner, so relevant text further down never reached the
+    reranker at all.
+    """
     chunks = []
     for document in documents:
-        text = "\n".join(line.strip() for line in document["content"].splitlines() if line.strip())
+        text = strip_boilerplate_lines(document["content"])[:MAX_PAGE_CHARS]
         if not text:
             continue
 
         start = 0
-        page_chunks = 0
-        while start < len(text) and page_chunks < CHUNKS_PER_PAGE:
+        while start < len(text):
             end = min(start + CHUNK_SIZE, len(text))
             if end < len(text):  # snap to a sentence/line boundary past the midpoint
                 snap = max(text.rfind(". ", start, end), text.rfind("\n", start, end))
@@ -1190,7 +1255,6 @@ def chunk_documents(documents: list[dict]):
             chunk = text[start:end].strip()
             if chunk:
                 chunks.append({**document, "content": chunk})
-                page_chunks += 1
             if end <= start:
                 break
             start = end if end >= len(text) else max(end - CHUNK_OVERLAP, start + 1)
