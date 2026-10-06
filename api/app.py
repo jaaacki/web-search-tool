@@ -65,6 +65,10 @@ SEARCH_TIMEOUT = float(os.getenv("SEARCH_TIMEOUT", "10"))
 # real engine query again, so /health can be polled aggressively without turning into
 # engine load of its own.
 HEALTH_CACHE_TTL = float(os.getenv("HEALTH_CACHE_TTL", "15"))
+# How long a caller should wait before retrying a downed pool. Engine outages clear in
+# seconds-to-minutes, not milliseconds, and a hot retry loop from every agent is how a
+# recovering backend gets knocked over again.
+OUTAGE_RETRY_AFTER = float(os.getenv("OUTAGE_RETRY_AFTER", "30"))
 DISCOVERY_TIMEOUT = float(os.getenv("DISCOVERY_TIMEOUT", "20"))
 CRAWL_TIMEOUT = float(os.getenv("CRAWL_TIMEOUT", "45"))
 RERANK_TIMEOUT = float(os.getenv("RERANK_TIMEOUT", "4"))
@@ -164,9 +168,23 @@ class ErrorDetail(BaseModel):
         description=(
             "Whether the same request can succeed later without the caller changing anything. "
             "True for a transient upstream fault (5xx, 429), false for a request the caller must "
-            "fix. Defaults to the status class when a handler does not state it."
+            "fix — including a server misconfiguration, which retrying cannot repair. "
+            "Defaults to the status class when a handler does not state it."
         ),
         examples=[True],
+    )
+    retry_after: float | None = Field(
+        default=None,
+        description=(
+            "Seconds the caller should wait before retrying. Top-level beside `retryable`, not "
+            "buried in `details`, so a retrying client can read it without parsing prose."
+        ),
+        examples=[30],
+    )
+    hint: str | None = Field(
+        default=None,
+        description="The next action to take, when one is knowable: a command to run, or the setting to change.",
+        examples=["Set SEARXNG_ENGINES to a comma-separated engine list and restart the API."],
     )
 
 
@@ -448,12 +466,23 @@ HEALTH_ERROR_RESPONSES = {
 
 
 class AppError(Exception):
-    def __init__(self, status_code: int, code: str, message: str, details: Any | None = None, retryable: bool | None = None):
+    def __init__(
+        self,
+        status_code: int,
+        code: str,
+        message: str,
+        details: Any | None = None,
+        retryable: bool | None = None,
+        retry_after: float | None = None,
+        hint: str | None = None,
+    ):
         self.status_code = status_code
         self.code = code
         self.message = message
         self.details = details
         self.retryable = retryable
+        self.retry_after = retry_after
+        self.hint = hint
 
 
 async def require_api_key(x_api_key: str | None = Security(api_key_header)):
@@ -465,7 +494,15 @@ async def require_api_key(x_api_key: str | None = Security(api_key_header)):
 
 @app.exception_handler(AppError)
 async def app_error_handler(_: Request, exc: AppError):
-    return error_response(exc.status_code, exc.code, exc.message, exc.details, retryable=exc.retryable)
+    return error_response(
+        exc.status_code,
+        exc.code,
+        exc.message,
+        exc.details,
+        retryable=exc.retryable,
+        retry_after=exc.retry_after,
+        hint=exc.hint,
+    )
 
 
 @app.exception_handler(RequestValidationError)
@@ -919,7 +956,33 @@ def _engine_names() -> list[str]:
     return [name.strip().lower() for name in SEARXNG_ENGINES.split(",") if name.strip()]
 
 
+# Raised before any query is sent: with no engine configured there is nothing to ask,
+# so this is a misconfiguration rather than an upstream fault.
+class _NoEnginesError(AppError):
+    def __init__(self) -> None:
+        super().__init__(
+            503,
+            "upstream_unavailable",
+            "No search engine is configured, so search cannot run",
+            {"configured_engines": SEARXNG_ENGINES, "engine_count": 0},
+            # Retrying cannot fix this: the operator has to configure the pool.
+            retryable=False,
+            hint=(
+                "Set SEARXNG_ENGINES to a comma-separated engine list "
+                f"(currently {SEARXNG_ENGINES!r}) and restart the API."
+            ),
+        )
+
+
 async def search_searxng(client: httpx.AsyncClient, query: str, limit: int, timeout: float = SEARCH_TIMEOUT):
+    configured = _engine_names()
+    # Zero configured engines must never look like an empty web. With no engine list,
+    # searxng returns nothing and reports nothing dead, so the "all engines failed"
+    # test below cannot fire and the caller is handed ok:true with zero results — the
+    # exact silent-empty failure #986 exists to remove (#986 follow-up).
+    if not configured:
+        raise _NoEnginesError()
+
     try:
         response = await client.get(
             f"{SEARXNG_URL}/search",
@@ -947,14 +1010,15 @@ async def search_searxng(client: httpx.AsyncClient, query: str, limit: int, time
     # non-public and duplicate URLs, so a healthy engine whose rows were all filtered
     # out would otherwise be misreported as an outage and retried forever.
     dead = {str(entry).strip().lower() for entry in unresponsive}
-    answered = bool(raw_results) or bool(set(_engine_names()) - dead)
+    answered = bool(raw_results) or bool(set(configured) - dead)
     if not answered and dead:
         raise AppError(
             503,
             "upstream_unavailable",
             "No search engine responded; the search backend is unavailable",
-            {"unresponsive_engines": sorted(dead), "retry_after": 30},
+            {"unresponsive_engines": sorted(dead)},
             retryable=True,
+            retry_after=OUTAGE_RETRY_AFTER,
         )
     return candidates
 
@@ -1730,18 +1794,35 @@ def search_response(query: str, results: list[SearchResult]):
     return SearchEnvelope(data=SearchData(query=query, results=results))
 
 
-def error_response(status_code: int, code: str, message: str, details: Any | None = None, retryable: bool | None = None):
-    # `retryable` is a top-level envelope field, not a detail buried in `details`: the
-    # canonical contract (sparkfn/pc-tools CLAUDE.md, "Error envelope") puts it beside
-    # `code`, because it is what decides retry-vs-fix for an agent. When a handler does
-    # not state it, derive it from the status class so the field is never a lie: a 5xx
-    # or a 429 is the upstream being transient, everything else needs the caller to change
-    # the request.
+def error_response(
+    status_code: int,
+    code: str,
+    message: str,
+    details: Any | None = None,
+    retryable: bool | None = None,
+    retry_after: float | None = None,
+    hint: str | None = None,
+):
+    # `retryable`, `retry_after` and `hint` are top-level envelope fields, not details
+    # buried in `details`: the canonical contract (sparkfn/pc-tools CLAUDE.md, "Error
+    # envelope") puts them beside `code`, because together they decide retry-vs-fix and
+    # how long to wait. When a handler does not state `retryable`, derive it from the
+    # status class so the field is never a lie: a 5xx or a 429 is the upstream being
+    # transient, everything else needs the caller (or an operator) to change something.
     if retryable is None:
         retryable = status_code >= 500 or status_code == 429
     return JSONResponse(
         status_code=status_code,
         content=jsonable_encoder(
-            ErrorEnvelope(error=ErrorDetail(code=code, message=message, details=details, retryable=retryable))
+            ErrorEnvelope(
+                error=ErrorDetail(
+                    code=code,
+                    message=message,
+                    details=details,
+                    retryable=retryable,
+                    retry_after=retry_after,
+                    hint=hint,
+                )
+            )
         ),
     )

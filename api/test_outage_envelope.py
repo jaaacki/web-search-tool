@@ -264,6 +264,77 @@ def test_health_outage_body_reports_every_service():
         restore()
 
 
+def test_retry_after_is_top_level_on_the_wire():
+    # retry_after belongs beside retryable, not buried in details: a retrying client
+    # reads the wait without parsing prose out of a details blob.
+    exc = raises_app_error(app.search_searxng(client(dead_pool), "anything", 5))
+    import json
+
+    error = json.loads(
+        app.error_response(
+            exc.status_code, exc.code, exc.message, exc.details,
+            retryable=exc.retryable, retry_after=exc.retry_after, hint=exc.hint,
+        ).body
+    )["error"]
+    assert error["retry_after"] == app.OUTAGE_RETRY_AFTER, error
+    assert "retry_after" not in (error.get("details") or {}), "retry_after must not be nested in details"
+
+
+# ------------------------------------------------------- zero configured engines
+#
+# With no engine configured, searxng returns nothing AND reports nothing dead, so the
+# "every engine failed" test cannot fire. That made search answer ok:true with zero
+# results and health report searxng GREEN: #986's silent-empty failure, reached a
+# different way.
+
+
+def _no_engines():
+    return use(lambda request: httpx.Response(200, json={"results": [], "unresponsive_engines": []}))
+
+
+def test_zero_configured_engines_is_an_error_not_an_empty_search():
+    saved = app.SEARXNG_ENGINES
+    app.SEARXNG_ENGINES = "   "
+    restore = _no_engines()
+    try:
+        exc = raises_app_error(app.search_searxng(client(lambda r: httpx.Response(200, json={})), "anything", 5))
+        assert exc.code == "upstream_unavailable", exc.code
+        # A misconfiguration is not transient: retrying cannot fix it, and an agent that
+        # believes it can will retry the same nothing forever.
+        assert exc.retryable is False, exc.retryable
+        # ...and the operator is told exactly which setting to change.
+        assert "SEARXNG_ENGINES" in (exc.hint or ""), exc.hint
+    finally:
+        app.SEARXNG_ENGINES = saved
+        restore()
+
+
+def test_zero_configured_engines_fails_the_health_searxng_check():
+    # Health must not report a green searxng while search is structurally unable to run.
+    saved = app.SEARXNG_ENGINES
+    app.SEARXNG_ENGINES = ""
+    restore = _no_engines()
+    try:
+        exc = raises_app_error(app.health())
+        assert exc.status_code == 503, exc.status_code
+        checks = (exc.details or {}).get("checks")
+        assert isinstance(checks, dict), exc.details
+        assert checks["searxng"].startswith("unavailable"), checks
+    finally:
+        app.SEARXNG_ENGINES = saved
+        restore()
+
+
+def test_engines_configured_is_still_a_normal_empty_search():
+    # The guard above must not fire when engines ARE configured but simply had no
+    # matches — that is a real answer, not a fault.
+    restore = use(empty_pool)
+    try:
+        assert run(app.search_searxng(client(empty_pool), "anything", 5)) == []
+    finally:
+        restore()
+
+
 def demo():
     for name, check in sorted(globals().items()):
         if name.startswith("test_"):
