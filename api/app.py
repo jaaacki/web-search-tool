@@ -52,6 +52,23 @@ BRAVE_TIMEOUT = float(os.getenv("BRAVE_TIMEOUT", "8"))
 # is absent from /config and can never be re-enabled by config, which silently
 # collapses discovery onto the remaining engines.
 SEARXNG_ENGINES = os.getenv("SEARXNG_ENGINES", "bing,brave,duckduckgo,google cse")
+# The canary query health sends through the real engine pool. It must be a term every
+# configured engine can answer, because an engine set that cannot answer it is exactly
+# the outage this probe exists to catch.
+HEALTH_CANARY_QUERY = os.getenv("HEALTH_CANARY_QUERY", "open source web search engines")
+# Bounded separately from SEARCH_TIMEOUT: health is polled, so it must not hold a
+# caller for as long as a real search would. Both are per-request ceilings, not
+# aggregate budgets.
+HEALTH_TIMEOUT = float(os.getenv("HEALTH_TIMEOUT", "5"))
+SEARCH_TIMEOUT = float(os.getenv("SEARCH_TIMEOUT", "10"))
+# A poll interval shorter than this reuses the last health verdict instead of firing a
+# real engine query again, so /health can be polled aggressively without turning into
+# engine load of its own.
+HEALTH_CACHE_TTL = float(os.getenv("HEALTH_CACHE_TTL", "15"))
+# How long a caller should wait before retrying a downed pool. Engine outages clear in
+# seconds-to-minutes, not milliseconds, and a hot retry loop from every agent is how a
+# recovering backend gets knocked over again.
+OUTAGE_RETRY_AFTER = float(os.getenv("OUTAGE_RETRY_AFTER", "30"))
 DISCOVERY_TIMEOUT = float(os.getenv("DISCOVERY_TIMEOUT", "20"))
 CRAWL_TIMEOUT = float(os.getenv("CRAWL_TIMEOUT", "45"))
 RERANK_TIMEOUT = float(os.getenv("RERANK_TIMEOUT", "4"))
@@ -146,6 +163,29 @@ class ErrorDetail(BaseModel):
         description="Optional structured details from validation or upstream services. May be null.",
         examples=[None],
     )
+    retryable: bool | None = Field(
+        default=None,
+        description=(
+            "Whether the same request can succeed later without the caller changing anything. "
+            "True for a transient upstream fault (5xx, 429), false for a request the caller must "
+            "fix — including a server misconfiguration, which retrying cannot repair. "
+            "Defaults to the status class when a handler does not state it."
+        ),
+        examples=[True],
+    )
+    retry_after: float | None = Field(
+        default=None,
+        description=(
+            "Seconds the caller should wait before retrying. Top-level beside `retryable`, not "
+            "buried in `details`, so a retrying client can read it without parsing prose."
+        ),
+        examples=[30],
+    )
+    hint: str | None = Field(
+        default=None,
+        description="The next action to take, when one is knowable: a command to run, or the setting to change.",
+        examples=["Set SEARXNG_ENGINES to a comma-separated engine list and restart the API."],
+    )
 
 
 class ErrorEnvelope(BaseModel):
@@ -157,6 +197,14 @@ class HealthData(BaseModel):
     services: dict[str, str] = Field(
         description="Internal service base URLs used by the stack. This is diagnostic metadata, not public crawl/search targets.",
         examples=[{"searxng": "http://searxng:8080", "crawl4ai": "http://crawl4ai:11235", "reranker": "http://reranker:7997"}],
+    )
+    checks: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Live per-service probe results. `searxng` is decided by a real canary query through the engine pool, so a total "
+            "search-backend outage is reported here instead of passing as a healthy process."
+        ),
+        examples=[{"searxng": "ok", "crawl4ai": "ok", "reranker": "ok"}],
     )
 
 
@@ -408,16 +456,33 @@ CRAWL_ERROR_RESPONSES = {
 }
 
 HEALTH_ERROR_RESPONSES = {
+    503: {
+        "model": ErrorEnvelope,
+        "description": "The search backend is unavailable: no engine responded to a canary query. Retry later.",
+        "content": {"application/json": {"examples": {"upstream_unavailable": ERROR_EXAMPLES["searxng_error"]}}},
+    },
     500: {"model": ErrorEnvelope, "description": "Unexpected server error. Retry later or contact the service owner."},
 }
 
 
 class AppError(Exception):
-    def __init__(self, status_code: int, code: str, message: str, details: Any | None = None):
+    def __init__(
+        self,
+        status_code: int,
+        code: str,
+        message: str,
+        details: Any | None = None,
+        retryable: bool | None = None,
+        retry_after: float | None = None,
+        hint: str | None = None,
+    ):
         self.status_code = status_code
         self.code = code
         self.message = message
         self.details = details
+        self.retryable = retryable
+        self.retry_after = retry_after
+        self.hint = hint
 
 
 async def require_api_key(x_api_key: str | None = Security(api_key_header)):
@@ -429,7 +494,15 @@ async def require_api_key(x_api_key: str | None = Security(api_key_header)):
 
 @app.exception_handler(AppError)
 async def app_error_handler(_: Request, exc: AppError):
-    return error_response(exc.status_code, exc.code, exc.message, exc.details)
+    return error_response(
+        exc.status_code,
+        exc.code,
+        exc.message,
+        exc.details,
+        retryable=exc.retryable,
+        retry_after=exc.retry_after,
+        hint=exc.hint,
+    )
 
 
 @app.exception_handler(RequestValidationError)
@@ -448,28 +521,97 @@ async def unhandled_error_handler(_: Request, exc: Exception):
     return error_response(500, "internal_error", "Internal server error", {"type": type(exc).__name__})
 
 
+async def probe_service(base_url: str, path: str, headers: dict[str, str] | None = None) -> str:
+    """Reachability probe for a supporting service. Reported, never fatal on its own."""
+    client = await get_client()
+    try:
+        response = await client.get(f"{base_url}{path}", headers=headers, timeout=HEALTH_TIMEOUT)
+        return "ok" if response.status_code < 500 else f"unavailable: http_{response.status_code}"
+    except (httpx.HTTPError, ValueError) as exc:
+        return f"unavailable: {type(exc).__name__}"
+
+
+async def _run_health_checks() -> dict[str, str]:
+    """Probe every service. Returns the checks map; raises AppError when search is down.
+
+    Every service is probed even after searxng fails, so the 503 body carries the same
+    information as the healthy one: an operator reading a failing health check learns
+    which dependency broke, not merely that something did.
+    """
+    client = await get_client()
+    checks: dict[str, str] = {}
+    search_failure: AppError | None = None
+    try:
+        # Reuses search_searxng, so health and search cannot disagree about an outage: a
+        # total engine failure raises upstream_unavailable here exactly as it does there.
+        # Bounded by HEALTH_TIMEOUT, not SEARCH_TIMEOUT — health is polled.
+        await search_searxng(client, HEALTH_CANARY_QUERY, 1, timeout=HEALTH_TIMEOUT)
+        checks["searxng"] = "ok"
+    except AppError as exc:
+        search_failure = exc
+        checks["searxng"] = f"unavailable: {exc.code}"
+    # Supporting services are reported, never fatal: search degrades to its lexical path
+    # without the reranker, so failing health on it would report an outage we do not have.
+    checks["crawl4ai"] = await probe_service(CRAWL4AI_URL, "/health", CRAWL4AI_HEADERS)
+    checks["reranker"] = await probe_service(RERANKER_URL, "/health")
+    if search_failure is not None:
+        raise AppError(
+            503,
+            "upstream_unavailable",
+            "No search engine responded to a canary query; search is unavailable",
+            {"checks": checks, **(search_failure.details if isinstance(search_failure.details, dict) else {})},
+            retryable=True,
+        )
+    return checks
+
+
+# Last verdict, reused for HEALTH_CACHE_TTL so a poll loop cannot become engine load.
+# Caches the failure too: a dead backend should not be hammered by its own health check.
+_HEALTH_CACHE: dict[str, object] = {"at": 0.0, "result": None}
+
+
+def health_cache_reset() -> None:
+    _HEALTH_CACHE["at"] = 0.0
+    _HEALTH_CACHE["result"] = None
+
+
 @app.get(
     "/health",
     response_model=HealthEnvelope,
     responses=HEALTH_ERROR_RESPONSES,
     summary="Check service health",
     description=(
-        "Public diagnostic endpoint for the search and crawl API hosts. It confirms the API process is running and reports the internal "
-        "service URLs configured for SearXNG, Crawl4AI, and the reranker. Do not use this endpoint for search or crawl work."
+        "Public diagnostic endpoint for the search and crawl API hosts. It confirms the API process is running, reports the "
+        "internal service URLs configured for SearXNG, Crawl4AI, and the reranker, and probes each service. The SearXNG probe "
+        "is a real canary query through the engine pool, so a search-backend outage is reported as `upstream_unavailable` "
+        "instead of a healthy process. Results are cached for a few seconds so the endpoint can be polled cheaply. "
+        "Do not use this endpoint for search or crawl work."
     ),
     operation_id="check_health",
     tags=["Diagnostics"],
 )
-def health():
-    return HealthEnvelope(
-        data=HealthData(
-            services={
-                "searxng": SEARXNG_URL,
-                "crawl4ai": CRAWL4AI_URL,
-                "reranker": RERANKER_URL,
-            }
-        )
-    )
+async def health():
+    now = time.monotonic()
+    cached_at = _HEALTH_CACHE["at"]
+    if isinstance(cached_at, float) and now - cached_at < HEALTH_CACHE_TTL:
+        cached = _HEALTH_CACHE["result"]
+        if isinstance(cached, AppError):
+            raise cached
+        if isinstance(cached, dict):
+            return HealthEnvelope(data=HealthData(services=_health_services(), checks=cached))
+    try:
+        checks = await _run_health_checks()
+    except AppError as exc:
+        _HEALTH_CACHE["at"] = time.monotonic()
+        _HEALTH_CACHE["result"] = exc
+        raise
+    _HEALTH_CACHE["at"] = time.monotonic()
+    _HEALTH_CACHE["result"] = checks
+    return HealthEnvelope(data=HealthData(services=_health_services(), checks=checks))
+
+
+def _health_services() -> dict[str, str]:
+    return {"searxng": SEARXNG_URL, "crawl4ai": CRAWL4AI_URL, "reranker": RERANKER_URL}
 
 
 @app.get("/docs", include_in_schema=False)
@@ -810,12 +952,42 @@ async def shape_candidates(items, limit: int, snippet_key: str = "content"):
     return results
 
 
-async def search_searxng(client: httpx.AsyncClient, query: str, limit: int):
+def _engine_names() -> list[str]:
+    return [name.strip().lower() for name in SEARXNG_ENGINES.split(",") if name.strip()]
+
+
+# Raised before any query is sent: with no engine configured there is nothing to ask,
+# so this is a misconfiguration rather than an upstream fault.
+class _NoEnginesError(AppError):
+    def __init__(self) -> None:
+        super().__init__(
+            503,
+            "upstream_unavailable",
+            "No search engine is configured, so search cannot run",
+            {"configured_engines": SEARXNG_ENGINES, "engine_count": 0},
+            # Retrying cannot fix this: the operator has to configure the pool.
+            retryable=False,
+            hint=(
+                "Set SEARXNG_ENGINES to a comma-separated engine list "
+                f"(currently {SEARXNG_ENGINES!r}) and restart the API."
+            ),
+        )
+
+
+async def search_searxng(client: httpx.AsyncClient, query: str, limit: int, timeout: float = SEARCH_TIMEOUT):
+    configured = _engine_names()
+    # Zero configured engines must never look like an empty web. With no engine list,
+    # searxng returns nothing and reports nothing dead, so the "all engines failed"
+    # test below cannot fire and the caller is handed ok:true with zero results — the
+    # exact silent-empty failure #986 exists to remove (#986 follow-up).
+    if not configured:
+        raise _NoEnginesError()
+
     try:
         response = await client.get(
             f"{SEARXNG_URL}/search",
             params={"q": query, "format": "json", "engines": SEARXNG_ENGINES},
-            timeout=10,
+            timeout=timeout,
         )
         response.raise_for_status()
         payload = response.json()
@@ -827,7 +999,28 @@ async def search_searxng(client: httpx.AsyncClient, query: str, limit: int):
         # A dead engine otherwise only shows up as fewer or zero results.
         logger.warning("searxng engines unresponsive: %s", ", ".join(str(entry) for entry in unresponsive))
 
-    return await shape_candidates(payload.get("results", []), limit)
+    raw_results = payload.get("results", [])
+    candidates = await shape_candidates(raw_results, limit)
+    # An outage is EVERY configured engine failing, not one of them. searxng reports the
+    # engines that failed, so a single answerer is proof the pool is partly alive: an
+    # empty result set from a live engine is a real answer ("nothing matched") and must
+    # stay `ok: true, results: []`, or a partial outage becomes a fake retry loop (#986).
+    #
+    # The test is on the RAW payload, not the shaped candidates: shape_candidates drops
+    # non-public and duplicate URLs, so a healthy engine whose rows were all filtered
+    # out would otherwise be misreported as an outage and retried forever.
+    dead = {str(entry).strip().lower() for entry in unresponsive}
+    answered = bool(raw_results) or bool(set(configured) - dead)
+    if not answered and dead:
+        raise AppError(
+            503,
+            "upstream_unavailable",
+            "No search engine responded; the search backend is unavailable",
+            {"unresponsive_engines": sorted(dead)},
+            retryable=True,
+            retry_after=OUTAGE_RETRY_AFTER,
+        )
+    return candidates
 
 
 def snippet_pages(candidates: list[dict]) -> list[dict]:
@@ -1601,8 +1794,35 @@ def search_response(query: str, results: list[SearchResult]):
     return SearchEnvelope(data=SearchData(query=query, results=results))
 
 
-def error_response(status_code: int, code: str, message: str, details: Any | None = None):
+def error_response(
+    status_code: int,
+    code: str,
+    message: str,
+    details: Any | None = None,
+    retryable: bool | None = None,
+    retry_after: float | None = None,
+    hint: str | None = None,
+):
+    # `retryable`, `retry_after` and `hint` are top-level envelope fields, not details
+    # buried in `details`: the canonical contract (sparkfn/pc-tools CLAUDE.md, "Error
+    # envelope") puts them beside `code`, because together they decide retry-vs-fix and
+    # how long to wait. When a handler does not state `retryable`, derive it from the
+    # status class so the field is never a lie: a 5xx or a 429 is the upstream being
+    # transient, everything else needs the caller (or an operator) to change something.
+    if retryable is None:
+        retryable = status_code >= 500 or status_code == 429
     return JSONResponse(
         status_code=status_code,
-        content=jsonable_encoder(ErrorEnvelope(error=ErrorDetail(code=code, message=message, details=details))),
+        content=jsonable_encoder(
+            ErrorEnvelope(
+                error=ErrorDetail(
+                    code=code,
+                    message=message,
+                    details=details,
+                    retryable=retryable,
+                    retry_after=retry_after,
+                    hint=hint,
+                )
+            )
+        ),
     )
