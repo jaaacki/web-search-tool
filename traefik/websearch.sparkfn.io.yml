@@ -1,15 +1,25 @@
 http:
   routers:
     websearch-sparkfn:
-      rule: "Host(`websearch.sparkfn.io`) && (Path(`/search`) || Path(`/health`) || PathPrefix(`/docs`) || Path(`/openapi.json`))"
+      rule: "Host(`websearch.sparkfn.io`) && (Path(`/health`) || PathPrefix(`/docs`) || Path(`/openapi.json`))"
       entryPoints:
         - websecure
       service: websearch-sparkfn
+      tls:
+        certResolver: cloudflare
+
+    websearch-sparkfn-search:
+      rule: "Host(`websearch.sparkfn.io`) && Path(`/search`)"
+      entryPoints:
+        - websecure
+      service: websearch-sparkfn
+      middlewares:
+        - websearch-sparkfn-allowlist
       tls:
         certResolver: cloudflare
 
     websearch-sparkfn-http:
-      rule: "Host(`websearch.sparkfn.io`) && (Path(`/search`) || Path(`/health`) || PathPrefix(`/docs`) || Path(`/openapi.json`))"
+      rule: "Host(`websearch.sparkfn.io`) && (Path(`/health`) || PathPrefix(`/docs`) || Path(`/openapi.json`))"
       entryPoints:
         - web
       service: websearch-sparkfn
@@ -17,16 +27,36 @@ http:
         - websearch-sparkfn-redirect
       priority: 100
 
+    websearch-sparkfn-search-http:
+      rule: "Host(`websearch.sparkfn.io`) && Path(`/search`)"
+      entryPoints:
+        - web
+      service: websearch-sparkfn
+      middlewares:
+        - websearch-sparkfn-allowlist
+        - websearch-sparkfn-redirect
+      priority: 100
+
     webcrawl-sparkfn:
-      rule: "Host(`webcrawl.sparkfn.io`) && (Path(`/crawl`) || Path(`/health`) || PathPrefix(`/docs`) || Path(`/openapi.json`))"
+      rule: "Host(`webcrawl.sparkfn.io`) && (Path(`/health`) || PathPrefix(`/docs`) || Path(`/openapi.json`))"
       entryPoints:
         - websecure
       service: websearch-sparkfn
       tls:
         certResolver: cloudflare
 
+    webcrawl-sparkfn-crawl:
+      rule: "Host(`webcrawl.sparkfn.io`) && Path(`/crawl`)"
+      entryPoints:
+        - websecure
+      service: websearch-sparkfn
+      middlewares:
+        - websearch-sparkfn-allowlist
+      tls:
+        certResolver: cloudflare
+
     webcrawl-sparkfn-http:
-      rule: "Host(`webcrawl.sparkfn.io`) && (Path(`/crawl`) || Path(`/health`) || PathPrefix(`/docs`) || Path(`/openapi.json`))"
+      rule: "Host(`webcrawl.sparkfn.io`) && (Path(`/health`) || PathPrefix(`/docs`) || Path(`/openapi.json`))"
       entryPoints:
         - web
       service: websearch-sparkfn
@@ -34,7 +64,30 @@ http:
         - websearch-sparkfn-redirect
       priority: 100
 
+    webcrawl-sparkfn-crawl-http:
+      rule: "Host(`webcrawl.sparkfn.io`) && Path(`/crawl`)"
+      entryPoints:
+        - web
+      service: websearch-sparkfn
+      middlewares:
+        - websearch-sparkfn-allowlist
+        - websearch-sparkfn-redirect
+      priority: 100
+
+    websearch-sparkfn-internal:
+      rule: "Host(`traefik`) && (Path(`/search`) || Path(`/crawl`) || Path(`/health`))"
+      entryPoints:
+        - web
+      service: websearch-sparkfn
+      middlewares:
+        - websearch-sparkfn-allowlist
+      priority: 1000
+
   middlewares:
+    websearch-sparkfn-allowlist:
+      ipAllowList:
+        sourceRange:
+          - "172.25.0.51/32"
     websearch-sparkfn-redirect:
       redirectScheme:
         scheme: https
