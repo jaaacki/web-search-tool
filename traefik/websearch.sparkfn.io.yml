@@ -84,6 +84,8 @@ http:
       priority: 1000
 
   middlewares:
+    # sourceRange must match sparkfn/pc-tools/deploy/docker-compose.yml's
+    # services.pc-tools.networks.traefik.ipv4_address.
     websearch-sparkfn-allowlist:
       ipAllowList:
         sourceRange:
