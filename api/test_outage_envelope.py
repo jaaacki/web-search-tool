@@ -11,7 +11,9 @@ import httpx
 
 import app
 
-DEAD_ENGINES = ["bing", "brave", "duckduckgo", "google cse"]
+# The shape searxng really sends: [engine, reason] pairs (searx/webutils.get_translated_errors).
+DEAD_ENGINES = [["bing", "timeout"], ["brave", "Suspended: too many requests"],
+                ["duckduckgo", "Suspended: timeout"], ["google cse", "Suspended: too many requests"]]
 
 
 def client(handler):
@@ -52,7 +54,7 @@ def partial_pool(request: httpx.Request) -> httpx.Response:
         200,
         json={
             "results": [{"url": "https://a.example/", "title": "A", "snippet": "s"}],
-            "unresponsive_engines": ["bing"],
+            "unresponsive_engines": [["bing", "timeout"]],
         },
     )
 
@@ -109,7 +111,7 @@ def test_a_live_but_empty_engine_is_not_an_outage():
     # only the FAILED engines, so an empty result here still means "a pool answered".
     # Grading this 503 turns every partial outage into a fake retry loop.
     def half_dead(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"results": [], "unresponsive_engines": ["bing"]})
+        return httpx.Response(200, json={"results": [], "unresponsive_engines": [["bing", "timeout"]]})
 
     assert run(app.search_searxng(client(half_dead), "anything", 5)) == []
 
@@ -220,6 +222,19 @@ def test_health_canary_is_bounded_by_health_timeout():
         f"health canary must be bounded below the search timeout "
         f"(health={app.HEALTH_TIMEOUT}, search={app.SEARCH_TIMEOUT})"
     )
+
+
+def test_searxng_is_told_to_answer_inside_the_budget():
+    # Without timeout_limit searxng waits out its slowest engine (8s) and the 5s canary
+    # times out even though the other engines answered (#36).
+    sent: list[float] = []
+
+    def watcher(request: httpx.Request) -> httpx.Response:
+        sent.append(float(request.url.params["timeout_limit"]))
+        return answered_with_results(request)
+
+    run(app.search_searxng(client(watcher), "anything", 5, timeout=app.HEALTH_TIMEOUT))
+    assert sent and sent[0] < app.HEALTH_TIMEOUT, sent
 
 
 def test_search_still_gets_the_search_timeout():
