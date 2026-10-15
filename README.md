@@ -8,7 +8,7 @@ Self-hosted stack for `websearch.sparkfn.io` and controlled headless crawling at
 - `reranker`: internal cross-encoder reranking service (Hugging Face TEI). The API's lexical
   prefilter lives in `api/app.py`; this container only scores query/document pairs.
 
-`api` is routed by Traefik through `traefik/websearch.sparkfn.io.yml`. `webcrawl.sparkfn.io` only routes `POST /crawl` to the API; Crawl4AI itself remains internal-only. Internal services use Docker `expose` only and are not host-published.
+`api` is routed by the lab-001 Traefik through [`sparkfn/lab-001-cluster:traefik/dynamic/websearch.sparkfn.io.yml`](https://github.com/sparkfn/lab-001-cluster/blob/main/traefik/dynamic/websearch.sparkfn.io.yml); route changes go to that repo. `webcrawl.sparkfn.io` only routes `POST /crawl` to the API; Crawl4AI itself remains internal-only. Internal services use Docker `expose` only and are not host-published.
 
 ## Required files
 
@@ -31,17 +31,25 @@ All persistent/runtime data belongs under `./data`. The Compose file does not us
 
 ## Deploy
 
-Install/update the Traefik dynamic config on the server:
+Production runs on lab-001 from a clean `main` checkout at `/home/docker/websearch.sparkfn.io`. There is no CI or auto-deploy; after a merge:
 
 ```bash
-cp traefik/websearch.sparkfn.io.yml /home/docker/traefik/dynamic/websearch.sparkfn.io.yml
+git pull --ff-only
+docker compose up -d --build          # or name one service, e.g. `api`
+curl -fsS https://websearch.sparkfn.io/health
 ```
 
-Then start the stack:
+`/health` sends a real canary query through SearXNG. It returns 503 only when no engine answers; a partial engine outage stays 200.
+
+## Tests
+
+No framework; each file is a self-running assert script:
 
 ```bash
-docker compose up -d --build
+cd api && for f in test_*.py; do python "$f" >/dev/null && echo "ok $f" || echo "FAIL $f"; done
 ```
+
+`eval/run.py` is the search-quality harness (golden queries against a running API; see `--help`).
 
 ## OpenAPI / Swagger
 

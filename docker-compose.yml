@@ -80,6 +80,9 @@ services:
     container_name: websearch-sparkfn-api
     expose:
       - "8000"
+    # Passes the optional knobs .env.example documents (RERANK_*, HEALTH_*, ...);
+    # the entries under environment: still win over it (#38).
+    env_file: .env
     environment:
       - SEARXNG_URL=http://searxng:8080
       - CRAWL4AI_URL=http://crawl4ai:11235
