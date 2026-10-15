@@ -64,7 +64,7 @@ SEARCH_TIMEOUT = float(os.getenv("SEARCH_TIMEOUT", "10"))
 # A poll interval shorter than this reuses the last health verdict instead of firing a
 # real engine query again, so /health can be polled aggressively without turning into
 # engine load of its own.
-HEALTH_CACHE_TTL = float(os.getenv("HEALTH_CACHE_TTL", "15"))
+HEALTH_CACHE_TTL = float(os.getenv("HEALTH_CACHE_TTL", "60"))
 # How long a caller should wait before retrying a downed pool. Engine outages clear in
 # seconds-to-minutes, not milliseconds, and a hot retry loop from every agent is how a
 # recovering backend gets knocked over again.
@@ -986,7 +986,10 @@ async def search_searxng(client: httpx.AsyncClient, query: str, limit: int, time
     try:
         response = await client.get(
             f"{SEARXNG_URL}/search",
-            params={"q": query, "format": "json", "engines": SEARXNG_ENGINES},
+            # timeout_limit makes searxng answer with whatever engines finished inside our
+            # budget; without it searxng waits out its slowest engine (8s), so one hung
+            # engine timed out the 5s health canary even while the others had answered (#36).
+            params={"q": query, "format": "json", "engines": SEARXNG_ENGINES, "timeout_limit": max(timeout - 1, 1)},
             timeout=timeout,
         )
         response.raise_for_status()
@@ -1009,7 +1012,8 @@ async def search_searxng(client: httpx.AsyncClient, query: str, limit: int, time
     # The test is on the RAW payload, not the shaped candidates: shape_candidates drops
     # non-public and duplicate URLs, so a healthy engine whose rows were all filtered
     # out would otherwise be misreported as an outage and retried forever.
-    dead = {str(entry).strip().lower() for entry in unresponsive}
+    # searxng reports each dead engine as an [engine, reason] pair, not a bare name (#36).
+    dead = {str(entry[0] if isinstance(entry, (list, tuple)) else entry).strip().lower() for entry in unresponsive}
     answered = bool(raw_results) or bool(set(configured) - dead)
     if not answered and dead:
         raise AppError(
