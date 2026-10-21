@@ -868,10 +868,13 @@ class BraveKeyPool:
             try:
                 results = await self._search_with_key(client, key_idx, query, limit, deadline)
             except _BraveKeyError as exc:
-                self._cool(key_idx, exc.cooldown)
+                if exc.cooldown > 0:
+                    self._cool(key_idx, exc.cooldown)
+                    logger.warning("brave key %d failed (%s), cooling %.0fs", key_idx, exc.reason, exc.cooldown)
+                else:
+                    logger.warning("brave key %d failed (%s)", key_idx, exc.reason)
                 if exc.reason == "rate_limited":
                     retry_after = max(retry_after or 0.0, exc.cooldown)
-                logger.warning("brave key %d failed (%s), cooling %.0fs", key_idx, exc.reason, exc.cooldown)
                 if exc.partial:
                     self._calls[key_idx] += 1
                     _record_provider_health("brave", "ok")
@@ -946,7 +949,7 @@ class BraveKeyPool:
                 )
                 items.extend(page_candidates)
                 if not complete:
-                    raise _BraveKeyError("normalization_timeout", 60.0, items)
+                    raise _BraveKeyError("normalization_timeout", 0.0, items)
                 query_info = payload.get("query")
                 if not isinstance(query_info, dict):
                     query_info = {}

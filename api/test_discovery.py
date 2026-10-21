@@ -194,6 +194,38 @@ def test_concurrent_brave_calls_keep_retry_after_per_request():
     assert short == (None, 20), short
 
 
+def test_local_validation_timeout_does_not_cool_brave_key():
+    saved_check = app.is_allowed_public_url
+    pool = app.BraveKeyPool(("test-key",))
+
+    async def check(url):
+        if url == "https://stall.example/":
+            await asyncio.sleep(1)
+            return True
+        return True
+
+    class Client:
+        async def get(self, url, **_kwargs):
+            return httpx.Response(
+                200,
+                json={
+                    "query": {"more_results_available": False},
+                    "web": {"results": [result(0), {"url": "https://stall.example/", "title": "stall"}]},
+                },
+                request=httpx.Request("GET", url),
+            )
+
+    app.is_allowed_public_url = check
+    try:
+        results, retry_after = run(pool.search(Client(), "q", 5, time.monotonic() + 0.05))
+        assert [item["url"] for item in results] == [result(0)["url"]], results
+        assert retry_after is None, retry_after
+        assert pool._cooled_until == [0.0], pool._cooled_until
+    finally:
+        app.is_allowed_public_url = saved_check
+        app.health_cache_reset()
+
+
 def test_shorter_concurrent_cooldown_never_shortens_key_cooldown():
     async def exercise():
         pool = app.BraveKeyPool(("test-key",))
