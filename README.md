@@ -150,9 +150,11 @@ curl -X POST 'https://webcrawl.sparkfn.io/crawl' \
 Firecrawl is disabled unless `FIRECRAWL_BUDGETS_JSON` is set in private `.env`. Group keys
 from one Firecrawl team together; only the first key in each group is active, and sibling keys are
 never rotated around a per-key cap. Separate groups only for independently funded and authorized
-balances. A team-exhausted 402 can fail over to another declared group only after the non-billable
-team-usage check confirms zero remaining credits. Ambiguous/key-cap 402s do not rotate keys or
-balances; 429 cooldowns are shared across keys in a group. No pay-as-you-go or billing setting is
+balances. An invalid-auth 401 can fail over to the next declared group; the bad primary is skipped
+for 15 minutes before one caller-requested operation may retry that same key, without a usage probe.
+A team-exhausted 402 can fail over only after the non-billable team-usage check confirms zero remaining
+credits. Ambiguous/key-cap 402s, policy 403s and rate 429s do not rotate keys or balances; 429 cooldowns
+are shared across keys in a group. No pay-as-you-go or billing setting is
 enabled automatically, and no universal per-request credit cap is claimed; configure vendor key
 spend limits separately. After a 15-minute ambiguous-402 cooldown and cached usage refresh, one
 caller-requested operation may retry only the same primary key; success clears the guard and another
