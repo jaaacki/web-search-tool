@@ -7,7 +7,7 @@ when:
 
 steps:
   - name: test
-    image: python:3.14-slim
+    image: python:3.15-slim
     commands:
       - |
         set -eu
