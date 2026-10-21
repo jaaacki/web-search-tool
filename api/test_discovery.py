@@ -463,11 +463,12 @@ def test_advanced_search_scrapes_firecrawl_once_and_skips_policy_denied_target()
     }
     app.BRAVE_POOL = app.BraveKeyPool(("test-key",))
     app.BRAVE_SEARCH_URL = "https://brave.example/search"
-    app.is_allowed_public_url = lambda _: asyncio.sleep(0, result=True)
+    app.is_allowed_public_url = lambda url: asyncio.sleep(0, result=url != "http://127.0.0.1/")
     app.firecrawl_url_allowed = lambda url: "linkedin.com" not in url
     linked = "https://www.linkedin.com/in/person"
     denied = "https://denied.example/"
     allowed = "https://allowed.example/"
+    unsafe = "https://unsafe.example/"
     pdf = "https://reports.example/download"
     calls = []
     crawled = []
@@ -480,17 +481,19 @@ def test_advanced_search_scrapes_firecrawl_once_and_skips_policy_denied_target()
                 {"url": linked, "title": "LinkedIn", "description": "B"},
                 {"url": denied, "title": "Denied", "description": "C"},
                 {"url": pdf, "title": "PDF", "description": "D", "category": "pdf"},
+                {"url": unsafe, "title": "Unsafe", "description": "E"},
             ]
             return httpx.Response(200, json={"success": True, "data": {"web": rows}})
         if payload["url"] == denied:
             raise app.FirecrawlUnavailable(403, "policy_denied", None, False)
+        reported_url = "http://127.0.0.1/" if payload["url"] == unsafe else "https://final.example/"
         return httpx.Response(
             200,
             json={
                 "success": True,
                 "data": {
-                    "markdown": "# Allowed page",
-                    "metadata": {"sourceURL": allowed, "statusCode": 203, "url": "https://final.example/"},
+                    "markdown": "# Scraped page",
+                    "metadata": {"sourceURL": payload["url"], "statusCode": 203, "url": reported_url},
                 },
             },
         )
@@ -530,12 +533,18 @@ def test_advanced_search_scrapes_firecrawl_once_and_skips_policy_denied_target()
     app.rerank = rerank
     app.health_cache_reset()
     try:
-        response = run(app.search(app.SearchRequest(query="q", candidates=5, depth="advanced")))
+        response = run(app.search(app.SearchRequest(query="q", candidates=6, depth="advanced")))
         assert {item.url for item in response.data.results} == {allowed, linked, pdf}, response.data.results
-        assert calls == [("/v2/search", None), ("/v2/scrape", allowed), ("/v2/scrape", denied)], calls
+        assert calls == [
+            ("/v2/search", None),
+            ("/v2/scrape", allowed),
+            ("/v2/scrape", denied),
+            ("/v2/scrape", unsafe),
+        ], calls
         assert brave_calls == [(0, app.BRAVE_PAGE_SIZE)], brave_calls
         assert crawled == [linked, pdf], crawled
         assert "https://allowed.example" not in crawled, crawled
+        assert unsafe not in crawled, crawled
         assert denied not in {item.url for item in response.data.results}
     finally:
         app.BRAVE_POOL = saved["pool"]
