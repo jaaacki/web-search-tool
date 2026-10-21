@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import socket
+from unittest.mock import patch
 
 import httpx
 
@@ -154,7 +156,6 @@ def test_direct_firecrawl_rejects_nonpublic_reported_urls_without_local_retry():
     saved_key = app.WEBSEARCH_API_KEY
     saved_get_client = app.get_client
     saved_public_check = app.is_allowed_public_url
-    saved_resolver = app._host_resolves_public
     saved_cache = app._dns_cache.copy()
     saved_firecrawl_check = app.firecrawl_url_allowed
     saved_firecrawl_request = app.firecrawl_request
@@ -163,11 +164,14 @@ def test_direct_firecrawl_rejects_nonpublic_reported_urls_without_local_retry():
     app.get_client = lambda: asyncio.sleep(0, result=object())
     app.firecrawl_url_allowed = lambda _: True
     calls = []
+    resolved_hosts = []
 
-    def resolve(hostname, _port):
+    def getaddrinfo(hostname, port, *_args, **_kwargs):
+        resolved_hosts.append(hostname)
         if chr(0xD800) in hostname:
             raise UnicodeEncodeError("idna", hostname, 3, 4, "surrogates not allowed")
-        return True
+        address = "127.0.0.1" if hostname == "127.0.0.1" else "8.8.8.8"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, port or 443))]
 
     async def firecrawl(_client, _endpoint, payload, *, timeout):
         calls.append(("firecrawl", payload["url"]))
@@ -188,7 +192,6 @@ def test_direct_firecrawl_rejects_nonpublic_reported_urls_without_local_retry():
         calls.append(("crawl4ai", None))
         raise AssertionError("known nonpublic Firecrawl target must not fall back locally")
 
-    app._host_resolves_public = resolve
     app._dns_cache.clear()
     app.firecrawl_request = firecrawl
     app.call_crawl4ai = local_crawl
@@ -205,15 +208,16 @@ def test_direct_firecrawl_rejects_nonpublic_reported_urls_without_local_retry():
             "https://bad" + chr(0xD800) + ".example/",
         ):
             calls.clear()
-            response = asyncio.run(request("https://example.com/article"))
-            assert response.status_code == 422, response.text
+            app._dns_cache.clear()
+            with patch("app.socket.getaddrinfo", side_effect=getaddrinfo):
+                response = asyncio.run(request("https://example.com/article"))
+            assert response.status_code == 422, (reported_url, response.text, resolved_hosts)
             assert response.json()["error"]["code"] == "invalid_crawled_url", response.text
             assert calls == [("firecrawl", "https://example.com/article")], calls
     finally:
         app.WEBSEARCH_API_KEY = saved_key
         app.get_client = saved_get_client
         app.is_allowed_public_url = saved_public_check
-        app._host_resolves_public = saved_resolver
         app._dns_cache.clear()
         app._dns_cache.update(saved_cache)
         app.firecrawl_url_allowed = saved_firecrawl_check
