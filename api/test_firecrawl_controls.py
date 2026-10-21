@@ -304,9 +304,6 @@ def test_malformed_usage_never_confirms_team_exhaustion():
 
 
 def test_top_up_recovers_exhausted_budget():
-    now = [1_800_000_000.0]
-    original_time = fc.time.time
-    fc.time.time = lambda: now[0]
     seen = []
     usage_remaining = [0, 50]
 
@@ -330,14 +327,13 @@ def test_top_up_recovers_exhausted_budget():
                         assert exc.category == "team_exhausted", exc.category
                     else:
                         raise AssertionError("zero-credit team was not blocked")
-                now[0] += fc.USAGE_RECHECK_SECONDS + 1
+                state = instance._read_state()
+                state["budgets"]["team"]["next_check"] = time.monotonic() - 1
+                instance._write_state(state)
                 result = await instance.request(client, "/v2/search", {"query": "q"}, timeout=2)
                 assert result.status_code == 200
 
-    try:
-        run(check())
-    finally:
-        fc.time.time = original_time
+    run(check())
     assert seen == ["/v2/search", fc.CREDIT_USAGE_PATH, fc.CREDIT_USAGE_PATH, "/v2/search"], seen
 
 
@@ -424,30 +420,31 @@ def test_credit_usage_check_is_bounded_by_remaining_deadline():
 
 
 def test_nonfinite_retry_after_uses_bounded_cooldown():
-    seen = []
+    for value in ("NaN", "Infinity", "-Infinity"):
+        seen = []
 
-    def handler(request):
-        seen.append(request)
-        return response(request, 429, {"success": False}, {"Retry-After": "NaN"})
+        def handler(request):
+            seen.append(request)
+            return response(request, 429, {"success": False}, {"Retry-After": value})
 
-    async def check():
-        with tempfile.TemporaryDirectory() as tmp:
-            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-                instance = controls(tmp, [("team", ["primary", "sibling"]), ("other", ["independent"])])
-                for attempt in range(2):
-                    try:
-                        await instance.request(client, "/v2/search", {"query": "q"}, timeout=2)
-                    except fc.FirecrawlUnavailable as exc:
-                        assert exc.category == "rate_limited", exc.category
-                        if attempt == 0:
-                            assert exc.retry_after == 60, exc.retry_after
+        async def check():
+            with tempfile.TemporaryDirectory() as tmp:
+                async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                    instance = controls(tmp, [("team", ["primary", "sibling"]), ("other", ["independent"])])
+                    for attempt in range(2):
+                        try:
+                            await instance.request(client, "/v2/search", {"query": "q"}, timeout=2)
+                        except fc.FirecrawlUnavailable as exc:
+                            assert exc.category == "rate_limited", exc.category
+                            if attempt == 0:
+                                assert exc.retry_after == 60, exc.retry_after
+                            else:
+                                assert 1 <= exc.retry_after <= 60, exc.retry_after
                         else:
-                            assert 1 <= exc.retry_after <= 60, exc.retry_after
-                    else:
-                        raise AssertionError("NaN Retry-After disabled the shared cooldown")
+                            raise AssertionError(f"Retry-After {value} disabled the shared cooldown")
 
-    run(check())
-    assert len(seen) == 1, len(seen)
+        run(check())
+        assert len(seen) == 1, (value, len(seen))
 
 
 def test_two_controls_share_one_inflight_limit_and_timeout_waiting_requests():

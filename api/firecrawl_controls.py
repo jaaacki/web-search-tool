@@ -272,7 +272,7 @@ class FirecrawlControls:
                 if response.status_code == 429:
                     delay = _retry_after(response)
                     group.clear()
-                    group.update(blocked="rate_limited", next_check=time.time() + delay)
+                    group.update(blocked="rate_limited", next_check=time.monotonic() + delay)
                     self._write_state(state)
                     logger.warning("firecrawl budget rate limited budget=%s retry_after=%.0f", budget.id, delay)
                     raise FirecrawlUnavailable(429, "rate_limited", delay, True)
@@ -302,7 +302,8 @@ class FirecrawlControls:
         blocked = group.get("blocked")
         if not blocked:
             return None
-        now = time.time()
+        now = time.monotonic()
+        wall_now = time.time()
         next_check = group.get("next_check")
         if isinstance(next_check, (int, float)) and now < next_check:
             retry_after = max(1.0, next_check - now)
@@ -330,9 +331,9 @@ class FirecrawlControls:
         previous_period = group.get("billing_period_end")
         period_reset = (
             isinstance(previous_period, (int, float))
-            and previous_period <= now
+            and previous_period <= wall_now
             and isinstance(usage["period_end"], (int, float))
-            and usage["period_end"] > now
+            and usage["period_end"] > wall_now
             and usage["period_end"] != previous_period
         )
         top_up = isinstance(previous, (int, float)) and remaining > previous
@@ -387,7 +388,7 @@ class FirecrawlControls:
         group.clear()
         group.update(
             blocked=reason,
-            next_check=time.time() + USAGE_RECHECK_SECONDS,
+            next_check=time.monotonic() + USAGE_RECHECK_SECONDS,
             remaining=usage.get("remaining") if usage else None,
             billing_period_end=usage.get("period_end") if usage else None,
         )
