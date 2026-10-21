@@ -18,7 +18,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("websearch.firecrawl")
 
 API_ROOT = "https://api.firecrawl.dev"
 CREDIT_USAGE_PATH = "/v2/team/credit-usage"
