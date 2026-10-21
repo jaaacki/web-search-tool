@@ -39,9 +39,9 @@ MAX_PAGE_CHARS = int(os.getenv("MAX_PAGE_CHARS", "60000"))
 # `fit_markdown` below this length means pruning ate the page, so fall back to raw.
 MIN_FIT_MARKDOWN_CHARS = 300
 CRAWL_CONCURRENCY = int(os.getenv("CRAWL_CONCURRENCY", "8"))
-# Chrome version the Crawl4AI image bundles (Chrome for Testing 153.0.8010.12 in 0.9.4).
+# Chrome version the Crawl4AI image bundles (Chrome for Testing 156.0.8078.4 in 0.9.5).
 # The UA we send has to match the engine that renders the page, so bump this with the image.
-CRAWL4AI_CHROMIUM_VERSION = os.getenv("CRAWL4AI_CHROMIUM_VERSION", "153.0.8010.12")
+CRAWL4AI_CHROMIUM_VERSION = os.getenv("CRAWL4AI_CHROMIUM_VERSION", "156.0.8078.4")
 WEBSEARCH_API_KEY = os.getenv("WEBSEARCH_API_KEY", "")
 # Optional Brave Search API keys (comma-separated) for primary discovery.
 # Empty = SearXNG-only discovery, exactly today's behavior.
@@ -1412,6 +1412,8 @@ CRAWL_FORBIDDEN_KEYS = frozenset({
 _CRAWL_SCALARS = (str, bool, int, float)
 CRAWL_ALLOWED_KEYS_HINT = ", ".join(sorted(CRAWL_ALLOWED_KEYS))
 CRAWL_MAX_RETRIES = 2
+CRAWL_MAX_DELAY_SECONDS = 60
+CRAWL_DELAY_KEYS = frozenset({"delay_before_return_html", "mean_delay", "max_range"})
 
 
 def _crawl_violation(loc: list[str], message: str) -> dict[str, Any]:
@@ -1438,6 +1440,17 @@ def _crawl_value_violation(key: str, value: Any) -> str | None:
         isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= CRAWL_MAX_RETRIES
     ):
         return f"'max_retries' must be an integer between 0 and {CRAWL_MAX_RETRIES}"
+    if key in CRAWL_DELAY_KEYS and not (
+        (
+            isinstance(value, int) and not isinstance(value, bool)
+            and 0 <= value <= CRAWL_MAX_DELAY_SECONDS
+        )
+        or (
+            isinstance(value, float) and math.isfinite(value)
+            and 0 <= value <= CRAWL_MAX_DELAY_SECONDS
+        )
+    ):
+        return f"'{key}' must be a finite number between 0 and {CRAWL_MAX_DELAY_SECONDS} seconds"
     if key == "cache_mode" and not (isinstance(value, str) and value.lower() in CRAWL_CACHE_MODES):
         return f"'cache_mode' must be one of: {', '.join(CRAWL_CACHE_MODES)}"
     return None
