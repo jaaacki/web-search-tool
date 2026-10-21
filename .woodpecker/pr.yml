@@ -1,0 +1,24 @@
+when:
+  - event:
+      - pull_request
+    branch:
+      - main
+    evaluate: 'CI_SYSTEM_HOST == "prci.sparkfn.io"'
+
+steps:
+  - name: test
+    image: python:3.14-slim
+    commands:
+      - |
+        set -eu
+        python --version
+        python -m pip install --no-cache-dir -r api/requirements.txt
+        python -m pip check
+        set -- api/test_*.py
+        if [ ! -f "$$1" ]; then
+          printf '%s\n' 'No API test scripts found' >&2
+          exit 1
+        fi
+        for test in "$$@"; do
+          python "$$test"
+        done
