@@ -50,9 +50,16 @@ class MockDiscoveryClient:
         if params and "offset" in params:
             offset = int(params["offset"])
             self.calls.append(offset)
-            return await self.brave_page(offset)
-        self.calls.append("searxng")
-        return httpx.Response(200, json={"results": self.rows, "unresponsive_engines": []})
+            response = await self.brave_page(offset)
+        else:
+            self.calls.append("searxng")
+            response = httpx.Response(200, json={"results": self.rows, "unresponsive_engines": []})
+        return httpx.Response(
+            response.status_code,
+            headers=response.headers,
+            content=response.content,
+            request=httpx.Request("GET", url),
+        )
 
 
 def run_discovery_with(provider, http_client, url_check, timeout, limit=10):
