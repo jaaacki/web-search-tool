@@ -252,6 +252,195 @@ def test_team_exhaustion_fails_over_only_to_an_independent_budget():
     ], seen
 
 
+def test_invalid_auth_fails_over_with_shared_cooldown_and_same_key_recovery():
+    for endpoint, payload in (
+        ("/v2/search", {"query": "q"}),
+        ("/v2/scrape", {"url": "https://example.org"}),
+    ):
+        seen = []
+        primary_status = 401
+        groups = [("team-a", ["primary", "sibling"]), ("team-b", ["independent"])]
+
+        def handler(request):
+            key = request.headers["Authorization"]
+            seen.append((request.url.path, key))
+            assert request.method == "POST", "invalid auth must not trigger usage probes"
+            return response(request, primary_status if key == "Bearer primary" else 200)
+
+        async def check():
+            nonlocal primary_status
+            with tempfile.TemporaryDirectory() as tmp:
+                async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                    instance = controls(tmp, groups)
+                    for _ in range(2):
+                        # A separate worker must also skip the cached bad primary.
+                        result = await controls(tmp, groups).request(client, endpoint, payload, timeout=2)
+                        assert result.status_code == 200
+                    state = instance._read_state()
+                    assert state["budgets"]["team-a"]["blocked"] == "invalid_auth", state
+                    state["budgets"]["team-a"]["next_check"] = time.monotonic() - 1
+                    instance._write_state(state)
+                    # Still invalid: one same-key attempt re-blocks, then callers skip it again.
+                    for _ in range(2):
+                        assert (await instance.request(client, endpoint, payload, timeout=2)).status_code == 200
+                    state = instance._read_state()
+                    assert state["budgets"]["team-a"]["next_check"] > time.monotonic(), state
+                    state["budgets"]["team-a"]["next_check"] = time.monotonic() - 1
+                    instance._write_state(state)
+                    primary_status = 200
+                    assert (await instance.request(client, endpoint, payload, timeout=2)).status_code == 200
+                    assert instance._read_state()["budgets"]["team-a"] == {}
+
+        run(check())
+        assert seen == [(endpoint, "Bearer " + key) for key in (
+            "primary", "independent", "independent", "primary", "independent", "independent", "primary",
+        )], seen
+
+
+def test_all_skipped_budgets_preserve_the_last_failure_and_safe_metadata():
+    secrets = ("primary-secret-61", "backup-secret-61", "body-secret-61", "header-secret-61", "url-secret-61")
+    for statuses in ((401, 401), (402, 401), (401, 402), (402, 402)):
+        seen = []
+
+        def handler(request):
+            key = request.headers["Authorization"]
+            seen.append((request.url.path, key))
+            if request.url.path == fc.CREDIT_USAGE_PATH:
+                return response(request, body={"success": True, "data": {"remainingCredits": 0}})
+            status = statuses[0] if key == "Bearer " + secrets[0] else statuses[1]
+            return response(request, status, {"error": secrets[2]}, {"X-Private": secrets[3], "Retry-After": "Infinity"})
+
+        async def check():
+            with tempfile.TemporaryDirectory() as tmp:
+                groups = [("a", [secrets[0], "sibling"]), ("b", [secrets[1]])]
+                async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                    for _ in range(2):
+                        try:
+                            await controls(tmp, groups).request(
+                                client, "/v2/scrape", {"url": "https://example.org/" + secrets[4]}, timeout=2
+                            )
+                        except fc.FirecrawlUnavailable as exc:
+                            expected = "invalid_auth" if statuses[-1] == 401 else "team_exhausted"
+                            assert (exc.status, exc.category) == (statuses[-1], expected), vars(exc)
+                            assert str(exc) == expected
+                            assert exc.retryable is True
+                            assert 1 <= exc.retry_after <= fc.USAGE_RECHECK_SECONDS, exc.retry_after
+                            if statuses[-1] == 402:
+                                assert exc.retry_after == fc.USAGE_RECHECK_SECONDS, exc.retry_after
+                        else:
+                            raise AssertionError("all unavailable budgets returned success")
+                    state = json.dumps(controls(tmp, groups)._read_state())
+                    assert not any(secret in state for secret in secrets), state
+
+        with patch.object(fc, "logger") as logs:
+            run(check())
+        logged = str(logs.mock_calls)
+        assert "category=invalid_auth" in logged or statuses == (402, 402), logged
+        assert not any(secret in logged for secret in (*secrets, "Authorization", "Bearer", "https://")), logged
+        expected_calls = []
+        for key, status in zip(secrets[:2], statuses):
+            expected_calls.append(("/v2/scrape", "Bearer " + key))
+            if status == 402:
+                expected_calls.append((fc.CREDIT_USAGE_PATH, "Bearer " + key))
+        assert seen == expected_calls, seen
+
+
+def test_invalid_auth_does_not_bypass_later_cap_policy_rate_or_provider_errors():
+    for status, category in ((402, "key_cap_or_ambiguous"), (403, "policy_denied"),
+                             (429, "rate_limited"), (500, "provider_unavailable")):
+        seen = []
+
+        def handler(request):
+            key = request.headers["Authorization"]
+            seen.append((request.url.path, key))
+            if request.url.path == fc.CREDIT_USAGE_PATH:
+                return response(request, body={"success": True, "data": {"remainingCredits": 3}})
+            return response(request, 401 if key == "Bearer primary" else status)
+
+        async def check():
+            with tempfile.TemporaryDirectory() as tmp:
+                async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                    try:
+                        await controls(tmp, [("a", ["primary", "sibling"]), ("b", ["backup", "other"]),
+                                             ("c", ["unused"])]).request(
+                            client, "/v2/search", {"query": "q"}, timeout=2
+                        )
+                    except fc.FirecrawlUnavailable as exc:
+                        assert (exc.status, exc.category) == (status, category), vars(exc)
+                    else:
+                        raise AssertionError("failover bypassed a non-rotating failure")
+
+        run(check())
+        expected = [("/v2/search", "Bearer primary"), ("/v2/search", "Bearer backup")]
+        if status == 402:
+            expected.append((fc.CREDIT_USAGE_PATH, "Bearer backup"))
+        assert seen == expected, seen
+
+
+def test_auth_recovery_does_not_fail_over_after_policy_or_provider_errors():
+    for status, category in ((403, "policy_denied"), (500, "provider_unavailable")):
+        seen = []
+        primary_status = 401
+
+        def handler(request):
+            key = request.headers["Authorization"]
+            seen.append(key)
+            return response(request, primary_status if key == "Bearer primary" else 200)
+
+        async def check():
+            nonlocal primary_status
+            with tempfile.TemporaryDirectory() as tmp:
+                async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                    instance = controls(tmp, [("a", ["primary"]), ("b", ["backup"])])
+                    assert (await instance.request(client, "/v2/search", {"query": "q"}, timeout=2)).status_code == 200
+                    state = instance._read_state()
+                    state["budgets"]["a"]["next_check"] = time.monotonic() - 1
+                    instance._write_state(state)
+                    primary_status = status
+                    for _ in range(2):
+                        try:
+                            await instance.request(client, "/v2/search", {"query": "q"}, timeout=2)
+                        except fc.FirecrawlUnavailable as exc:
+                            assert (exc.status, exc.category) == (status, category), vars(exc)
+                        else:
+                            raise AssertionError("stale auth guard bypassed a later non-rotating failure")
+
+        run(check())
+        assert seen == ["Bearer primary", "Bearer backup", "Bearer primary", "Bearer primary"], seen
+
+
+def test_auth_failover_uses_the_remaining_operation_deadline():
+    clock = [0.0]
+    seen = []
+
+    def handler(request):
+        key = request.headers["Authorization"]
+        seen.append(key)
+        if key == "Bearer primary":
+            clock[0] = 1.0
+            return response(request, 401)
+        return response(request)
+
+    async def check():
+        with tempfile.TemporaryDirectory() as tmp:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                instance = controls(tmp, [("a", ["primary"]), ("b", ["backup"])])
+                with patch.object(instance, "_acquire_lock", wraps=instance._acquire_lock) as acquire, patch.object(
+                    instance, "_release_lock", wraps=instance._release_lock
+                ) as release:
+                    assert (await instance.request(client, "/v2/search", {"query": "q"}, timeout=2)).status_code == 200
+                    assert acquire.call_count == release.call_count == 1
+                    assert acquire.call_args.args == (2.0,)
+
+    with patch.object(asyncio, "get_running_loop") as get_loop, patch.object(
+        asyncio, "wait_for", wraps=asyncio.wait_for
+    ) as wait_for:
+        get_loop.return_value.time.side_effect = lambda: clock[0]
+        run(check())
+    assert [call.kwargs["timeout"] for call in wait_for.call_args_list] == [2.0, 1.0]
+    assert seen == ["Bearer primary", "Bearer backup"], seen
+
+
 def test_positive_balance_blocks_during_cooldown_then_retries_same_key():
     seen = []
     posts = 0

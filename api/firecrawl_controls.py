@@ -215,11 +215,14 @@ class FirecrawlControls:
         fd = await self._acquire_lock(deadline)
         try:
             state = self._read_state()
+            exhausted_error = FirecrawlUnavailable(402, "team_exhausted", USAGE_RECHECK_SECONDS, True)
+            last_error = exhausted_error
             for budget in self._budgets:
                 group = self._group_state(state, budget.id)
                 blocked = await self._refresh_block(client, budget, group, state, deadline)
                 if blocked is not None:
-                    if blocked.category == "team_exhausted":
+                    if blocked.category in ("team_exhausted", "invalid_auth"):
+                        last_error = blocked if blocked.category == "invalid_auth" else exhausted_error
                         continue
                     raise blocked
 
@@ -263,6 +266,7 @@ class FirecrawlControls:
                         self._block(group, "team_exhausted", usage)
                         self._write_state(state)
                         logger.warning("firecrawl budget exhausted budget=%s remaining=0", budget.id)
+                        last_error = exhausted_error
                         continue
                     self._block(group, "key_cap_or_ambiguous", usage)
                     self._write_state(state)
@@ -278,7 +282,11 @@ class FirecrawlControls:
                     raise FirecrawlUnavailable(429, "rate_limited", delay, True)
 
                 if response.status_code == 401:
-                    raise FirecrawlUnavailable(401, "invalid_auth", None, False)
+                    self._block(group, "invalid_auth", None)
+                    self._write_state(state)
+                    logger.warning("firecrawl budget blocked budget=%s category=invalid_auth", budget.id)
+                    last_error = FirecrawlUnavailable(401, "invalid_auth", USAGE_RECHECK_SECONDS, True)
+                    continue
                 if response.status_code == 403:
                     raise FirecrawlUnavailable(403, "policy_denied", None, False)
                 if response.status_code >= 500:
@@ -288,7 +296,7 @@ class FirecrawlControls:
                 # content, no record, and page status); do not rotate a key for them.
                 return response
 
-            raise FirecrawlUnavailable(402, "team_exhausted", USAGE_RECHECK_SECONDS, True)
+            raise last_error
         finally:
             self._release_lock(fd)
 
@@ -311,10 +319,18 @@ class FirecrawlControls:
                 return FirecrawlUnavailable(402, blocked, retry_after, True)
             if blocked == "rate_limited":
                 return FirecrawlUnavailable(429, blocked, retry_after, True)
+            if blocked == "invalid_auth":
+                return FirecrawlUnavailable(401, blocked, min(retry_after, USAGE_RECHECK_SECONDS), True)
             return FirecrawlUnavailable(402, "key_cap_or_ambiguous", retry_after, True)
 
         if blocked == "rate_limited":
             group.clear()
+            return None
+        if blocked == "invalid_auth":
+            # Only a caller retries the same primary key; another 401 re-arms the guard.
+            group.clear()
+            self._write_state(state)
+            logger.info("firecrawl same-key retry allowed after cooldown budget=%s", budget.id)
             return None
 
         key = budget.keys[0]
