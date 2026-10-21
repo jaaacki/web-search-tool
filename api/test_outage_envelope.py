@@ -286,7 +286,8 @@ def test_health_outage_body_reports_every_service():
         exc = raises_app_error(app.health())
         checks = (exc.details or {}).get("checks")
         assert isinstance(checks, dict), exc.details
-        assert set(checks) == {"brave", "searxng", "searxng_service", "crawl4ai", "reranker"}, checks
+        assert set(checks) == {"firecrawl", "brave", "searxng", "searxng_service", "crawl4ai", "reranker"}, checks
+        assert checks["firecrawl"] == "unknown", checks
         assert checks["searxng"] == "unavailable", checks
         assert checks["brave"] == "not_configured", checks
     finally:

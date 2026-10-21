@@ -24,6 +24,17 @@ from fastapi.responses import JSONResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, ConfigDict, Field
 
+from firecrawl_adapter import (
+    is_pdf_target,
+    scrape_payload as firecrawl_scrape_payload,
+    scrape_result as firecrawl_scrape_result,
+    search_payload as firecrawl_search_payload,
+    search_results as firecrawl_search_results,
+    same_url_identity,
+    supports_markdown_crawl,
+)
+from firecrawl_controls import FirecrawlUnavailable, firecrawl_request, firecrawl_url_allowed
+
 SEARXNG_URL = os.getenv("SEARXNG_URL", "http://searxng:8080").rstrip("/")
 CRAWL4AI_URL = os.getenv("CRAWL4AI_URL", "http://crawl4ai:11235").rstrip("/")
 # crawl4ai >=0.9 refuses to bind non-loopback without an API token; send it as a bearer header.
@@ -203,7 +214,7 @@ class HealthData(BaseModel):
             "Cached per-provider discovery outcomes plus bounded internal service probes. Public health polling never "
             "issues paid search requests; a total discovery outage is still reported as unavailable."
         ),
-        examples=[{"brave": "unknown", "searxng": "unknown", "searxng_service": "ok", "crawl4ai": "ok", "reranker": "ok"}],
+        examples=[{"firecrawl": "unknown", "brave": "unknown", "searxng": "unknown", "searxng_service": "ok", "crawl4ai": "ok", "reranker": "ok"}],
     )
 
 
@@ -398,6 +409,18 @@ ERROR_EXAMPLES = {
         "summary": "Crawl URL is not a public http(s) URL",
         "value": {"ok": False, "error": {"code": "invalid_url", "message": "URL must be a public http(s) URL", "details": None}},
     },
+    "firecrawl_policy_denied": {
+        "summary": "The provider policy denied this target",
+        "value": {
+            "ok": False,
+            "error": {
+                "code": "firecrawl_policy_denied",
+                "message": "The requested target is not available under provider policy",
+                "details": {"provider": "firecrawl"},
+                "retryable": False,
+            },
+        },
+    },
     "crawl4ai_error": {
         "summary": "Internal Crawl4AI service failed",
         "value": {"ok": False, "error": {"code": "crawl4ai_error", "message": "Crawl4AI crawl failed", "details": {"error": "upstream error details"}}},
@@ -437,8 +460,8 @@ SEARCH_ERROR_RESPONSES = {
     },
     422: {
         "model": ErrorEnvelope,
-        "description": "Invalid request. Fix the query/body values before retrying.",
-        "content": {"application/json": {"examples": {"validation_error": ERROR_EXAMPLES["validation_error"]}}},
+        "description": "Invalid request or permanent provider-policy denial. Do not retry unchanged values or targets.",
+        "content": {"application/json": {"examples": {"validation_error": ERROR_EXAMPLES["validation_error"], "firecrawl_policy_denied": ERROR_EXAMPLES["firecrawl_policy_denied"]}}},
     },
     502: {
         "model": ErrorEnvelope,
@@ -461,8 +484,8 @@ CRAWL_ERROR_RESPONSES = {
     },
     422: {
         "model": ErrorEnvelope,
-        "description": "Invalid request. Most often this is a non-public URL, unsupported URL scheme, credentialed URL, or malformed body.",
-        "content": {"application/json": {"examples": {"validation_error": ERROR_EXAMPLES["validation_error"], "invalid_url": ERROR_EXAMPLES["invalid_url"]}}},
+        "description": "Invalid request, non-public URL, unsupported option, or permanent provider-policy denial.",
+        "content": {"application/json": {"examples": {"validation_error": ERROR_EXAMPLES["validation_error"], "invalid_url": ERROR_EXAMPLES["invalid_url"], "firecrawl_policy_denied": ERROR_EXAMPLES["firecrawl_policy_denied"]}}},
     },
     502: {
         "model": ErrorEnvelope,
@@ -551,6 +574,7 @@ async def probe_service(base_url: str, path: str, headers: dict[str, str] | None
 # Recent outcomes from real discovery requests. Health reads these instead of issuing
 # searches that may be paid or rate-limited.
 _PROVIDER_HEALTH: dict[str, dict[str, object]] = {
+    "firecrawl": {"at": 0.0, "status": "unknown"},
     "brave": {"at": 0.0, "status": "unknown"},
     "searxng": {"at": 0.0, "status": "unknown"},
 }
@@ -585,6 +609,7 @@ def health_cache_reset() -> None:
 async def _run_health_checks() -> dict[str, str]:
     """Report recent provider outcomes and probe supporting services without searching."""
     checks = {
+        "firecrawl": _provider_health("firecrawl", True),
         "brave": _provider_health("brave", bool(BRAVE_POOL)),
         "searxng": _provider_health("searxng", bool(_engine_names())),
     }
@@ -600,7 +625,7 @@ async def _run_health_checks() -> dict[str, str]:
     searxng_available = checks["searxng"] == "ok" or (
         checks["searxng"] == "unknown" and checks["searxng_service"] == "ok"
     )
-    if checks["brave"] != "ok" and not searxng_available:
+    if checks["firecrawl"] != "ok" and checks["brave"] != "ok" and not searxng_available:
         raise AppError(
             503,
             "upstream_unavailable",
@@ -669,10 +694,10 @@ def openapi(request: Request):
     dependencies=[Depends(require_api_key)],
     summary="Search the web and return extracted, reranked page content",
     description=(
-        "Use this endpoint when the caller has a question or topic and needs current web evidence. The service discovers candidate "
-        "URLs with Brave when configured and SearXNG fallback/top-up, crawls public pages through internal Crawl4AI, chunks extracted text, "
-        "and reranks chunks against the query, "
-        "and returns normalized results. Prefer this POST endpoint for MCP/CLI tools because the request body is explicit and easy to validate. "
+        "Use this endpoint when the caller has a question or topic and needs current web evidence. Firecrawl is the primary discovery "
+        "provider when configured, with Brave and SearXNG as fallbacks/top-up. Advanced search uses Firecrawl Markdown for eligible "
+        "Firecrawl results and Crawl4AI for remaining pages, then chunks and reranks the content. Basic search returns discovery snippets "
+        "without scraping. Prefer this POST endpoint for MCP/CLI tools because the request body is explicit and easy to validate. "
         "If `data.results` is empty, the request succeeded but no usable pages were found."
     ),
     operation_id="search_web",
@@ -710,7 +735,26 @@ async def search(request: SearchRequest):
     if request.depth == "basic":
         pages = snippet_pages(candidates)
     else:
-        pages = await crawl_all(client, candidates)
+        crawl_deadline = asyncio.get_running_loop().time() + CRAWL_TIMEOUT
+        firecrawl_pages, crawl_candidates, policy_denied = await scrape_firecrawl_candidates(
+            client, candidates, crawl_deadline
+        )
+        pages = firecrawl_pages
+        if crawl_candidates:
+            try:
+                pages.extend(await crawl_all(client, crawl_candidates, deadline=crawl_deadline))
+            except AppError as exc:
+                if not pages:
+                    raise
+                logger.warning("crawl fallback failed after Firecrawl content (%s)", exc.code)
+        if not pages and policy_denied and not crawl_candidates:
+            raise AppError(
+                422,
+                "firecrawl_policy_denied",
+                "The requested targets are not available under provider policy",
+                {"provider": "firecrawl"},
+                retryable=False,
+            )
     if not pages:
         logger.info(
             "search q=%r depth=%s candidates=%d results=0 discovery=%.0fms crawl=%.0fms elapsed=%.0fms",
@@ -786,9 +830,10 @@ async def search_get(
     dependencies=[Depends(require_api_key)],
     summary="Crawl one public URL and return extracted content",
     description=(
-        "Use this endpoint when the caller already has a URL and needs clean page content. This is a safe public facade over internal Crawl4AI: "
-        "it validates that the URL is public http(s), rejects localhost/private/internal targets, calls Crawl4AI on the private Docker network, "
-        "and returns only normalized `url` and `content`. Do not use this endpoint for discovery; call the search API first when you do not already know the URL."
+        "Use this endpoint when the caller already has a URL and needs Markdown. A plain, compatible Markdown request uses Firecrawl "
+        "when the target is allowed; explicit Crawl4AI formats/cache/options and Firecrawl-unavailable cases use internal Crawl4AI. "
+        "It validates public http(s) URLs and returns only normalized `url` and `content`. Do not use this endpoint for discovery; call "
+        "the search API first when you do not already know the URL."
     ),
     operation_id="crawl_url",
     tags=["Crawl"],
@@ -999,16 +1044,69 @@ async def discover_candidates(client: httpx.AsyncClient, query: str, limit: int)
     candidates: list[dict] = []
     answered = False
 
-    if BRAVE_POOL:
+    payload = firecrawl_search_payload(query, limit)
+    if payload is None:
+        failures["firecrawl"] = "query_too_long"
+    else:
+        remaining = deadline - loop.time()
+        if remaining > 0:
+            try:
+                response = await firecrawl_request(client, "/v2/search", payload, timeout=remaining)
+                rows = firecrawl_search_results(response)
+                if rows is None:
+                    failures["firecrawl"] = "invalid_response"
+                    _record_provider_health("firecrawl", "unavailable")
+                else:
+                    firecrawl_candidates, complete = await shape_candidates(
+                        rows, limit, "description", deadline=deadline
+                    )
+                    if complete or firecrawl_candidates:
+                        pdf_urls = {
+                            row["url"] for row in rows if row.get("category", "").lower() == "pdf"
+                        }
+                        for candidate in firecrawl_candidates:
+                            candidate["_firecrawl_source"] = True
+                            if candidate["url"] in pdf_urls:
+                                candidate["_firecrawl_category"] = "pdf"
+                        candidates = firecrawl_candidates
+                        answered = True
+                        _record_provider_health("firecrawl", "ok")
+                    else:
+                        failures["firecrawl"] = "candidate_validation_timeout"
+                        _record_provider_health("firecrawl", "unavailable")
+            except FirecrawlUnavailable as exc:
+                failures["firecrawl"] = exc.category
+                if exc.retry_after is not None:
+                    retry_afters.append(exc.retry_after)
+                _record_provider_health(
+                    "firecrawl", "not_configured" if exc.category == "not_configured" else "unavailable"
+                )
+                if exc.category != "not_configured":
+                    logger.warning("firecrawl discovery failed (%s)", exc.category)
+            except asyncio.TimeoutError:
+                failures["firecrawl"] = "timeout"
+                _record_provider_health("firecrawl", "unavailable")
+            except Exception as exc:
+                failures["firecrawl"] = type(exc).__name__
+                _record_provider_health("firecrawl", "unavailable")
+                logger.warning("firecrawl discovery failed (%s)", type(exc).__name__)
+        else:
+            failures["firecrawl"] = "deadline_exceeded"
+            _record_provider_health("firecrawl", "unavailable")
+
+    if len(candidates) < limit and BRAVE_POOL:
         brave_retry_after: float | None = None
         remaining = deadline - loop.time()
         if remaining > 0:
             try:
-                brave, brave_retry_after = await BRAVE_POOL.search(client, query, limit, deadline)
+                brave, brave_retry_after = await BRAVE_POOL.search(
+                    client, query, limit - len(candidates), deadline
+                )
                 if brave is None:
                     failures["brave"] = "unavailable"
                 else:
-                    candidates = brave
+                    seen_urls = {item["url"] for item in candidates}
+                    candidates.extend(item for item in brave if item["url"] not in seen_urls)
                     answered = True
             except asyncio.TimeoutError:
                 failures["brave"] = "timeout"
@@ -1027,7 +1125,9 @@ async def discover_candidates(client: httpx.AsyncClient, query: str, limit: int)
         remaining = deadline - loop.time()
         if remaining > 0:
             try:
-                extra = await search_searxng(client, query, limit, timeout=remaining, deadline=deadline)
+                extra = await search_searxng(
+                    client, query, limit - len(candidates), timeout=remaining, deadline=deadline
+                )
                 answered = True
                 seen_urls = {item["url"] for item in candidates}
                 candidates.extend(item for item in extra if item["url"] not in seen_urls)
@@ -1045,7 +1145,7 @@ async def discover_candidates(client: httpx.AsyncClient, query: str, limit: int)
 
     if answered:
         return candidates[:limit]
-    if not BRAVE_POOL and not _engine_names():
+    if not BRAVE_POOL and not _engine_names() and failures.get("firecrawl") == "not_configured":
         raise _NoEnginesError()
     raise AppError(
         503,
@@ -1055,6 +1155,92 @@ async def discover_candidates(client: httpx.AsyncClient, query: str, limit: int)
         retryable=True,
         retry_after=max(retry_afters, default=OUTAGE_RETRY_AFTER),
     )
+
+
+async def scrape_firecrawl_candidates(
+    client: httpx.AsyncClient, candidates: list[dict], deadline: float
+) -> tuple[list[dict], list[dict], set[str]]:
+    loop = asyncio.get_running_loop()
+    pages = []
+    local_candidates = []
+    policy_denied: set[str] = set()
+    seen_candidates: list[str] = []
+    for candidate in candidates:
+        url = candidate["url"]
+        if any(same_url_identity(url, seen) for seen in seen_candidates):
+            continue
+        seen_candidates.append(url)
+        if not candidate.get("_firecrawl_source"):
+            local_candidates.append(candidate)
+            continue
+        url = candidate["url"]
+        if is_pdf_target(url, candidate.get("_firecrawl_category", "")) or not firecrawl_url_allowed(url):
+            local_candidates.append(candidate)
+            continue
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            local_candidates.append(candidate)
+            continue
+        try:
+            allowed = await asyncio.wait_for(is_allowed_public_url(url), timeout=remaining)
+        except asyncio.TimeoutError:
+            local_candidates.append(candidate)
+            continue
+        if not allowed:
+            local_candidates.append(candidate)
+            continue
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            local_candidates.append(candidate)
+            continue
+        try:
+            response = await firecrawl_request(
+                client, "/v2/scrape", firecrawl_scrape_payload(url), timeout=remaining
+            )
+        except FirecrawlUnavailable as exc:
+            if exc.category == "policy_denied":
+                policy_denied.add(url)
+                _record_provider_health("firecrawl", "ok")
+                continue
+            if exc.category == "provider_routed_domain":
+                local_candidates.append(candidate)
+                continue
+            _record_provider_health(
+                "firecrawl", "not_configured" if exc.category == "not_configured" else "unavailable"
+            )
+            if exc.category != "not_configured":
+                logger.warning("firecrawl scrape failed (%s)", exc.category)
+            local_candidates.append(candidate)
+            continue
+        except asyncio.TimeoutError:
+            _record_provider_health("firecrawl", "unavailable")
+            local_candidates.append(candidate)
+            continue
+
+        if response.status_code < 500:
+            _record_provider_health("firecrawl", "ok")
+        page = firecrawl_scrape_result(response, url)
+        if page is None:
+            local_candidates.append(candidate)
+        else:
+            pages.append(
+                {
+                    "url": page["url"],
+                    "title": candidate["title"],
+                    "snippet": candidate.get("snippet", ""),
+                    "content": page["content"],
+                }
+            )
+
+    seen_urls = [page["url"] for page in pages] + list(policy_denied)
+    unique_local_candidates = []
+    for item in local_candidates:
+        url = item["url"]
+        if any(same_url_identity(url, seen) for seen in seen_urls):
+            continue
+        seen_urls.append(url)
+        unique_local_candidates.append(item)
+    return pages, unique_local_candidates, policy_denied
 
 
 async def shape_candidates(
@@ -1429,6 +1615,41 @@ async def crawl_direct_url(client: httpx.AsyncClient, request: CrawlRequest):
     if not await is_allowed_public_url(request.url):
         raise AppError(422, "invalid_url", "URL must be a public http(s) URL")
 
+    if (
+        supports_markdown_crawl(request)
+        and not is_pdf_target(request.url)
+        and firecrawl_url_allowed(request.url)
+    ):
+        try:
+            response = await firecrawl_request(
+                client,
+                "/v2/scrape",
+                firecrawl_scrape_payload(request.url),
+                timeout=CRAWL_TIMEOUT,
+            )
+        except FirecrawlUnavailable as exc:
+            if exc.category == "policy_denied":
+                _record_provider_health("firecrawl", "ok")
+                raise AppError(
+                    422,
+                    "firecrawl_policy_denied",
+                    "The requested target is not available under provider policy",
+                    {"provider": "firecrawl"},
+                    retryable=False,
+                ) from exc
+            if exc.category != "provider_routed_domain":
+                _record_provider_health(
+                    "firecrawl", "not_configured" if exc.category == "not_configured" else "unavailable"
+                )
+                if exc.category != "not_configured":
+                    logger.warning("firecrawl scrape failed (%s)", exc.category)
+        else:
+            if response.status_code < 500:
+                _record_provider_health("firecrawl", "ok")
+            result = firecrawl_scrape_result(response, request.url)
+            if result is not None:
+                return result
+
     payload = await call_crawl4ai(client, build_crawl_payload(request))
     crawled_url = extract_crawled_url(payload) or request.url
     if not await is_allowed_public_url(crawled_url):
@@ -1708,9 +1929,9 @@ def filtered_openapi(surface: Literal["search", "crawl"]):
         schema["info"]["title"] = "SparkFN Web Search API"
         schema["info"]["description"] = (
             "Tool-facing API for web discovery plus extracted, reranked page content. Use this service when an agent, CLI, or MCP tool "
-            "has a natural-language question/topic and needs current web evidence. The pipeline is: Brave discovers candidates when "
-            "configured, SearXNG provides fallback/top-up, internal Crawl4AI extracts public pages, and the reranker returns the most "
-            "relevant extracted chunks.\n\n"
+            "has a natural-language question/topic and needs current web evidence. The pipeline is: Firecrawl discovers web candidates "
+            "when configured, Brave and SearXNG fill fallbacks, eligible Firecrawl results are scraped once through Firecrawl, other pages "
+            "use internal Crawl4AI, and the reranker returns the most relevant extracted chunks.\n\n"
             "How to use: send POST /search with JSON body {\"query\": \"your concise query\", \"max_results\": 5, \"candidates\": 10} "
             "and an X-API-Key header. Start with max_results 3-5 and candidates 10. Increase candidates only when recall matters more than latency. "
             "An empty results array is a successful no-results response, not a failure."

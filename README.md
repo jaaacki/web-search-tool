@@ -3,8 +3,9 @@
 Self-hosted stack for `websearch.sparkfn.io` and controlled headless crawling at `webcrawl.sparkfn.io`:
 
 - `api`: OpenAPI/Swagger-compatible search and crawl API exposed through Traefik.
-- `searxng`: internal URL discovery service.
-- `crawl4ai`: internal page extraction service used by the API.
+- `firecrawl`: optional managed web discovery and Markdown extraction when an authorized budget is configured.
+- `searxng`: internal discovery fallback and top-up service.
+- `crawl4ai`: internal page extraction fallback and service for explicit Crawl4AI options.
 - `reranker`: internal cross-encoder reranking service (Hugging Face TEI). The API's lexical
   prefilter lives in `api/app.py`; this container only scores query/document pairs.
 

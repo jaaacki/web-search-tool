@@ -96,6 +96,7 @@ services:
       - CRAWL4AI_CHROMIUM_VERSION=${CRAWL4AI_CHROMIUM_VERSION:-156.0.8078.4}
       - WEBSEARCH_API_KEY=${WEBSEARCH_API_KEY:?set WEBSEARCH_API_KEY in .env}
       - BRAVE_API_KEYS=${BRAVE_API_KEYS:-}
+      - FIRECRAWL_BUDGETS_JSON=${FIRECRAWL_BUDGETS_JSON:-}
     depends_on:
       searxng:
         condition: service_healthy
