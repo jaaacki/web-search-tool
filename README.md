@@ -39,7 +39,7 @@ docker compose up -d --build          # or name one service, e.g. `api`
 curl -fsS https://websearch.sparkfn.io/health
 ```
 
-`/health` sends a real canary query through SearXNG. It returns 503 only when no engine answers; a partial engine outage stays 200.
+`/health` reuses recent discovery-provider outcomes and uses SearXNG's `/healthz` only before a search outcome is known. Polling never launches a search. It returns 503 when no configured discovery provider is available; Crawl4AI and the reranker remain diagnostic checks.
 
 ## Tests
 

@@ -8,6 +8,8 @@ import secrets
 import socket
 import time
 from collections import Counter
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from typing import Any, Literal
@@ -46,24 +48,21 @@ WEBSEARCH_API_KEY = os.getenv("WEBSEARCH_API_KEY", "")
 BRAVE_API_KEYS = tuple(key.strip() for key in os.getenv("BRAVE_API_KEYS", "").split(",") if key.strip())
 BRAVE_SEARCH_URL = os.getenv("BRAVE_SEARCH_URL", "https://api.search.brave.com/res/v1/web/search").rstrip("/")
 BRAVE_TIMEOUT = float(os.getenv("BRAVE_TIMEOUT", "8"))
+BRAVE_PAGE_SIZE = 20
+BRAVE_PAGE_LIMIT = 10
 # Fences SearXNG discovery per request: settings.yml merges with defaults, so
 # the allowlist lives here where every search routes through. Every engine named
 # here must be active in the pinned image - an engine the image marks `inactive`
 # is absent from /config and can never be re-enabled by config, which silently
 # collapses discovery onto the remaining engines.
 SEARXNG_ENGINES = os.getenv("SEARXNG_ENGINES", "bing,brave,duckduckgo,google cse")
-# The canary query health sends through the real engine pool. It must be a term every
-# configured engine can answer, because an engine set that cannot answer it is exactly
-# the outage this probe exists to catch.
-HEALTH_CANARY_QUERY = os.getenv("HEALTH_CANARY_QUERY", "open source web search engines")
 # Bounded separately from SEARCH_TIMEOUT: health is polled, so it must not hold a
 # caller for as long as a real search would. Both are per-request ceilings, not
 # aggregate budgets.
 HEALTH_TIMEOUT = float(os.getenv("HEALTH_TIMEOUT", "5"))
 SEARCH_TIMEOUT = float(os.getenv("SEARCH_TIMEOUT", "10"))
-# A poll interval shorter than this reuses the last health verdict instead of firing a
-# real engine query again, so /health can be polled aggressively without turning into
-# engine load of its own.
+# Reuse per-provider outcomes and internal probes so frequent /health polls do not
+# trigger additional network checks or paid searches.
 HEALTH_CACHE_TTL = float(os.getenv("HEALTH_CACHE_TTL", "60"))
 # How long a caller should wait before retrying a downed pool. Engine outages clear in
 # seconds-to-minutes, not milliseconds, and a hot retry loop from every agent is how a
@@ -201,10 +200,10 @@ class HealthData(BaseModel):
     checks: dict[str, str] = Field(
         default_factory=dict,
         description=(
-            "Live per-service probe results. `searxng` is decided by a real canary query through the engine pool, so a total "
-            "search-backend outage is reported here instead of passing as a healthy process."
+            "Cached per-provider discovery outcomes plus bounded internal service probes. Public health polling never "
+            "issues paid search requests; a total discovery outage is still reported as unavailable."
         ),
-        examples=[{"searxng": "ok", "crawl4ai": "ok", "reranker": "ok"}],
+        examples=[{"brave": "unknown", "searxng": "unknown", "searxng_service": "ok", "crawl4ai": "ok", "reranker": "ok"}],
     )
 
 
@@ -411,6 +410,19 @@ ERROR_EXAMPLES = {
         "summary": "Internal SearXNG service failed",
         "value": {"ok": False, "error": {"code": "searxng_error", "message": "SearXNG search failed", "details": {"error": "upstream error details"}}},
     },
+    "upstream_unavailable": {
+        "summary": "All configured discovery providers failed",
+        "value": {
+            "ok": False,
+            "error": {
+                "code": "upstream_unavailable",
+                "message": "All configured discovery providers failed",
+                "details": {"providers": {"brave": "unavailable", "searxng": "searxng_error"}},
+                "retryable": True,
+                "retry_after": 30,
+            },
+        },
+    },
     "reranker_error": {
         "summary": "Internal reranker service failed",
         "value": {"ok": False, "error": {"code": "reranker_error", "message": "Reranker failed", "details": {"error": "upstream error details"}}},
@@ -432,6 +444,11 @@ SEARCH_ERROR_RESPONSES = {
         "model": ErrorEnvelope,
         "description": "A search, crawl, or rerank upstream service failed. Retry later or reduce `candidates` if timeouts persist.",
         "content": {"application/json": {"examples": {"searxng_error": ERROR_EXAMPLES["searxng_error"], "crawl4ai_error": ERROR_EXAMPLES["crawl4ai_error"], "reranker_error": ERROR_EXAMPLES["reranker_error"]}}},
+    },
+    503: {
+        "model": ErrorEnvelope,
+        "description": "All configured discovery providers failed. Retry after the indicated delay.",
+        "content": {"application/json": {"examples": {"upstream_unavailable": ERROR_EXAMPLES["upstream_unavailable"]}}},
     },
     500: {"model": ErrorEnvelope, "description": "Unexpected server error. Retry later or contact the service owner."},
 }
@@ -458,8 +475,8 @@ CRAWL_ERROR_RESPONSES = {
 HEALTH_ERROR_RESPONSES = {
     503: {
         "model": ErrorEnvelope,
-        "description": "The search backend is unavailable: no engine responded to a canary query. Retry later.",
-        "content": {"application/json": {"examples": {"upstream_unavailable": ERROR_EXAMPLES["searxng_error"]}}},
+        "description": "No configured discovery provider has a recent healthy outcome. Retry later.",
+        "content": {"application/json": {"examples": {"upstream_unavailable": ERROR_EXAMPLES["upstream_unavailable"]}}},
     },
     500: {"model": ErrorEnvelope, "description": "Unexpected server error. Retry later or contact the service owner."},
 }
@@ -526,53 +543,73 @@ async def probe_service(base_url: str, path: str, headers: dict[str, str] | None
     client = await get_client()
     try:
         response = await client.get(f"{base_url}{path}", headers=headers, timeout=HEALTH_TIMEOUT)
-        return "ok" if response.status_code < 500 else f"unavailable: http_{response.status_code}"
+        return "ok" if response.status_code < 400 else f"unavailable: http_{response.status_code}"
     except (httpx.HTTPError, ValueError) as exc:
         return f"unavailable: {type(exc).__name__}"
 
 
-async def _run_health_checks() -> dict[str, str]:
-    """Probe every service. Returns the checks map; raises AppError when search is down.
-
-    Every service is probed even after searxng fails, so the 503 body carries the same
-    information as the healthy one: an operator reading a failing health check learns
-    which dependency broke, not merely that something did.
-    """
-    client = await get_client()
-    checks: dict[str, str] = {}
-    search_failure: AppError | None = None
-    try:
-        # Reuses search_searxng, so health and search cannot disagree about an outage: a
-        # total engine failure raises upstream_unavailable here exactly as it does there.
-        # Bounded by HEALTH_TIMEOUT, not SEARCH_TIMEOUT — health is polled.
-        await search_searxng(client, HEALTH_CANARY_QUERY, 1, timeout=HEALTH_TIMEOUT)
-        checks["searxng"] = "ok"
-    except AppError as exc:
-        search_failure = exc
-        checks["searxng"] = f"unavailable: {exc.code}"
-    # Supporting services are reported, never fatal: search degrades to its lexical path
-    # without the reranker, so failing health on it would report an outage we do not have.
-    checks["crawl4ai"] = await probe_service(CRAWL4AI_URL, "/health", CRAWL4AI_HEADERS)
-    checks["reranker"] = await probe_service(RERANKER_URL, "/health")
-    if search_failure is not None:
-        raise AppError(
-            503,
-            "upstream_unavailable",
-            "No search engine responded to a canary query; search is unavailable",
-            {"checks": checks, **(search_failure.details if isinstance(search_failure.details, dict) else {})},
-            retryable=True,
-        )
-    return checks
-
-
-# Last verdict, reused for HEALTH_CACHE_TTL so a poll loop cannot become engine load.
-# Caches the failure too: a dead backend should not be hammered by its own health check.
+# Recent outcomes from real discovery requests. Health reads these instead of issuing
+# searches that may be paid or rate-limited.
+_PROVIDER_HEALTH: dict[str, dict[str, object]] = {
+    "brave": {"at": 0.0, "status": "unknown"},
+    "searxng": {"at": 0.0, "status": "unknown"},
+}
+# Last verdict, reused for HEALTH_CACHE_TTL so public polling cannot become engine load.
+# Caches failures too; an outage is not hammered by its own health check.
 _HEALTH_CACHE: dict[str, object] = {"at": 0.0, "result": None}
+
+
+def _record_provider_health(provider: str, status: str) -> None:
+    _PROVIDER_HEALTH[provider] = {"at": time.monotonic(), "status": status}
+    _HEALTH_CACHE["at"] = 0.0
+
+
+def _provider_health(provider: str, configured: bool) -> str:
+    if not configured:
+        return "not_configured"
+    result = _PROVIDER_HEALTH[provider]
+    if result["at"] == 0.0:
+        return "unknown"
+    if time.monotonic() - result["at"] >= HEALTH_CACHE_TTL:
+        return f"stale:{result['status']}"
+    return str(result["status"])
 
 
 def health_cache_reset() -> None:
     _HEALTH_CACHE["at"] = 0.0
     _HEALTH_CACHE["result"] = None
+    for result in _PROVIDER_HEALTH.values():
+        result.update(at=0.0, status="unknown")
+
+
+async def _run_health_checks() -> dict[str, str]:
+    """Report recent provider outcomes and probe supporting services without searching."""
+    checks = {
+        "brave": _provider_health("brave", bool(BRAVE_POOL)),
+        "searxng": _provider_health("searxng", bool(_engine_names())),
+    }
+    if checks["searxng"] == "unknown" and checks["searxng"] != "not_configured":
+        checks["searxng_service"] = await probe_service(SEARXNG_URL, "/healthz")
+    else:
+        checks["searxng_service"] = "not_probed"
+    checks["crawl4ai"] = await probe_service(CRAWL4AI_URL, "/health", CRAWL4AI_HEADERS)
+    checks["reranker"] = await probe_service(RERANKER_URL, "/health")
+
+    # A live SearXNG process is the cold-start fallback until a real search records
+    # whether its engine pool answered. Known provider failures always take precedence.
+    searxng_available = checks["searxng"] == "ok" or (
+        checks["searxng"] == "unknown" and checks["searxng_service"] == "ok"
+    )
+    if checks["brave"] != "ok" and not searxng_available:
+        raise AppError(
+            503,
+            "upstream_unavailable",
+            "No configured discovery provider is available",
+            {"checks": checks},
+            retryable=True,
+            retry_after=OUTAGE_RETRY_AFTER,
+        )
+    return checks
 
 
 @app.get(
@@ -581,11 +618,10 @@ def health_cache_reset() -> None:
     responses=HEALTH_ERROR_RESPONSES,
     summary="Check service health",
     description=(
-        "Public diagnostic endpoint for the search and crawl API hosts. It confirms the API process is running, reports the "
-        "internal service URLs configured for SearXNG, Crawl4AI, and the reranker, and probes each service. The SearXNG probe "
-        "is a real canary query through the engine pool, so a search-backend outage is reported as `upstream_unavailable` "
-        "instead of a healthy process. Results are cached for a few seconds so the endpoint can be polled cheaply. "
-        "Do not use this endpoint for search or crawl work."
+        "Public diagnostic endpoint for the search and crawl API hosts. It reports configured internal service URLs and "
+        "recent discovery-provider outcomes, using bounded service probes only when no search outcome is cached. Health "
+        "polling never performs a paid search. Results are cached for HEALTH_CACHE_TTL. Do not use this endpoint for search "
+        "or crawl work."
     ),
     operation_id="check_health",
     tags=["Diagnostics"],
@@ -634,7 +670,8 @@ def openapi(request: Request):
     summary="Search the web and return extracted, reranked page content",
     description=(
         "Use this endpoint when the caller has a question or topic and needs current web evidence. The service discovers candidate "
-        "URLs with SearXNG, crawls public pages through internal Crawl4AI, chunks extracted text, reranks chunks against the query, "
+        "URLs with Brave when configured and SearXNG fallback/top-up, crawls public pages through internal Crawl4AI, chunks extracted text, "
+        "and reranks chunks against the query, "
         "and returns normalized results. Prefer this POST endpoint for MCP/CLI tools because the request body is explicit and easy to validate. "
         "If `data.results` is empty, the request succeeded but no usable pages were found."
     ),
@@ -664,20 +701,7 @@ def openapi(request: Request):
 async def search(request: SearchRequest):
     client = await get_client()
     started = time.perf_counter()
-    try:
-        candidates = await asyncio.wait_for(
-            discover_candidates(client, request.query, request.candidates),
-            timeout=DISCOVERY_TIMEOUT,
-        )
-    except asyncio.TimeoutError:
-        logger.warning("discovery timed out after %.0fs; trying searxng directly", DISCOVERY_TIMEOUT)
-        try:
-            candidates = await asyncio.wait_for(
-                search_searxng(client, request.query, request.candidates), timeout=10
-            )
-        except (asyncio.TimeoutError, AppError) as exc:
-            logger.warning("searxng fallback also failed (%r)", exc)
-            candidates = []
+    candidates = await discover_candidates(client, request.query, request.candidates)
     if not candidates:
         logger.info("search q=%r results=0 elapsed=%.0fms stage=discovery", request.query, _ms(started))
         return search_response(request.query, [])
@@ -808,10 +832,11 @@ async def crawl(request: CrawlRequest):
 
 
 class _BraveKeyError(Exception):
-    def __init__(self, reason: str, cooldown: float):
+    def __init__(self, reason: str, cooldown: float, partial: list[dict] | None = None):
         super().__init__(reason)
         self.reason = reason
         self.cooldown = cooldown
+        self.partial = partial or []
 
 
 class BraveKeyPool:
@@ -822,30 +847,45 @@ class BraveKeyPool:
         self._index = 0
         self._lock = asyncio.Lock()
         self._cooled_until = [0.0] * len(self._keys)
+        self._last_retry_after: float | None = None
         # ponytail: in-memory counters reset on restart; persist when real metrics exist
         self._calls = [0] * len(self._keys)
 
     def __bool__(self):
         return bool(self._keys)
 
-    async def search(self, client: httpx.AsyncClient, query: str, limit: int):
-        """Candidate dicts, or None when the whole pool is unusable (caller falls back)."""
+    async def search(self, client: httpx.AsyncClient, query: str, limit: int, deadline: float):
+        """Candidate dicts, or None when no key can answer within the request budget."""
+        self._last_retry_after = None
         tried = 0
         while tried < len(self._keys):
+            if deadline <= asyncio.get_running_loop().time():
+                _record_provider_health("brave", "unavailable")
+                return None
             key_idx = await self._take_key()
             if key_idx is None:
                 logger.warning("brave pool exhausted (all %d keys cooling)", len(self._keys))
+                _record_provider_health("brave", "unavailable")
                 return None
             tried += 1
             try:
-                results = await self._search_with_key(client, key_idx, query, limit)
+                results = await self._search_with_key(client, key_idx, query, limit, deadline)
             except _BraveKeyError as exc:
                 self._cool(key_idx, exc.cooldown)
+                if exc.reason == "rate_limited":
+                    self._last_retry_after = max(self._last_retry_after or 0.0, exc.cooldown)
                 logger.warning("brave key %d failed (%s), cooling %.0fs", key_idx, exc.reason, exc.cooldown)
+                if exc.partial:
+                    self._calls[key_idx] += 1
+                    _record_provider_health("brave", "ok")
+                    return exc.partial[:limit]
                 continue
             self._calls[key_idx] += 1
+            self._last_retry_after = None
+            _record_provider_health("brave", "ok")
             logger.info("brave key %d ok (%d candidates, %d calls)", key_idx, len(results), self._calls[key_idx])
-            return results
+            return results[:limit]
+        _record_provider_health("brave", "unavailable")
         return None
 
     async def _take_key(self):
@@ -861,71 +901,162 @@ class BraveKeyPool:
     def _cool(self, key_idx: int, cooldown: float):
         self._cooled_until[key_idx] = asyncio.get_running_loop().time() + max(cooldown, 0.0)
 
-    async def _search_with_key(self, client: httpx.AsyncClient, key_idx: int, query: str, limit: int):
+    async def _search_with_key(self, client: httpx.AsyncClient, key_idx: int, query: str, limit: int, deadline: float):
         items: list[dict] = []
-        offset = 0
+        seen: set[str] = set()
         try:
-            while len(items) < limit and offset < limit:
-                count = min(limit - len(items), 20)  # Brave page cap
+            for page_index in range(BRAVE_PAGE_LIMIT):
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    if items:
+                        break
+                    raise _BraveKeyError("deadline_exceeded", 0.0)
                 response = await client.get(
                     BRAVE_SEARCH_URL,
-                    params={"q": query, "count": count, "offset": offset, "text_decorations": False},
+                    params={
+                        "q": query,
+                        "count": BRAVE_PAGE_SIZE,
+                        "offset": page_index,
+                        "text_decorations": False,
+                    },
                     headers={"X-Subscription-Token": self._keys[key_idx], "Accept": "application/json"},
-                    timeout=BRAVE_TIMEOUT,
+                    timeout=min(BRAVE_TIMEOUT, remaining),
                 )
                 if response.status_code == 429:
                     raise _BraveKeyError("rate_limited", _retry_after(response, 300.0))
                 if response.status_code in (401, 403):
                     raise _BraveKeyError(f"http_{response.status_code}", 86400.0)
                 if 400 <= response.status_code < 500:
-                    # Bad request, not a sick key (e.g. paging past Brave's
-                    # offset cap): keep what we have instead of burning the pool.
-                    logger.warning("brave key %d bad request (http_%d), stopping paging", key_idx, response.status_code)
-                    break
+                    # Invalid paging/config is not retried at later page indices.
+                    if items:
+                        break
+                    raise _BraveKeyError(f"http_{response.status_code}", 0.0)
                 response.raise_for_status()
-                page = (response.json().get("web") or {}).get("results") or []
+                payload = response.json()
+                if not isinstance(payload, dict) or not isinstance(payload.get("web"), dict):
+                    raise ValueError("invalid Brave response shape")
+                web = payload["web"]
+                page = web.get("results")
+                if not isinstance(page, list):
+                    raise ValueError("invalid Brave results")
                 if not page:
                     break
-                items.extend(page)
-                offset += len(page)
-        except _BraveKeyError:
+                for item in page:
+                    url = item.get("url") if isinstance(item, dict) else None
+                    if isinstance(url, str) and url not in seen:
+                        seen.add(url)
+                        items.append(item)
+                query_info = payload.get("query")
+                if not isinstance(query_info, dict):
+                    query_info = {}
+                more_results = query_info.get(
+                    "more_results_available",
+                    payload.get("more_results_available", web.get("more_results_available", True)),
+                )
+                if more_results is False or len(items) >= limit:
+                    break
+        except _BraveKeyError as exc:
+            exc.partial = items
             raise
         except (httpx.HTTPError, ValueError) as exc:
-            raise _BraveKeyError(str(exc), 60.0) from exc
-        return items
+            raise _BraveKeyError("request_failed", 60.0, items) from exc
+        return items[:limit]
 
 
 def _retry_after(response: httpx.Response, default: float) -> float:
-    try:
-        return max(float(response.headers.get("Retry-After", default)), 0.0)
-    except (TypeError, ValueError):
+    value = response.headers.get("Retry-After")
+    if value is None:
         return default
+    try:
+        seconds = float(value)
+        if not math.isfinite(seconds):
+            raise ValueError("Retry-After is not finite")
+        return max(seconds, 0.0)
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(value)
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=timezone.utc)
+            return max((retry_at - datetime.now(timezone.utc)).total_seconds(), 0.0)
+        except (TypeError, ValueError, OverflowError):
+            return default
 
 
 BRAVE_POOL = BraveKeyPool(BRAVE_API_KEYS)
 
 
 async def discover_candidates(client: httpx.AsyncClient, query: str, limit: int):
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(DISCOVERY_TIMEOUT, 0.0)
+    failures: dict[str, str] = {}
+    retry_afters: list[float] = []
+    candidates: list[dict] = []
+    answered = False
+
     if BRAVE_POOL:
-        try:
-            brave = await BRAVE_POOL.search(client, query, limit)
-        except Exception as exc:  # never let the primary provider break search; SearXNG is the fallback
-            logger.warning("brave pool error (%r), falling back to searxng", exc)
-            brave = None
-        if brave:
-            shaped = await shape_candidates(brave, limit, snippet_key="description")
-            if len(shaped) < limit:  # Brave pages cap out; top up the shortfall from SearXNG
-                try:
-                    extra = await search_searxng(client, query, limit)
-                except AppError as exc:
-                    logger.warning("searxng top-up failed (%s)", exc.code)
-                    extra = []
-                seen_urls = {item["url"] for item in shaped}
-                shaped.extend(item for item in extra if item["url"] not in seen_urls)
-                shaped = shaped[:limit]
-            if shaped:
-                return shaped
-    return await search_searxng(client, query, limit)
+        remaining = deadline - loop.time()
+        if remaining > 0:
+            try:
+                brave = await BRAVE_POOL.search(client, query, limit, deadline)
+                if brave is None:
+                    failures["brave"] = "unavailable"
+                else:
+                    remaining = deadline - loop.time()
+                    if remaining > 0:
+                        candidates = await asyncio.wait_for(
+                            shape_candidates(brave, limit, snippet_key="description"), timeout=remaining
+                        )
+                        answered = True
+                    else:
+                        failures["brave"] = "deadline_exceeded"
+                        _record_provider_health("brave", "unavailable")
+            except asyncio.TimeoutError:
+                failures["brave"] = "timeout"
+                _record_provider_health("brave", "unavailable")
+            except Exception as exc:
+                failures["brave"] = type(exc).__name__
+                _record_provider_health("brave", "unavailable")
+                logger.warning("brave discovery failed (%s); continuing with SearXNG", type(exc).__name__)
+        else:
+            failures["brave"] = "deadline_exceeded"
+            _record_provider_health("brave", "unavailable")
+        if BRAVE_POOL._last_retry_after is not None:
+            retry_afters.append(BRAVE_POOL._last_retry_after)
+
+    if len(candidates) < limit:
+        remaining = deadline - loop.time()
+        if remaining > 0:
+            try:
+                extra = await asyncio.wait_for(
+                    search_searxng(client, query, limit, timeout=remaining), timeout=remaining
+                )
+                answered = True
+                seen_urls = {item["url"] for item in candidates}
+                candidates.extend(item for item in extra if item["url"] not in seen_urls)
+            except asyncio.TimeoutError:
+                failures["searxng"] = "timeout"
+                _record_provider_health("searxng", "unavailable")
+            except AppError as exc:
+                failures["searxng"] = exc.code
+                if exc.retry_after is not None:
+                    retry_afters.append(exc.retry_after)
+                logger.warning("searxng discovery failed (%s)", exc.code)
+        else:
+            failures["searxng"] = "deadline_exceeded"
+            _record_provider_health("searxng", "unavailable")
+
+    if answered:
+        return candidates[:limit]
+    if not BRAVE_POOL and not _engine_names():
+        raise _NoEnginesError()
+    raise AppError(
+        503,
+        "upstream_unavailable",
+        "All configured discovery providers failed",
+        {"providers": failures},
+        retryable=True,
+        retry_after=max(retry_afters, default=OUTAGE_RETRY_AFTER),
+    )
 
 
 async def shape_candidates(items, limit: int, snippet_key: str = "content"):
@@ -981,26 +1112,36 @@ async def search_searxng(client: httpx.AsyncClient, query: str, limit: int, time
     # test below cannot fire and the caller is handed ok:true with zero results — the
     # exact silent-empty failure #986 exists to remove (#986 follow-up).
     if not configured:
+        _record_provider_health("searxng", "unavailable")
         raise _NoEnginesError()
 
     try:
         response = await client.get(
             f"{SEARXNG_URL}/search",
-            # timeout_limit makes searxng answer with whatever engines finished inside our
-            # budget; without it searxng waits out its slowest engine (8s), so one hung
-            # engine timed out the 5s health canary even while the others had answered (#36).
+            # timeout_limit makes searxng answer with whatever engines finish inside the
+            # remaining discovery budget; without it one hung engine can stall the fallback
+            # even after other engines answered (#36).
             params={"q": query, "format": "json", "engines": SEARXNG_ENGINES, "timeout_limit": max(timeout - 1, 1)},
             timeout=timeout,
         )
         response.raise_for_status()
         payload = response.json()
     except (httpx.HTTPError, ValueError) as exc:
-        raise AppError(502, "searxng_error", "SearXNG search failed", {"error": str(exc)}) from exc
+        _record_provider_health("searxng", "unavailable")
+        raise AppError(502, "searxng_error", "SearXNG search failed", {"error": type(exc).__name__}) from exc
 
+    if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
+        _record_provider_health("searxng", "unavailable")
+        raise AppError(502, "searxng_error", "SearXNG returned an invalid response")
     unresponsive = payload.get("unresponsive_engines") or []
+    if not isinstance(unresponsive, list):
+        _record_provider_health("searxng", "unavailable")
+        raise AppError(502, "searxng_error", "SearXNG returned invalid engine status")
     if unresponsive:
-        # A dead engine otherwise only shows up as fewer or zero results.
-        logger.warning("searxng engines unresponsive: %s", ", ".join(str(entry) for entry in unresponsive))
+        # A dead engine otherwise only shows up as fewer or zero results. Log names only;
+        # upstream error reasons are response data and can contain sensitive text.
+        names = sorted({str(entry[0] if isinstance(entry, (list, tuple)) else entry) for entry in unresponsive})
+        logger.warning("searxng engines unresponsive: %s", ", ".join(names))
 
     raw_results = payload.get("results", [])
     candidates = await shape_candidates(raw_results, limit)
@@ -1016,6 +1157,7 @@ async def search_searxng(client: httpx.AsyncClient, query: str, limit: int, time
     dead = {str(entry[0] if isinstance(entry, (list, tuple)) else entry).strip().lower() for entry in unresponsive}
     answered = bool(raw_results) or bool(set(configured) - dead)
     if not answered and dead:
+        _record_provider_health("searxng", "unavailable")
         raise AppError(
             503,
             "upstream_unavailable",
@@ -1024,6 +1166,7 @@ async def search_searxng(client: httpx.AsyncClient, query: str, limit: int, time
             retryable=True,
             retry_after=OUTAGE_RETRY_AFTER,
         )
+    _record_provider_health("searxng", "ok")
     return candidates
 
 
@@ -1419,8 +1562,9 @@ def filtered_openapi(surface: Literal["search", "crawl"]):
         schema["info"]["title"] = "SparkFN Web Search API"
         schema["info"]["description"] = (
             "Tool-facing API for web discovery plus extracted, reranked page content. Use this service when an agent, CLI, or MCP tool "
-            "has a natural-language question/topic and needs current web evidence. The pipeline is: SearXNG discovers candidate URLs, "
-            "internal Crawl4AI extracts content from public pages, and the reranker returns the most relevant extracted chunks.\n\n"
+            "has a natural-language question/topic and needs current web evidence. The pipeline is: Brave discovers candidates when "
+            "configured, SearXNG provides fallback/top-up, internal Crawl4AI extracts public pages, and the reranker returns the most "
+            "relevant extracted chunks.\n\n"
             "How to use: send POST /search with JSON body {\"query\": \"your concise query\", \"max_results\": 5, \"candidates\": 10} "
             "and an X-API-Key header. Start with max_results 3-5 and candidates 10. Increase candidates only when recall matters more than latency. "
             "An empty results array is a successful no-results response, not a failure."
