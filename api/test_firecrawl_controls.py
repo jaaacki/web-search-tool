@@ -185,6 +185,41 @@ def test_provider_routed_hosts_and_obvious_pdfs_are_blocked_before_scrape():
     assert calls == [], calls
 
 
+def test_idna_provider_host_aliases_are_blocked_before_scrape():
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return response(request)
+
+    async def check():
+        with tempfile.TemporaryDirectory() as tmp:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                instance = controls(tmp, [("team", ["fc-test"])])
+                for url in (
+                    "https://linkedin。com/in/person",
+                    "https://linkedin．com/in/person",
+                    "https://ｌｉｎｋｅｄｉｎ.com/in/person",
+                    "https://linkedin.com./in/person",
+                    "https://bad\ud800.linkedin.com/in/person",
+                ):
+                    try:
+                        await instance.request(client, "/v2/scrape", {"url": url}, timeout=1)
+                    except fc.FirecrawlUnavailable as exc:
+                        assert exc.category == "provider_routed_domain", exc.category
+                    else:
+                        raise AssertionError(f"Firecrawl accepted a restricted IDNA host: {url!r}")
+                assert calls == [], calls
+
+                result = await instance.request(
+                    client, "/v2/scrape", {"url": "https://docs.example.com/guide"}, timeout=1
+                )
+                assert result.status_code == 200, result.status_code
+
+    run(check())
+    assert len(calls) == 1 and calls[0].url.host == "api.firecrawl.dev", calls
+
+
 def test_team_exhaustion_fails_over_only_to_an_independent_budget():
     seen = []
 
