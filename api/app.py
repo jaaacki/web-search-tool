@@ -1704,18 +1704,50 @@ async def cross_encode(client: httpx.AsyncClient, query: str, documents: list[st
         return None
 
 
+def query_aligned_passage(query: str, content: str) -> str:
+    width = RERANK_MAX_CHARS
+    if width <= 0:
+        return ""
+    if len(content) <= width:
+        return content
+
+    last = len(content) - width
+    starts = list(range(0, last + 1, max(width // 2, 1)))
+    if starts[-1] != last:
+        starts.append(last)
+    windows = [content[start : start + width] for start in starts]
+    scores = lexical_scores(query, windows)
+    return windows[max(range(len(windows)), key=scores.__getitem__)]
+
+
 async def rerank(client: httpx.AsyncClient, query: str, chunks: list[dict], top_k: int):
     """Two-stage rerank. Returns (results, path) where path names the ranking that won."""
     if not chunks:
         return [], "empty"
 
-    # Stage 1: cheap lexical pass decides which chunks the cross-encoder sees at all.
+    # Stage 1: reserve scored slots for distinct sources before filling by lexical rank.
     lexical = lexical_scores(query, [chunk["content"] for chunk in chunks])
     by_lexical = sorted(range(len(chunks)), key=lambda index: lexical[index], reverse=True)
-    head, tail = by_lexical[:RERANK_PREFILTER], by_lexical[RERANK_PREFILTER:]
+    head = []
+    seen_urls = set()
+    for index in by_lexical:
+        if len(head) >= RERANK_PREFILTER:
+            break
+        url = chunks[index]["url"]
+        if url not in seen_urls:
+            head.append(index)
+            seen_urls.add(url)
+    selected = set(head)
+    for index in by_lexical:
+        if len(head) >= RERANK_PREFILTER:
+            break
+        if index not in selected:
+            head.append(index)
+            selected.add(index)
+    tail = [index for index in by_lexical if index not in selected]
 
-    # Stage 2: cross-encoder over the prefiltered head, blended with discovery rank.
-    passages = [chunks[index]["content"][:RERANK_MAX_CHARS] for index in head]
+    # Stage 2: cross-encoder over the source-diverse head, blended with discovery rank.
+    passages = [query_aligned_passage(query, chunks[index]["content"]) for index in head]
     cross_encoder = await cross_encode(client, query, passages)
     if cross_encoder is None:
         order = [(index, None) for index in by_lexical]
