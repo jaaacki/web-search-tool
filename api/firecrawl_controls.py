@@ -217,7 +217,7 @@ class FirecrawlControls:
             state = self._read_state()
             for budget in self._budgets:
                 group = self._group_state(state, budget.id)
-                blocked = await self._refresh_block(client, budget, group, deadline)
+                blocked = await self._refresh_block(client, budget, group, state, deadline)
                 if blocked is not None:
                     if blocked.category == "team_exhausted":
                         continue
@@ -297,13 +297,13 @@ class FirecrawlControls:
         client: httpx.AsyncClient,
         budget: _Budget,
         group: dict[str, Any],
+        state: dict[str, Any],
         deadline: float,
     ) -> FirecrawlUnavailable | None:
         blocked = group.get("blocked")
         if not blocked:
             return None
         now = time.monotonic()
-        wall_now = time.time()
         next_check = group.get("next_check")
         if isinstance(next_check, (int, float)) and now < next_check:
             retry_after = max(1.0, next_check - now)
@@ -317,33 +317,29 @@ class FirecrawlControls:
             group.clear()
             return None
 
-        key = budget.keys[int(group.get("next_key", 0)) % len(budget.keys)]
+        key = budget.keys[0]
         usage = await self._credit_usage(client, key, deadline, budget.id)
         if usage is None:
             self._block(group, "key_cap_or_ambiguous", None)
+            self._write_state(state)
             return FirecrawlUnavailable(402, "key_cap_or_ambiguous", USAGE_RECHECK_SECONDS, True)
-        remaining = usage["remaining"]
-        if remaining <= 0:
+        if usage["remaining"] <= 0:
             self._block(group, "team_exhausted", usage)
+            self._write_state(state)
             return FirecrawlUnavailable(402, "team_exhausted", USAGE_RECHECK_SECONDS, True)
 
-        previous = group.get("remaining")
-        previous_period = group.get("billing_period_end")
-        period_reset = (
-            isinstance(previous_period, (int, float))
-            and previous_period <= wall_now
-            and isinstance(usage["period_end"], (int, float))
-            and usage["period_end"] > wall_now
-            and usage["period_end"] != previous_period
-        )
-        top_up = isinstance(previous, (int, float)) and remaining > previous
-        if blocked == "team_exhausted" or top_up or period_reset:
+        if blocked == "team_exhausted":
             group.clear()
-            logger.info("firecrawl budget recovered budget=%s remaining=%.0f", budget.id, remaining)
+            self._write_state(state)
+            logger.info("firecrawl budget recovered budget=%s remaining=%.0f", budget.id, usage["remaining"])
             return None
 
+        # After this cached usage check, allow one caller-driven request on the same
+        # primary key; success clears the block, while another 402 re-blocks the group.
         self._block(group, "key_cap_or_ambiguous", usage)
-        return FirecrawlUnavailable(402, "key_cap_or_ambiguous", USAGE_RECHECK_SECONDS, True)
+        self._write_state(state)
+        logger.info("firecrawl same-key retry allowed after cooldown budget=%s", budget.id)
+        return None
 
     async def _credit_usage(
         self, client: httpx.AsyncClient, key: str, deadline: float, budget_id: str
