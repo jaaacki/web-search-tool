@@ -27,6 +27,58 @@ def brave_response(items, more=True):
     return httpx.Response(200, json={"query": {"more_results_available": more}, "web": {"results": items}})
 
 
+def use_url_check(check):
+    saved = app.is_allowed_public_url
+    app.is_allowed_public_url = check
+    return lambda: setattr(app, "is_allowed_public_url", saved)
+
+
+def allow_public_urls():
+    async def allow(_):
+        return True
+
+    return use_url_check(allow)
+
+
+class MockDiscoveryClient:
+    def __init__(self, rows, brave_page=None):
+        self.rows = rows
+        self.brave_page = brave_page
+        self.calls = []
+
+    async def get(self, url, params=None, headers=None, timeout=None):
+        if params and "offset" in params:
+            offset = int(params["offset"])
+            self.calls.append(offset)
+            response = await self.brave_page(offset)
+        else:
+            self.calls.append("searxng")
+            response = httpx.Response(200, json={"results": self.rows, "unresponsive_engines": []})
+        return httpx.Response(
+            response.status_code,
+            headers=response.headers,
+            content=response.content,
+            request=httpx.Request("GET", url),
+        )
+
+
+def run_discovery_with(provider, http_client, url_check, timeout, limit=10):
+    saved_pool = app.BRAVE_POOL
+    saved_timeout = app.DISCOVERY_TIMEOUT
+    saved_check = app.is_allowed_public_url
+    app.BRAVE_POOL = app.BraveKeyPool(("test-key",)) if provider == "brave" else app.BraveKeyPool(())
+    app.DISCOVERY_TIMEOUT = timeout
+    app.is_allowed_public_url = url_check
+    app.health_cache_reset()
+    try:
+        return run(app.discover_candidates(http_client, "q", limit))
+    finally:
+        app.BRAVE_POOL = saved_pool
+        app.DISCOVERY_TIMEOUT = saved_timeout
+        app.is_allowed_public_url = saved_check
+        app.health_cache_reset()
+
+
 def test_brave_uses_constant_page_size_page_index_and_trims():
     calls = []
 
@@ -35,13 +87,16 @@ def test_brave_uses_constant_page_size_page_index_and_trims():
         offset = int(request.url.params["offset"])
         return brave_response([result(i) for i in range(offset * 20, (offset + 1) * 20)])
 
-    pool = app.BraveKeyPool(("test-key",))
-    deadline = time.monotonic() + 10
-    results = run(pool._search_with_key(client(handler), 0, "q", 50, deadline))
-
-    assert calls == [(20, 0), (20, 1), (20, 2)], calls
-    assert len(results) == 50, len(results)
-    assert len({item["url"] for item in results}) == 50
+    restore = allow_public_urls()
+    try:
+        pool = app.BraveKeyPool(("test-key",))
+        deadline = time.monotonic() + 10
+        results = run(pool._search_with_key(client(handler), 0, "q", 50, deadline))
+        assert calls == [(20, 0), (20, 1), (20, 2)], calls
+        assert len(results) == 50, len(results)
+        assert len({item["url"] for item in results}) == 50
+    finally:
+        restore()
 
 
 def test_brave_deduplicates_overlapping_pages_and_honors_no_more_results():
@@ -58,13 +113,16 @@ def test_brave_deduplicates_overlapping_pages_and_honors_no_more_results():
         items, more = pages[offset]
         return brave_response(items, more)
 
-    pool = app.BraveKeyPool(("test-key",))
-    deadline = time.monotonic() + 10
-    results = run(pool._search_with_key(client(handler), 0, "q", 40, deadline))
-
-    assert calls == [0, 1, 2], calls
-    assert len(results) == 40, len(results)
-    assert len({item["url"] for item in results}) == 40
+    restore = allow_public_urls()
+    try:
+        pool = app.BraveKeyPool(("test-key",))
+        deadline = time.monotonic() + 10
+        results = run(pool._search_with_key(client(handler), 0, "q", 40, deadline))
+        assert calls == [0, 1, 2], calls
+        assert len(results) == 40, len(results)
+        assert len({item["url"] for item in results}) == 40
+    finally:
+        restore()
 
 
 def test_brave_page_cap_stops_no_progress_pages():
@@ -75,12 +133,15 @@ def test_brave_page_cap_stops_no_progress_pages():
         calls.append(int(request.url.params["offset"]))
         return brave_response(page)
 
-    pool = app.BraveKeyPool(("test-key",))
-    deadline = time.monotonic() + 10
-    results = run(pool._search_with_key(client(handler), 0, "q", 50, deadline))
-
-    assert calls == list(range(app.BRAVE_PAGE_LIMIT)), calls
-    assert len(results) == 20
+    restore = allow_public_urls()
+    try:
+        pool = app.BraveKeyPool(("test-key",))
+        deadline = time.monotonic() + 10
+        results = run(pool._search_with_key(client(handler), 0, "q", 50, deadline))
+        assert calls == list(range(app.BRAVE_PAGE_LIMIT)), calls
+        assert len(results) == 20
+    finally:
+        restore()
 
 
 def test_retry_after_accepts_seconds_and_http_date():
@@ -196,6 +257,308 @@ def test_brave_response_is_bounded_by_the_discovery_deadline():
         app.BRAVE_POOL = saved_pool
         app.DISCOVERY_TIMEOUT = saved_timeout
         app.health_cache_reset()
+
+
+def test_brave_page_timeout_preserves_normalized_page_prefix():
+    validated = []
+    page_calls = []
+    page_zero = [result(i) for i in range(20)]
+
+    async def check_public(url):
+        validated.append(url)
+        return True
+
+    async def brave_page(offset):
+        page_calls.append(offset)
+        if offset == 0:
+            return brave_response(page_zero)
+        assert len(validated) == 20, "page 0 must be validated before page 1 starts"
+        await asyncio.sleep(0.5)
+        return brave_response([result(i) for i in range(20, 40)])
+
+    mock = MockDiscoveryClient([], brave_page)
+    started = time.monotonic()
+    results = run_discovery_with("brave", mock, check_public, 0.05, limit=50)
+
+    assert [item["url"] for item in results] == [result(i)["url"] for i in range(20)]
+    assert page_calls == [0, 1], page_calls
+    assert mock.calls == [0, 1], mock.calls
+    assert time.monotonic() - started < 0.3
+
+
+def test_each_provider_returns_only_validated_prefix_when_later_validation_stalls():
+    public = "https://public.example/"
+    private = "http://127.0.0.1/private"
+    stalled = "https://stall.example/"
+    tail = "https://tail.example/"
+    rows = [{"url": url, "title": url, "description": "snippet"} for url in (public, private, stalled, tail)]
+
+    for provider in ("brave", "searxng"):
+        visited = []
+        cancelled = []
+
+        async def check(url):
+            visited.append(url)
+            if url == private:
+                return False
+            if url == stalled:
+                try:
+                    await asyncio.sleep(1)
+                finally:
+                    cancelled.append(url)
+            return True
+
+        async def brave_page(_offset):
+            return brave_response(rows)
+
+        mock = MockDiscoveryClient(rows, brave_page)
+        results = run_discovery_with(provider, mock, check, 0.05)
+
+        assert [item["url"] for item in results] == [public], (provider, results)
+        assert visited == [public, private, stalled], (provider, visited)
+        assert cancelled == [stalled], (provider, cancelled)
+        assert tail not in visited, (provider, visited)
+
+
+def test_each_provider_first_validation_timeout_is_a_retryable_outage():
+    stalled = "https://stall.example/"
+    rows = [{"url": stalled, "title": "stall", "description": "snippet"}]
+
+    for provider in ("brave", "searxng"):
+        cancelled = []
+
+        async def check(url):
+            try:
+                await asyncio.sleep(1)
+            finally:
+                cancelled.append(url)
+            return True
+
+        async def brave_page(_offset):
+            return brave_response(rows, False)
+
+        mock = MockDiscoveryClient(rows, brave_page)
+        try:
+            run_discovery_with(provider, mock, check, 0.05)
+        except app.AppError as exc:
+            assert exc.status_code == 503
+            assert exc.code == "upstream_unavailable"
+            assert exc.retryable is True
+        else:
+            raise AssertionError(f"{provider} incomplete-empty validation became a successful empty result")
+        assert cancelled == [stalled], (provider, cancelled)
+
+
+def test_candidate_validation_preserves_external_cancellation():
+    saved_check = app.is_allowed_public_url
+    started = None
+
+    async def slow_check(_url):
+        started.set()
+        await asyncio.sleep(1)
+
+    app.is_allowed_public_url = slow_check
+
+    async def exercise():
+        nonlocal started
+        started = asyncio.Event()
+        task = asyncio.create_task(
+            app.shape_candidates(
+                [result(1)], 5, deadline=asyncio.get_running_loop().time() + 5
+            )
+        )
+        await started.wait()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            return
+        raise AssertionError("shape_candidates swallowed external cancellation")
+
+    try:
+        run(exercise())
+    finally:
+        app.is_allowed_public_url = saved_check
+
+
+def test_brave_page_timeout_preserves_normalized_prefix_without_fallback():
+    validated = []
+    page_calls = []
+    first_page = [result(i) for i in range(20)]
+
+    async def check_public(url):
+        validated.append(url)
+        return True
+
+    async def brave_page(offset):
+        page_calls.append(offset)
+        if offset == 0:
+            return brave_response(first_page)
+        assert len(validated) == 20, "page zero must be validated before page one starts"
+        await asyncio.sleep(1)
+        return brave_response([result(i) for i in range(20, 40)])
+
+    mock = MockDiscoveryClient([], brave_page)
+    started = time.monotonic()
+    results = run_discovery_with("brave", mock, check_public, 0.05, limit=50)
+
+    assert [item["url"] for item in results] == [result(i)["url"] for i in range(20)]
+    assert page_calls == [0, 1], page_calls
+    assert mock.calls == [0, 1], mock.calls
+    assert time.monotonic() - started < 0.3
+
+
+def test_both_providers_return_only_accepted_prefix_on_stalled_validation():
+    public = "https://public.example/"
+    private = "http://127.0.0.1/private"
+    stalled = "https://stall.example/"
+    tail = "https://tail.example/"
+    rows = [{"url": url, "title": url, "description": "snippet"} for url in (public, private, stalled, tail)]
+
+    for provider in ("brave", "searxng"):
+        visited = []
+        cancelled = []
+
+        async def check_url(url):
+            visited.append(url)
+            if url == private:
+                return False
+            if url == stalled:
+                try:
+                    await asyncio.sleep(1)
+                finally:
+                    cancelled.append(url)
+            return True
+
+        async def brave_page(_offset):
+            return brave_response(rows)
+
+        mock = MockDiscoveryClient(rows, brave_page)
+        results = run_discovery_with(provider, mock, check_url, 0.05)
+
+        assert [item["url"] for item in results] == [public], (provider, results)
+        assert visited == [public, private, stalled], (provider, visited)
+        assert cancelled == [stalled], (provider, cancelled)
+        assert tail not in visited, (provider, visited)
+
+
+def test_both_providers_first_validation_timeout_is_a_retryable_outage():
+    stalled = "https://stall.example/"
+    rows = [{"url": stalled, "title": "stall", "description": "snippet"}]
+
+    for provider in ("brave", "searxng"):
+        cancelled = []
+
+        async def check_url(_url):
+            try:
+                await asyncio.sleep(1)
+            finally:
+                cancelled.append(stalled)
+            return True
+
+        async def brave_page(_offset):
+            return brave_response(rows, False)
+
+        mock = MockDiscoveryClient(rows, brave_page)
+        try:
+            run_discovery_with(provider, mock, check_url, 0.05)
+        except app.AppError as exc:
+            assert exc.status_code == 503
+            assert exc.code == "upstream_unavailable"
+            assert exc.retryable is True
+        else:
+            raise AssertionError(f"{provider} incomplete-empty validation became a successful empty result")
+        assert cancelled == [stalled], (provider, cancelled)
+
+
+def test_brave_page_timeout_preserves_normalized_prefix_without_fallback():
+    validated = []
+    page_calls = []
+    first_page = [result(i) for i in range(20)]
+
+    async def check_public(url):
+        validated.append(url)
+        return True
+
+    async def brave_page(offset):
+        page_calls.append(offset)
+        if offset == 0:
+            return brave_response(first_page)
+        assert len(validated) == 20, "page zero must be validated before page one starts"
+        await asyncio.sleep(1)
+        return brave_response([result(i) for i in range(20, 40)])
+
+    mock = MockDiscoveryClient([], brave_page)
+    started = time.monotonic()
+    results = run_discovery_with("brave", mock, check_public, 0.05, limit=50)
+
+    assert [item["url"] for item in results] == [result(i)["url"] for i in range(20)]
+    assert page_calls == [0, 1], page_calls
+    assert mock.calls == [0, 1], mock.calls
+    assert time.monotonic() - started < 0.3
+
+
+def test_both_providers_return_only_accepted_prefix_on_stalled_validation():
+    public = "https://public.example/"
+    private = "http://127.0.0.1/private"
+    stalled = "https://stall.example/"
+    tail = "https://tail.example/"
+    rows = [{"url": url, "title": url, "description": "snippet"} for url in (public, private, stalled, tail)]
+
+    for provider in ("brave", "searxng"):
+        visited = []
+        cancelled = []
+
+        async def check_url(url):
+            visited.append(url)
+            if url == private:
+                return False
+            if url == stalled:
+                try:
+                    await asyncio.sleep(1)
+                finally:
+                    cancelled.append(url)
+            return True
+
+        async def brave_page(_offset):
+            return brave_response(rows)
+
+        mock = MockDiscoveryClient(rows, brave_page)
+        results = run_discovery_with(provider, mock, check_url, 0.05)
+
+        assert [item["url"] for item in results] == [public], (provider, results)
+        assert visited == [public, private, stalled], (provider, visited)
+        assert cancelled == [stalled], (provider, cancelled)
+        assert tail not in visited, (provider, visited)
+
+
+def test_both_providers_first_validation_timeout_is_a_retryable_outage():
+    stalled = "https://stall.example/"
+    rows = [{"url": stalled, "title": "stall", "description": "snippet"}]
+
+    for provider in ("brave", "searxng"):
+        cancelled = []
+
+        async def check_url(url):
+            try:
+                await asyncio.sleep(1)
+            finally:
+                cancelled.append(url)
+            return True
+
+        async def brave_page(_offset):
+            return brave_response(rows, False)
+
+        mock = MockDiscoveryClient(rows, brave_page)
+        try:
+            run_discovery_with(provider, mock, check_url, 0.05)
+        except app.AppError as exc:
+            assert exc.status_code == 503
+            assert exc.code == "upstream_unavailable"
+            assert exc.retryable is True
+        else:
+            raise AssertionError(f"{provider} incomplete-empty validation became a successful empty result")
+        assert cancelled == [stalled], (provider, cancelled)
 
 
 def test_retry_after_from_brave_is_top_level_on_exhausted_discovery():
