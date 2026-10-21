@@ -12,9 +12,10 @@ steps:
       - |
         set -eu
         python --version
-        python -m pip install --no-cache-dir -r api/requirements.txt
+        cd api
+        python -m pip install --no-cache-dir -r requirements.txt
         python -m pip check
-        set -- api/test_*.py
+        set -- test_*.py
         if [ ! -f "$$1" ]; then
           printf '%s\n' 'No API test scripts found' >&2
           exit 1
