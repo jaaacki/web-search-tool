@@ -85,6 +85,18 @@ def scrape_payload(url: str) -> dict[str, Any]:
     }
 
 
+def scrape_target_url(response: Any) -> tuple[bool, Any]:
+    try:
+        payload = response.json()
+    except (TypeError, ValueError):
+        return False, None
+    data = payload.get("data") if isinstance(payload, dict) else None
+    metadata = data.get("metadata") if isinstance(data, dict) else None
+    if not isinstance(metadata, dict) or "url" not in metadata:
+        return False, None
+    return True, metadata["url"]
+
+
 def scrape_result(response: Any, requested_url: str) -> dict[str, str] | None:
     if not 200 <= response.status_code < 300:
         return None

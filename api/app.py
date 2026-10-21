@@ -27,6 +27,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from firecrawl_adapter import (
     is_pdf_target,
     scrape_payload as firecrawl_scrape_payload,
+    scrape_target_url as firecrawl_scrape_target_url,
     scrape_result as firecrawl_scrape_result,
     search_payload as firecrawl_search_payload,
     search_results as firecrawl_search_results,
@@ -1157,6 +1158,18 @@ async def discover_candidates(client: httpx.AsyncClient, query: str, limit: int)
     )
 
 
+async def firecrawl_metadata_url_is_public(response: httpx.Response, deadline: float) -> bool:
+    present, url = firecrawl_scrape_target_url(response)
+    if not present:
+        return True
+    if not isinstance(url, str):
+        return False
+    remaining = deadline - asyncio.get_running_loop().time()
+    if remaining <= 0:
+        raise asyncio.TimeoutError
+    return await asyncio.wait_for(is_allowed_public_url(url), timeout=remaining)
+
+
 async def scrape_firecrawl_candidates(
     client: httpx.AsyncClient, candidates: list[dict], deadline: float
 ) -> tuple[list[dict], list[dict], set[str]]:
@@ -1164,6 +1177,7 @@ async def scrape_firecrawl_candidates(
     pages = []
     local_candidates = []
     policy_denied: set[str] = set()
+    rejected_metadata_urls: set[str] = set()
     seen_candidates: list[str] = []
     for candidate in candidates:
         url = candidate["url"]
@@ -1219,6 +1233,14 @@ async def scrape_firecrawl_candidates(
 
         if response.status_code < 500:
             _record_provider_health("firecrawl", "ok")
+        try:
+            reported_url_allowed = await firecrawl_metadata_url_is_public(response, deadline)
+        except asyncio.TimeoutError:
+            rejected_metadata_urls.add(url)
+            continue
+        if not reported_url_allowed:
+            rejected_metadata_urls.add(url)
+            continue
         page = firecrawl_scrape_result(response, url)
         if page is None:
             local_candidates.append(candidate)
@@ -1232,7 +1254,7 @@ async def scrape_firecrawl_candidates(
                 }
             )
 
-    seen_urls = [page["url"] for page in pages] + list(policy_denied)
+    seen_urls = [page["url"] for page in pages] + list(policy_denied | rejected_metadata_urls)
     unique_local_candidates = []
     for item in local_candidates:
         url = item["url"]
@@ -1620,12 +1642,13 @@ async def crawl_direct_url(client: httpx.AsyncClient, request: CrawlRequest):
         and not is_pdf_target(request.url)
         and firecrawl_url_allowed(request.url)
     ):
+        firecrawl_deadline = asyncio.get_running_loop().time() + CRAWL_TIMEOUT
         try:
             response = await firecrawl_request(
                 client,
                 "/v2/scrape",
                 firecrawl_scrape_payload(request.url),
-                timeout=CRAWL_TIMEOUT,
+                timeout=max(firecrawl_deadline - asyncio.get_running_loop().time(), 0.0),
             )
         except FirecrawlUnavailable as exc:
             if exc.category == "policy_denied":
@@ -1646,6 +1669,17 @@ async def crawl_direct_url(client: httpx.AsyncClient, request: CrawlRequest):
         else:
             if response.status_code < 500:
                 _record_provider_health("firecrawl", "ok")
+            try:
+                reported_url_allowed = await firecrawl_metadata_url_is_public(response, firecrawl_deadline)
+            except asyncio.TimeoutError as exc:
+                raise AppError(
+                    503,
+                    "upstream_unavailable",
+                    "Firecrawl returned a URL that could not be validated before the deadline",
+                    retryable=True,
+                ) from exc
+            if not reported_url_allowed:
+                raise AppError(422, "invalid_crawled_url", "Crawled URL must be a public http(s) URL")
             result = firecrawl_scrape_result(response, request.url)
             if result is not None:
                 return result

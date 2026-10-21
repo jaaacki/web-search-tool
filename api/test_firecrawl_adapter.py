@@ -149,6 +149,125 @@ def test_crawl_policy_denial_is_public_422_without_local_retry():
         app.health_cache_reset()
 
 
+def test_direct_firecrawl_rejects_nonpublic_reported_urls_without_local_retry():
+    saved_key = app.WEBSEARCH_API_KEY
+    saved_get_client = app.get_client
+    saved_public_check = app.is_allowed_public_url
+    saved_firecrawl_check = app.firecrawl_url_allowed
+    saved_firecrawl_request = app.firecrawl_request
+    saved_crawl4ai = app.call_crawl4ai
+    app.WEBSEARCH_API_KEY = "test-key"
+    app.get_client = lambda: asyncio.sleep(0, result=object())
+    app.firecrawl_url_allowed = lambda _: True
+    calls = []
+
+    async def public_check(url):
+        return url == "https://example.com/article"
+
+    async def firecrawl(_client, endpoint, payload, *, timeout):
+        calls.append(("firecrawl", payload["url"]))
+        return httpx.Response(
+            200,
+            json={
+                "success": True,
+                "data": {
+                    "markdown": "# Unsafe target body",
+                    "metadata": {
+                        "sourceURL": payload["url"],
+                        "url": reported_url,
+                        "statusCode": 200,
+                    },
+                },
+            },
+        )
+
+    async def local_crawl(_client, _payload):
+        calls.append(("crawl4ai", None))
+        raise AssertionError("known nonpublic Firecrawl target must not fall back locally")
+
+    app.is_allowed_public_url = public_check
+    app.firecrawl_request = firecrawl
+    app.call_crawl4ai = local_crawl
+
+    async def request(url):
+        transport = httpx.ASGITransport(app=app.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as api:
+            return await api.post("/crawl", headers={"X-API-Key": "test-key"}, json={"url": url})
+
+    try:
+        for reported_url in ("http://127.0.0.1/", "file:///etc/passwd"):
+            calls.clear()
+            response = asyncio.run(request("https://example.com/article"))
+            assert response.status_code == 422, response.text
+            assert response.json()["error"]["code"] == "invalid_crawled_url", response.text
+            assert calls == [("firecrawl", "https://example.com/article")], calls
+    finally:
+        app.WEBSEARCH_API_KEY = saved_key
+        app.get_client = saved_get_client
+        app.is_allowed_public_url = saved_public_check
+        app.firecrawl_url_allowed = saved_firecrawl_check
+        app.firecrawl_request = saved_firecrawl_request
+        app.call_crawl4ai = saved_crawl4ai
+        app.health_cache_reset()
+
+
+def test_direct_firecrawl_accepts_public_canonical_metadata_url():
+    saved_key = app.WEBSEARCH_API_KEY
+    saved_get_client = app.get_client
+    saved_public_check = app.is_allowed_public_url
+    saved_firecrawl_check = app.firecrawl_url_allowed
+    saved_firecrawl_request = app.firecrawl_request
+    saved_crawl4ai = app.call_crawl4ai
+    app.WEBSEARCH_API_KEY = "test-key"
+    app.get_client = lambda: asyncio.sleep(0, result=object())
+    app.firecrawl_url_allowed = lambda _: True
+    requested = "https://python.org/#about"
+    canonical = "https://www.python.org/#about"
+    checked = []
+
+    async def public_check(url):
+        checked.append(url)
+        return url in {requested, canonical}
+
+    async def firecrawl(_client, _endpoint, payload, *, timeout):
+        return httpx.Response(
+            200,
+            json={
+                "success": True,
+                "data": {
+                    "markdown": "# Python",
+                    "metadata": {"sourceURL": requested, "url": canonical, "statusCode": 200},
+                },
+            },
+        )
+
+    async def local_crawl(_client, _payload):
+        raise AssertionError("valid Firecrawl result should not fall back locally")
+
+    app.is_allowed_public_url = public_check
+    app.firecrawl_request = firecrawl
+    app.call_crawl4ai = local_crawl
+
+    async def request():
+        transport = httpx.ASGITransport(app=app.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as api:
+            return await api.post("/crawl", headers={"X-API-Key": "test-key"}, json={"url": requested})
+
+    try:
+        response = asyncio.run(request())
+        assert response.status_code == 200, response.text
+        assert response.json()["data"] == {"url": requested, "content": "# Python"}, response.text
+        assert checked == [requested, canonical], checked
+    finally:
+        app.WEBSEARCH_API_KEY = saved_key
+        app.get_client = saved_get_client
+        app.is_allowed_public_url = saved_public_check
+        app.firecrawl_url_allowed = saved_firecrawl_check
+        app.firecrawl_request = saved_firecrawl_request
+        app.call_crawl4ai = saved_crawl4ai
+        app.health_cache_reset()
+
+
 def test_provider_routed_direct_crawl_uses_local_crawl4ai():
     saved_public_check = app.is_allowed_public_url
     saved_firecrawl_check = app.firecrawl_url_allowed
@@ -326,7 +445,10 @@ def test_scrape_requires_success_status_identity_and_nonempty_markdown():
             },
         },
     )
+    assert adapter.scrape_target_url(valid) == (True, "https://final.example/article")
     assert adapter.scrape_result(valid, requested) == {"url": requested, "content": "# Article"}
+    missing_target = httpx.Response(200, json={"success": True, "data": {"metadata": {"sourceURL": requested}}})
+    assert adapter.scrape_target_url(missing_target) == (False, None)
     for api_status, target_status in ((201, 203), (200, 304)):
         response = httpx.Response(
             api_status,
