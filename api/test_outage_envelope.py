@@ -27,13 +27,16 @@ def use(handler):
     helper does not exist, and a test that dies on a missing test helper proves
     nothing. These checks must fail on their own behavioural assertion instead.
     """
-    saved = app.get_client
+    saved_client = app.get_client
+    saved_url_check = app.is_allowed_public_url
     app.get_client = lambda: asyncio.sleep(0, result=client(handler))
-    getattr(app, "health_cache_reset", lambda: None)()
+    app.is_allowed_public_url = lambda url: asyncio.sleep(0, result=not url.startswith("http://localhost"))
+    app.health_cache_reset()
 
     def restore():
-        app.get_client = saved
-        getattr(app, "health_cache_reset", lambda: None)()
+        app.get_client = saved_client
+        app.is_allowed_public_url = saved_url_check
+        app.health_cache_reset()
 
     return restore
 
@@ -124,11 +127,14 @@ def test_genuinely_empty_results_are_not_an_outage():
 
 def test_partial_outage_still_returns_results():
     # One dead engine must not fail a search the other engines answered.
+    restore = use(partial_pool)
     exc = None
     try:
         run(app.search_searxng(client(partial_pool), "anything", 5))
     except app.AppError as caught:
         exc = caught
+    finally:
+        restore()
     assert exc is None, f"a partial outage was escalated: {exc}"
 
 
@@ -228,16 +234,19 @@ def test_health_service_probes_are_bounded_by_health_timeout():
 
 
 def test_searxng_is_told_to_answer_inside_the_budget():
-    # Without timeout_limit searxng waits out its slowest engine (8s) and the 5s canary
-    # times out even though the other engines answered (#36).
+    # Without timeout_limit searxng can wait out its slowest engine (#36).
     sent: list[float] = []
 
     def watcher(request: httpx.Request) -> httpx.Response:
         sent.append(float(request.url.params["timeout_limit"]))
         return answered_with_results(request)
 
-    run(app.search_searxng(client(watcher), "anything", 5, timeout=app.HEALTH_TIMEOUT))
-    assert sent and sent[0] < app.HEALTH_TIMEOUT, sent
+    restore = use(watcher)
+    try:
+        run(app.search_searxng(client(watcher), "anything", 5, timeout=app.HEALTH_TIMEOUT))
+        assert sent and sent[0] < app.HEALTH_TIMEOUT, sent
+    finally:
+        restore()
 
 
 def test_search_still_gets_the_search_timeout():

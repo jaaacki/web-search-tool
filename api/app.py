@@ -945,11 +945,12 @@ class BraveKeyPool:
                     raise ValueError("invalid Brave results")
                 if not page:
                     break
-                for item in page:
-                    url = item.get("url") if isinstance(item, dict) else None
-                    if isinstance(url, str) and url not in seen:
-                        seen.add(url)
-                        items.append(item)
+                page_candidates, complete = await shape_candidates(
+                    page, limit - len(items), "description", deadline=deadline, seen_urls=seen
+                )
+                items.extend(page_candidates)
+                if not complete:
+                    raise _BraveKeyError("normalization_timeout", 60.0, items)
                 query_info = payload.get("query")
                 if not isinstance(query_info, dict):
                     query_info = {}
@@ -1008,15 +1009,8 @@ async def discover_candidates(client: httpx.AsyncClient, query: str, limit: int)
                 if brave is None:
                     failures["brave"] = "unavailable"
                 else:
-                    remaining = deadline - loop.time()
-                    if remaining > 0:
-                        candidates = await asyncio.wait_for(
-                            shape_candidates(brave, limit, snippet_key="description"), timeout=remaining
-                        )
-                        answered = True
-                    else:
-                        failures["brave"] = "deadline_exceeded"
-                        _record_provider_health("brave", "unavailable")
+                    candidates = brave
+                    answered = True
             except asyncio.TimeoutError:
                 failures["brave"] = "timeout"
                 _record_provider_health("brave", "unavailable")
@@ -1034,9 +1028,7 @@ async def discover_candidates(client: httpx.AsyncClient, query: str, limit: int)
         remaining = deadline - loop.time()
         if remaining > 0:
             try:
-                extra = await asyncio.wait_for(
-                    search_searxng(client, query, limit, timeout=remaining), timeout=remaining
-                )
+                extra = await search_searxng(client, query, limit, timeout=remaining, deadline=deadline)
                 answered = True
                 seen_urls = {item["url"] for item in candidates}
                 candidates.extend(item for item in extra if item["url"] not in seen_urls)
@@ -1066,17 +1058,36 @@ async def discover_candidates(client: httpx.AsyncClient, query: str, limit: int)
     )
 
 
-async def shape_candidates(items, limit: int, snippet_key: str = "content"):
-    seen = set()
+async def shape_candidates(
+    items,
+    limit: int,
+    snippet_key: str = "content",
+    *,
+    deadline: float,
+    seen_urls: set[str] | None = None,
+) -> tuple[list[dict], bool]:
+    loop = asyncio.get_running_loop()
+    seen = seen_urls if seen_urls is not None else set()
     results = []
     for item in items:
+        if loop.time() >= deadline:
+            return results, False
         if not isinstance(item, dict):
             continue
         url = item.get("url")
         if not isinstance(url, str) or url in seen:
             continue
         seen.add(url)
-        if not await is_allowed_public_url(url):
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return results, False
+        try:
+            allowed = await asyncio.wait_for(is_allowed_public_url(url), timeout=remaining)
+        except asyncio.TimeoutError:
+            return results, False
+        if loop.time() >= deadline:
+            return results, False
+        if not allowed:
             continue
         results.append(
             {
@@ -1086,8 +1097,8 @@ async def shape_candidates(items, limit: int, snippet_key: str = "content"):
             }
         )
         if len(results) >= limit:
-            break
-    return results
+            return results, True
+    return results, True
 
 
 def _engine_names() -> list[str]:
@@ -1112,7 +1123,17 @@ class _NoEnginesError(AppError):
         )
 
 
-async def search_searxng(client: httpx.AsyncClient, query: str, limit: int, timeout: float = SEARCH_TIMEOUT):
+async def search_searxng(
+    client: httpx.AsyncClient,
+    query: str,
+    limit: int,
+    timeout: float = SEARCH_TIMEOUT,
+    *,
+    deadline: float | None = None,
+):
+    loop = asyncio.get_running_loop()
+    if deadline is None:
+        deadline = loop.time() + max(timeout, 0.0)
     configured = _engine_names()
     # Zero configured engines must never look like an empty web. With no engine list,
     # searxng returns nothing and reports nothing dead, so the "all engines failed"
@@ -1122,17 +1143,42 @@ async def search_searxng(client: httpx.AsyncClient, query: str, limit: int, time
         _record_provider_health("searxng", "unavailable")
         raise _NoEnginesError()
 
+    remaining = deadline - loop.time()
+    if remaining <= 0:
+        _record_provider_health("searxng", "unavailable")
+        raise AppError(
+            503,
+            "upstream_unavailable",
+            "SearXNG discovery deadline expired",
+            {"provider": "searxng", "stage": "request"},
+            retryable=True,
+            retry_after=OUTAGE_RETRY_AFTER,
+        )
+    request_timeout = min(timeout, remaining)
     try:
-        response = await client.get(
-            f"{SEARXNG_URL}/search",
-            # timeout_limit makes searxng answer with whatever engines finish inside the
-            # remaining discovery budget; without it one hung engine can stall the fallback
-            # even after other engines answered (#36).
-            params={"q": query, "format": "json", "engines": SEARXNG_ENGINES, "timeout_limit": max(timeout - 1, 1)},
-            timeout=timeout,
+        response = await asyncio.wait_for(
+            client.get(
+                f"{SEARXNG_URL}/search",
+                # timeout_limit makes searxng answer with whatever engines finish inside the
+                # remaining discovery budget; without it one hung engine can stall the fallback
+                # even after other engines answered (#36).
+                params={"q": query, "format": "json", "engines": SEARXNG_ENGINES, "timeout_limit": max(request_timeout - 1, 1)},
+                timeout=request_timeout,
+            ),
+            timeout=remaining,
         )
         response.raise_for_status()
         payload = response.json()
+    except asyncio.TimeoutError as exc:
+        _record_provider_health("searxng", "unavailable")
+        raise AppError(
+            503,
+            "upstream_unavailable",
+            "SearXNG discovery request timed out",
+            {"provider": "searxng", "stage": "request"},
+            retryable=True,
+            retry_after=OUTAGE_RETRY_AFTER,
+        ) from exc
     except (httpx.HTTPError, ValueError) as exc:
         _record_provider_health("searxng", "unavailable")
         raise AppError(502, "searxng_error", "SearXNG search failed", {"error": type(exc).__name__}) from exc
@@ -1151,16 +1197,7 @@ async def search_searxng(client: httpx.AsyncClient, query: str, limit: int, time
         logger.warning("searxng engines unresponsive: %s", ", ".join(names))
 
     raw_results = payload.get("results", [])
-    candidates = await shape_candidates(raw_results, limit)
-    # An outage is EVERY configured engine failing, not one of them. searxng reports the
-    # engines that failed, so a single answerer is proof the pool is partly alive: an
-    # empty result set from a live engine is a real answer ("nothing matched") and must
-    # stay `ok: true, results: []`, or a partial outage becomes a fake retry loop (#986).
-    #
-    # The test is on the RAW payload, not the shaped candidates: shape_candidates drops
-    # non-public and duplicate URLs, so a healthy engine whose rows were all filtered
-    # out would otherwise be misreported as an outage and retried forever.
-    # searxng reports each dead engine as an [engine, reason] pair, not a bare name (#36).
+    # Grade raw results, before URL filtering: a healthy empty engine answer is not an outage.
     dead = {str(entry[0] if isinstance(entry, (list, tuple)) else entry).strip().lower() for entry in unresponsive}
     answered = bool(raw_results) or bool(set(configured) - dead)
     if not answered and dead:
@@ -1170,6 +1207,18 @@ async def search_searxng(client: httpx.AsyncClient, query: str, limit: int, time
             "upstream_unavailable",
             "No search engine responded; the search backend is unavailable",
             {"unresponsive_engines": sorted(dead)},
+            retryable=True,
+            retry_after=OUTAGE_RETRY_AFTER,
+        )
+
+    candidates, complete = await shape_candidates(raw_results, limit, deadline=deadline)
+    if not complete and not candidates:
+        _record_provider_health("searxng", "unavailable")
+        raise AppError(
+            503,
+            "upstream_unavailable",
+            "SearXNG candidate validation deadline expired",
+            {"provider": "searxng", "stage": "candidate_validation"},
             retryable=True,
             retry_after=OUTAGE_RETRY_AFTER,
         )
