@@ -5,7 +5,8 @@ pydantic==2.14.1
 # Keep FastAPI's transitive Starlette on 0.x until 1.x is separately qualified.
 starlette==0.52.1
 
-# Resolved on Python 3.14.8/linux-arm64 from python:3.14-slim@sha256:fbecd461fc72d21b2143c6eaba25143738079154a6d0ea3da3aec724f50eed4a.
+# Resolved on Python 3.14.8/linux-arm64; installed and checked on linux/amd64 too.
+# Base: python:3.14-slim@sha256:fbecd461fc72d21b2143c6eaba25143738079154a6d0ea3da3aec724f50eed4a.
 annotated-doc==0.0.5
 annotated-types==0.8.0
 anyio==4.15.1
