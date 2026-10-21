@@ -1298,8 +1298,14 @@ def _crawl_value_violation(key: str, value: Any) -> str | None:
     ):
         return f"'max_retries' must be an integer between 0 and {CRAWL_MAX_RETRIES}"
     if key in CRAWL_DELAY_KEYS and not (
-        isinstance(value, (int, float)) and not isinstance(value, bool)
-        and math.isfinite(value) and 0 <= value <= CRAWL_MAX_DELAY_SECONDS
+        (
+            isinstance(value, int) and not isinstance(value, bool)
+            and 0 <= value <= CRAWL_MAX_DELAY_SECONDS
+        )
+        or (
+            isinstance(value, float) and math.isfinite(value)
+            and 0 <= value <= CRAWL_MAX_DELAY_SECONDS
+        )
     ):
         return f"'{key}' must be a finite number between 0 and {CRAWL_MAX_DELAY_SECONDS} seconds"
     if key == "cache_mode" and not (isinstance(value, str) and value.lower() in CRAWL_CACHE_MODES):

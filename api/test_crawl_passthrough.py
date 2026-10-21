@@ -47,6 +47,7 @@ FORBIDDEN = [
     ("crawler_config", {"max_retries": 3}),
     ("crawler_config", {"delay_before_return_html": 60.1}),
     ("crawler_config", {"mean_delay": -0.1}),
+    ("crawler_config", {"delay_before_return_html": 10**400}),
     ("crawler_config", {"max_range": True}),
     ("crawler_config", {"cache_mode": "nope"}),
     ("crawl_options", {"llm_config": {}}),
@@ -109,6 +110,9 @@ def demo() -> None:
     assert rejects("crawler_config", {"wait_for": "js:1"})["loc"] == ["crawler_config", "wait_for"]
     assert rejects("crawler_config", {"delay_before_return_html": 60.1})["loc"] == ["crawler_config", "delay_before_return_html"]
     assert rejects("crawler_config", {"mean_delay": -0.1})["loc"] == ["crawler_config", "mean_delay"]
+    assert rejects("crawler_config", {"delay_before_return_html": 10**400})["loc"] == [
+        "crawler_config", "delay_before_return_html"
+    ]
     assert rejects("crawler_config", {"mean_delay": float("nan")})["loc"] == ["crawler_config", "mean_delay"]
     assert rejects("crawler_config", {"max_range": float("inf")})["loc"] == ["crawler_config", "max_range"]
     assert rejects("crawler_config", {"max_range": True})["loc"] == ["crawler_config", "max_range"]
