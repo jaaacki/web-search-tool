@@ -45,7 +45,7 @@ Crawl4AI is pinned to the 0.9.5 multi-platform image digest in `docker-compose.y
 
 ## Tests
 
-No framework; PRCI installs the pinned dependencies in Python 3.14, runs `pip check`, and executes every assert script fail-fast on pull requests targeting `main`. To test the packaged API image locally:
+No framework; PRCI installs the pinned dependencies in Python 3.15, runs `pip check`, and executes every assert script fail-fast on pull requests targeting `main`. To test the packaged API image locally:
 
 ```bash
 cd api && docker build --target test -t websearch-api-test .
