@@ -2111,15 +2111,20 @@ DNS_TTL = 60.0
 
 
 async def is_allowed_public_url(url: str):
-    parsed = urlparse(url)
-    if not _url_prefix_ok(parsed):
+    try:
+        parsed = urlparse(url)
+        if not _url_prefix_ok(parsed):
+            return False
+        port = parsed.port
+        hostname = (parsed.hostname or "").rstrip(".").lower()
+    except (TypeError, ValueError):
         return False
-    hostname = (parsed.hostname or "").rstrip(".").lower()
+
     async with _dns_lock:
         hit = _dns_cache.get(hostname)
     now = asyncio.get_running_loop().time()
     if hit is None or hit[0] <= now:
-        verdict = await asyncio.to_thread(_host_resolves_public, hostname, parsed.port)
+        verdict = await asyncio.to_thread(_host_resolves_public, hostname, port)
         async with _dns_lock:
             _dns_cache[hostname] = (asyncio.get_running_loop().time() + DNS_TTL, verdict)
         return verdict
@@ -2144,7 +2149,7 @@ def _host_resolves_public(hostname: str, port) -> bool:
 
 
 def is_public_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address):
-    return not any(
+    return ip.is_global and not any(
         (
             ip.is_private,
             ip.is_loopback,
@@ -2152,6 +2157,7 @@ def is_public_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address):
             ip.is_multicast,
             ip.is_reserved,
             ip.is_unspecified,
+            getattr(ip, "is_site_local", False),
         )
     )
 
