@@ -5,6 +5,7 @@ import json
 import tempfile
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 import httpx
 
@@ -423,7 +424,6 @@ def test_provider_call_is_cancelled_at_the_shared_deadline():
         with tempfile.TemporaryDirectory() as tmp:
             transport = DelayedTransport()
             async with httpx.AsyncClient(transport=transport) as client:
-                started = asyncio.get_running_loop().time()
                 try:
                     await controls(tmp, [("team", ["key"]) ]).request(
                         client, "/v2/search", {"query": "q"}, timeout=0.02
@@ -434,17 +434,25 @@ def test_provider_call_is_cancelled_at_the_shared_deadline():
                 else:
                     raise AssertionError("progressing response exceeded its total deadline")
                 assert transport.cancelled.is_set(), "deadline did not cancel the provider request"
-                assert asyncio.get_running_loop().time() - started < 0.15
 
-    run(check())
+    # Freeze budget accounting, not wait_for's real event-loop cancellation.
+    with patch.object(asyncio, "get_running_loop") as get_loop, patch.object(
+        asyncio, "wait_for", wraps=asyncio.wait_for
+    ) as wait_for:
+        get_loop.return_value.time.return_value = 0.0
+        run(check())
+    timeouts = [call.kwargs["timeout"] for call in wait_for.call_args_list]
+    assert timeouts == [0.02], timeouts
 
 
 def test_credit_usage_check_is_bounded_by_remaining_deadline():
     usage_cancelled = []
+    clock = [0.0]
 
     class DelayedUsageTransport(httpx.AsyncBaseTransport):
         async def handle_async_request(self, request):
             if request.url.path == "/v2/search":
+                clock[0] = 0.02
                 return response(request, 402, {"success": False, "error": "Insufficient credits"})
             try:
                 await asyncio.sleep(0.2)
@@ -456,7 +464,6 @@ def test_credit_usage_check_is_bounded_by_remaining_deadline():
     async def check():
         with tempfile.TemporaryDirectory() as tmp:
             async with httpx.AsyncClient(transport=DelayedUsageTransport()) as client:
-                started = asyncio.get_running_loop().time()
                 try:
                     await controls(tmp, [("team", ["key"]) ]).request(
                         client, "/v2/search", {"query": "q"}, timeout=0.03
@@ -466,9 +473,16 @@ def test_credit_usage_check_is_bounded_by_remaining_deadline():
                     assert exc.retryable is True
                 else:
                     raise AssertionError("timed-out usage check was treated as balance evidence")
-                assert asyncio.get_running_loop().time() - started < 0.15
 
-    run(check())
+    with patch.object(asyncio, "get_running_loop") as get_loop, patch.object(
+        asyncio, "wait_for", wraps=asyncio.wait_for
+    ) as wait_for:
+        get_loop.return_value.time.side_effect = lambda: clock[0]
+        run(check())
+    timeouts = [call.kwargs["timeout"] for call in wait_for.call_args_list]
+    assert len(timeouts) == 2, timeouts
+    assert abs(timeouts[0] - 0.03) < 1e-9, timeouts
+    assert abs(timeouts[1] - 0.01) < 1e-9, timeouts
     assert usage_cancelled == [True], usage_cancelled
 
 
