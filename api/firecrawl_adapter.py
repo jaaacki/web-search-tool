@@ -20,7 +20,7 @@ def _url_identity(value: str) -> tuple[str, str, int, str, str] | None:
         return None
 
 
-def _same_url_identity(first: str, second: str) -> bool:
+def same_url_identity(first: str, second: str) -> bool:
     identity = _url_identity(first)
     return identity is not None and identity == _url_identity(second)
 
@@ -86,7 +86,7 @@ def scrape_payload(url: str) -> dict[str, Any]:
 
 
 def scrape_result(response: Any, requested_url: str) -> dict[str, str] | None:
-    if response.status_code != 200:
+    if not 200 <= response.status_code < 300:
         return None
     try:
         payload = response.json()
@@ -99,11 +99,14 @@ def scrape_result(response: Any, requested_url: str) -> dict[str, str] | None:
         return None
     metadata = data.get("metadata")
     markdown = data.get("markdown")
+    target_status = metadata.get("statusCode") if isinstance(metadata, dict) else None
     if (
         not isinstance(metadata, dict)
-        or metadata.get("statusCode") != 200
+        or not isinstance(target_status, int)
+        or isinstance(target_status, bool)
+        or not (200 <= target_status < 300 or target_status == 304)
         or not isinstance(metadata.get("sourceURL"), str)
-        or not _same_url_identity(metadata["sourceURL"], requested_url)
+        or not same_url_identity(metadata["sourceURL"], requested_url)
         or metadata.get("error")
         or (isinstance(metadata.get("contentType"), str) and "pdf" in metadata["contentType"].lower())
         or data.get("rawBase64")

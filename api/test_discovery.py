@@ -205,6 +205,277 @@ def test_shorter_concurrent_cooldown_never_shortens_key_cooldown():
     run(exercise())
 
 
+def test_firecrawl_web_search_is_first_and_discovery_only():
+    saved_pool = app.BRAVE_POOL
+    saved_request = app.firecrawl_request
+    saved_url_check = app.is_allowed_public_url
+    app.BRAVE_POOL = app.BraveKeyPool(())
+    calls = []
+
+    async def firecrawl(_client, endpoint, payload, *, timeout):
+        calls.append((endpoint, payload))
+        return httpx.Response(
+            200,
+            json={
+                "success": True,
+                "data": {"web": [{"url": "https://fc.example/", "title": "FC", "description": "snippet"}]},
+            },
+        )
+
+    async def allow_public(_url):
+        return True
+
+    app.firecrawl_request = firecrawl
+    app.is_allowed_public_url = allow_public
+    app.health_cache_reset()
+    try:
+        candidates = run(app.discover_candidates(object(), "q", 1))
+        assert [item["url"] for item in candidates] == ["https://fc.example/"]
+        assert calls[0][0] == "/v2/search", calls
+        assert calls[0][1]["sources"] == ["web"], calls
+        assert "scrapeOptions" not in calls[0][1], calls
+        assert len(calls) == 1, calls
+    finally:
+        app.BRAVE_POOL = saved_pool
+        app.firecrawl_request = saved_request
+        app.is_allowed_public_url = saved_url_check
+        app.health_cache_reset()
+
+
+def test_firecrawl_skips_oversized_query_without_truncation():
+    saved_pool = app.BRAVE_POOL
+    saved_request = app.firecrawl_request
+    app.BRAVE_POOL = app.BraveKeyPool(())
+    firecrawl_calls = []
+    searx_queries = []
+
+    async def firecrawl(*args, **kwargs):
+        firecrawl_calls.append((args, kwargs))
+        raise AssertionError("oversized query reached Firecrawl")
+
+    class SeaxClient:
+        async def get(self, url, params=None, headers=None, timeout=None):
+            searx_queries.append(params["q"])
+            return httpx.Response(
+                200,
+                json={"results": [], "unresponsive_engines": []},
+                request=httpx.Request("GET", url),
+            )
+
+    app.firecrawl_request = firecrawl
+    app.health_cache_reset()
+    try:
+        assert run(app.discover_candidates(SeaxClient(), "q" * 501, 1)) == []
+        assert firecrawl_calls == [], firecrawl_calls
+        assert searx_queries == ["q" * 501], len(searx_queries)
+    finally:
+        app.BRAVE_POOL = saved_pool
+        app.firecrawl_request = saved_request
+        app.health_cache_reset()
+
+
+def test_unconfigured_firecrawl_falls_back_to_brave_before_searxng():
+    saved_pool = app.BRAVE_POOL
+    saved_url = app.BRAVE_SEARCH_URL
+    saved_request = app.firecrawl_request
+    saved_check = app.is_allowed_public_url
+    app.BRAVE_POOL = app.BraveKeyPool(("test-key",))
+    app.BRAVE_SEARCH_URL = "https://brave.example/search"
+    calls = []
+
+    async def firecrawl(*_args, **_kwargs):
+        calls.append("firecrawl")
+        raise app.FirecrawlUnavailable(None, "not_configured", None, False)
+
+    async def allow_public(_url):
+        return True
+
+    app.firecrawl_request = firecrawl
+    app.is_allowed_public_url = allow_public
+
+    def handler(request):
+        calls.append("brave")
+        return brave_response([result(1)], False)
+
+    try:
+        results = run(app.discover_candidates(client(handler), "q", 1))
+        assert [item["url"] for item in results] == ["https://1.example/"]
+        assert calls == ["firecrawl", "brave"], calls
+    finally:
+        app.BRAVE_POOL = saved_pool
+        app.BRAVE_SEARCH_URL = saved_url
+        app.firecrawl_request = saved_request
+        app.is_allowed_public_url = saved_check
+        app.health_cache_reset()
+
+
+def test_firecrawl_search_is_web_first_and_basic_mode_does_not_scrape():
+    saved = {
+        "pool": app.BRAVE_POOL,
+        "brave_url": app.BRAVE_SEARCH_URL,
+        "request": app.firecrawl_request,
+        "get_client": app.get_client,
+        "url_check": app.is_allowed_public_url,
+        "rerank": app.rerank,
+    }
+    app.BRAVE_POOL = app.BraveKeyPool(("test-key",))
+    app.BRAVE_SEARCH_URL = "https://brave.example/search"
+    app.is_allowed_public_url = lambda _: asyncio.sleep(0, result=True)
+    calls = []
+    seen = {}
+
+    async def firecrawl(_client, endpoint, payload, *, timeout):
+        calls.append(("firecrawl", endpoint, payload))
+        return httpx.Response(
+            200,
+            json={
+                "success": True,
+                "data": {"web": [{"url": "https://fc.example/", "title": "FC", "description": "snippet"}]},
+            },
+        )
+
+    class DiscoveryClient:
+        async def get(self, url, params=None, headers=None, timeout=None):
+            calls.append(("brave", params["offset"], params["count"]))
+            return httpx.Response(
+                200,
+                json={"query": {"more_results_available": False}, "web": {"results": [result(1)]}},
+                request=httpx.Request("GET", url),
+            )
+
+    async def rerank(_client, _query, chunks, top_k):
+        seen["chunks"] = chunks
+        return [
+            app.SearchResult(
+                title=chunks[0]["title"],
+                url=chunks[0]["url"],
+                snippet=chunks[0]["snippet"],
+                content=chunks[0]["content"],
+                score=None,
+            )
+        ], "mock"
+
+    app.firecrawl_request = firecrawl
+    app.get_client = lambda: asyncio.sleep(0, result=DiscoveryClient())
+    app.rerank = rerank
+    app.health_cache_reset()
+    try:
+        response = run(app.search(app.SearchRequest(query="q", candidates=2, depth="basic")))
+        assert response.ok is True
+        assert response.data.results[0].url == "https://fc.example/"
+        assert response.data.results[0].content == "snippet"
+        assert [item["url"] for item in seen["chunks"]] == ["https://fc.example/", "https://1.example/"]
+        assert calls == [
+            ("firecrawl", "/v2/search", {"query": "q", "limit": 2, "sources": ["web"]}),
+            ("brave", 0, 20),
+        ], calls
+    finally:
+        app.BRAVE_POOL = saved["pool"]
+        app.BRAVE_SEARCH_URL = saved["brave_url"]
+        app.firecrawl_request = saved["request"]
+        app.get_client = saved["get_client"]
+        app.is_allowed_public_url = saved["url_check"]
+        app.rerank = saved["rerank"]
+        app.health_cache_reset()
+
+
+def test_advanced_search_scrapes_firecrawl_once_and_skips_policy_denied_target():
+    saved = {
+        "pool": app.BRAVE_POOL,
+        "brave_url": app.BRAVE_SEARCH_URL,
+        "request": app.firecrawl_request,
+        "get_client": app.get_client,
+        "url_check": app.is_allowed_public_url,
+        "firecrawl_allowed": app.firecrawl_url_allowed,
+        "crawl_all": app.crawl_all,
+        "rerank": app.rerank,
+    }
+    app.BRAVE_POOL = app.BraveKeyPool(("test-key",))
+    app.BRAVE_SEARCH_URL = "https://brave.example/search"
+    app.is_allowed_public_url = lambda _: asyncio.sleep(0, result=True)
+    app.firecrawl_url_allowed = lambda url: "linkedin.com" not in url
+    linked = "https://www.linkedin.com/in/person"
+    denied = "https://denied.example/"
+    allowed = "https://allowed.example/"
+    pdf = "https://reports.example/download"
+    calls = []
+    crawled = []
+
+    async def firecrawl(_client, endpoint, payload, *, timeout):
+        calls.append((endpoint, payload.get("url")))
+        if endpoint == "/v2/search":
+            rows = [
+                {"url": allowed, "title": "Allowed", "description": "A"},
+                {"url": linked, "title": "LinkedIn", "description": "B"},
+                {"url": denied, "title": "Denied", "description": "C"},
+                {"url": pdf, "title": "PDF", "description": "D", "category": "pdf"},
+            ]
+            return httpx.Response(200, json={"success": True, "data": {"web": rows}})
+        if payload["url"] == denied:
+            raise app.FirecrawlUnavailable(403, "policy_denied", None, False)
+        return httpx.Response(
+            200,
+            json={
+                "success": True,
+                "data": {
+                    "markdown": "# Allowed page",
+                    "metadata": {"sourceURL": allowed, "statusCode": 203, "url": "https://final.example/"},
+                },
+            },
+        )
+
+    brave_calls = []
+
+    class DiscoveryClient:
+        async def get(self, url, params=None, headers=None, timeout=None):
+            brave_calls.append((params["offset"], params["count"]))
+            return httpx.Response(
+                200,
+                json={
+                    "query": {"more_results_available": False},
+                    "web": {"results": [{"url": "https://denied.example", "title": "Denied alias", "description": "dup"}]},
+                },
+                request=httpx.Request("GET", url),
+            )
+
+    async def crawl_all(_client, candidates, *, deadline=None):
+        crawled.extend(item["url"] for item in candidates)
+        return [
+            {"url": item["url"], "title": item["title"], "snippet": item["snippet"], "content": "# Local page"}
+            for item in candidates
+        ]
+
+    async def rerank(_client, _query, chunks, top_k):
+        return [
+            app.SearchResult(
+                title=item["title"], url=item["url"], snippet=item["snippet"], content=item["content"], score=None
+            )
+            for item in chunks[:top_k]
+        ], "mock"
+
+    app.firecrawl_request = firecrawl
+    app.get_client = lambda: asyncio.sleep(0, result=DiscoveryClient())
+    app.crawl_all = crawl_all
+    app.rerank = rerank
+    app.health_cache_reset()
+    try:
+        response = run(app.search(app.SearchRequest(query="q", candidates=5, depth="advanced")))
+        assert {item.url for item in response.data.results} == {allowed, linked, pdf}, response.data.results
+        assert calls == [("/v2/search", None), ("/v2/scrape", allowed), ("/v2/scrape", denied)], calls
+        assert brave_calls == [(0, app.BRAVE_PAGE_SIZE)], brave_calls
+        assert crawled == [linked, pdf], crawled
+        assert denied not in {item.url for item in response.data.results}
+    finally:
+        app.BRAVE_POOL = saved["pool"]
+        app.firecrawl_request = saved["request"]
+        app.get_client = saved["get_client"]
+        app.is_allowed_public_url = saved["url_check"]
+        app.firecrawl_url_allowed = saved["firecrawl_allowed"]
+        app.crawl_all = saved["crawl_all"]
+        app.rerank = saved["rerank"]
+        app.health_cache_reset()
+
+
 def test_discovery_outage_returns_retryable_error_and_does_not_retry_searxng():
     paths = []
     saved_pool = app.BRAVE_POOL
@@ -249,7 +520,11 @@ def test_brave_response_is_bounded_by_the_discovery_deadline():
         except app.AppError as exc:
             assert exc.retryable is True
             assert exc.code == "upstream_unavailable"
-            assert exc.details["providers"] == {"brave": "unavailable", "searxng": "deadline_exceeded"}
+            assert exc.details["providers"] == {
+                "firecrawl": "not_configured",
+                "brave": "unavailable",
+                "searxng": "deadline_exceeded",
+            }
         else:
             raise AssertionError("discovery deadline became an empty success")
         assert time.monotonic() - started < 0.15
@@ -661,6 +936,32 @@ def test_health_accepts_healthy_brave_when_searxng_is_down_without_searching():
         assert health.data.checks["searxng"] == "unavailable", health.data.checks
         assert "/search" not in paths, paths
         assert "/res/v1/web/search" not in paths, paths
+    finally:
+        app.get_client = saved_get_client
+        app.BRAVE_POOL = saved_pool
+        app.health_cache_reset()
+
+
+def test_health_accepts_healthy_firecrawl_when_searxng_is_down_without_searching():
+    saved_pool = app.BRAVE_POOL
+    saved_get_client = app.get_client
+    app.BRAVE_POOL = app.BraveKeyPool(())
+    app.health_cache_reset()
+    app._record_provider_health("firecrawl", "ok")
+    app._record_provider_health("searxng", "unavailable")
+    paths = []
+
+    def handler(request):
+        paths.append(request.url.path)
+        return httpx.Response(200)
+
+    app.get_client = lambda: asyncio.sleep(0, result=client(handler))
+    try:
+        health = run(app.health())
+        assert health.data.checks["firecrawl"] == "ok", health.data.checks
+        assert health.data.checks["searxng"] == "unavailable", health.data.checks
+        assert "/search" not in paths, paths
+        assert "/v2/search" not in paths, paths
     finally:
         app.get_client = saved_get_client
         app.BRAVE_POOL = saved_pool
