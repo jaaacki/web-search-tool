@@ -12,7 +12,8 @@ RUN pip install -r requirements.txt \
     && addgroup --system app \
     && adduser --system --ingroup app app
 
-COPY --chown=app:app app.py firecrawl_adapter.py .
+COPY --chown=app:app app.py .
+COPY --chown=app:app firecrawl_adapter.py .
 USER app
 
 FROM base AS test
