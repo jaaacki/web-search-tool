@@ -201,29 +201,68 @@ def test_local_validation_timeout_does_not_cool_brave_key():
     async def check(url):
         if url == "https://stall.example/":
             await asyncio.sleep(1)
-            return True
         return True
 
     class Client:
+        def __init__(self):
+            self.calls = 0
+
         async def get(self, url, **_kwargs):
+            self.calls += 1
+            rows = (
+                [result(0), {"url": "https://stall.example/", "title": "stall"}]
+                if self.calls == 1
+                else []
+            )
             return httpx.Response(
                 200,
-                json={
-                    "query": {"more_results_available": False},
-                    "web": {"results": [result(0), {"url": "https://stall.example/", "title": "stall"}]},
-                },
+                json={"query": {"more_results_available": False}, "web": {"results": rows}},
                 request=httpx.Request("GET", url),
             )
 
     app.is_allowed_public_url = check
+
+    async def exercise():
+        client = Client()
+        loop = asyncio.get_running_loop()
+        first = await pool.search(client, "q", 5, loop.time() + 0.05)
+        cooled = pool._cooled_until[0]
+        second = await pool.search(client, "next", 5, loop.time() + 5)
+        return first, cooled, second, client.calls
+
     try:
-        results, retry_after = run(pool.search(Client(), "q", 5, time.monotonic() + 0.05))
-        assert [item["url"] for item in results] == [result(0)["url"]], results
-        assert retry_after is None, retry_after
-        assert pool._cooled_until == [0.0], pool._cooled_until
+        first, cooled, second, calls = run(exercise())
+        assert [item["url"] for item in first[0]] == [result(0)["url"]], first
+        assert first[1] is None, first
+        assert cooled == 0.0, cooled
+        assert second == ([], None), second
+        assert calls == 2, calls
     finally:
         app.is_allowed_public_url = saved_check
         app.health_cache_reset()
+
+
+def test_real_brave_rate_limit_cooldown_is_preserved():
+    pool = app.BraveKeyPool(("test-key",))
+    calls = []
+
+    class RateLimitedClient:
+        async def get(self, url, **_kwargs):
+            calls.append(url)
+            return httpx.Response(429, headers={"Retry-After": "20"}, request=httpx.Request("GET", url))
+
+    async def exercise():
+        deadline = asyncio.get_running_loop().time() + 5
+        first = await pool.search(RateLimitedClient(), "q", 5, deadline)
+        cooled_until = pool._cooled_until[0]
+        second = await pool.search(RateLimitedClient(), "q", 5, deadline)
+        return first, cooled_until, second
+
+    first, cooled_until, second = run(exercise())
+    assert first == (None, 20), first
+    assert cooled_until > time.monotonic() + 19, cooled_until
+    assert second == (None, None), second
+    assert len(calls) == 1, calls
 
 
 def test_shorter_concurrent_cooldown_never_shortens_key_cooldown():
