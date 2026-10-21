@@ -710,11 +710,7 @@ async def search(request: SearchRequest):
     if request.depth == "basic":
         pages = snippet_pages(candidates)
     else:
-        try:
-            pages = await asyncio.wait_for(crawl_all(client, candidates), timeout=CRAWL_TIMEOUT)
-        except asyncio.TimeoutError:
-            logger.warning("crawl timed out after %.0fs", CRAWL_TIMEOUT)
-            pages = []
+        pages = await crawl_all(client, candidates)
     if not pages:
         logger.info(
             "search q=%r depth=%s candidates=%d results=0 discovery=%.0fms crawl=%.0fms elapsed=%.0fms",
@@ -1246,25 +1242,75 @@ def snippet_pages(candidates: list[dict]) -> list[dict]:
 
 
 async def crawl_all(client: httpx.AsyncClient, candidates: list[dict]):
-    """One bulk Crawl4AI call for the search path; per-URL fallback if bulk fails."""
-    flags = await asyncio.gather(*(is_allowed_public_url(item["url"]) for item in candidates))
+    """Bulk crawl, recover missing candidates, and keep successes inside one deadline."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + CRAWL_TIMEOUT
+    try:
+        flags = await asyncio.wait_for(
+            asyncio.gather(*(is_allowed_public_url(item["url"]) for item in candidates)),
+            timeout=max(0, deadline - loop.time()),
+        )
+    except asyncio.TimeoutError as exc:
+        raise AppError(
+            502,
+            "crawl4ai_error",
+            "Crawl timed out while validating target URLs",
+            retryable=True,
+            retry_after=OUTAGE_RETRY_AFTER,
+        ) from exc
     allowed = [item for item, ok in zip(candidates, flags) if ok]
     if not allowed:
         return []
 
-    pages = await _bulk_crawl(client, allowed)
-    if not pages:  # transport failure OR zero parsed content: per-URL is the known-good shape
-        if pages is None:
-            logger.warning("bulk crawl failed, falling back to per-URL")
-        else:
-            logger.warning("bulk crawl returned no usable pages, falling back to per-URL")
-        semaphore = asyncio.Semaphore(CRAWL_CONCURRENCY)
-        results = await asyncio.gather(
-            *(crawl_with_limit(semaphore, client, item) for item in allowed),
-            return_exceptions=True,
+    try:
+        bulk = await asyncio.wait_for(
+            _bulk_crawl(client, allowed), timeout=max(0, deadline - loop.time())
         )
-        pages = [page for page in results if isinstance(page, dict) and page.get("content")]
-    return pages
+    except asyncio.TimeoutError:
+        logger.warning("bulk crawl timed out; recovering candidates inside remaining deadline")
+        bulk = None
+
+    if bulk is None:
+        pages, retry_candidates = [], allowed
+    else:
+        pages, retry_candidates = bulk
+
+    if retry_candidates:
+        semaphore = asyncio.Semaphore(CRAWL_CONCURRENCY)
+        tasks = [
+            asyncio.create_task(crawl_with_limit(semaphore, client, item))
+            for item in retry_candidates
+        ]
+        done = set()
+        try:
+            done, _ = await asyncio.wait(tasks, timeout=max(0, deadline - loop.time()))
+        finally:
+            pending = [task for task in tasks if not task.done()]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+        for task in tasks:
+            if task not in done or task.cancelled():
+                continue
+            try:
+                page = task.result()
+            except Exception:
+                continue
+            if isinstance(page, dict) and page.get("content"):
+                pages.append(page)
+
+    if not pages:
+        raise AppError(
+            502,
+            "crawl4ai_error",
+            "Crawl4AI returned no usable page content",
+            retryable=True,
+            retry_after=OUTAGE_RETRY_AFTER,
+        )
+    order = {item["url"]: index for index, item in enumerate(allowed)}
+    pages.sort(key=lambda page: order.get(page["_crawl_request_url"], len(order)))
+    return [{key: value for key, value in page.items() if key != "_crawl_request_url"} for page in pages]
 
 
 # Search-path crawler config. Without a markdown generator the response carries no
@@ -1285,39 +1331,48 @@ SEARCH_CRAWLER_CONFIG = {
 
 
 async def _bulk_crawl(client: httpx.AsyncClient, candidates: list[dict]):
-    """Bulk crawl, mapped back to candidates. [] = no content; None = transport failure."""
+    """Return mapped pages and candidates needing recovery; None means provider failure."""
     try:
         payload = await call_crawl4ai(
             client, {"urls": [item["url"] for item in candidates], "crawler_config": SEARCH_CRAWLER_CONFIG}
         )
     except AppError:
         return None
+    if isinstance(payload, dict) and not crawl_result_is_usable(payload):
+        return None
 
     items = payload.get("results", payload) if isinstance(payload, dict) else payload
     if not isinstance(items, list):
         items = [items]
 
-    by_url = {item["url"]: item for item in candidates}
-    claimed = set(by_url)
-    crawled_urls = [extract_crawled_url(item) for item in items]
-    contents = [extract_crawl_content(item) for item in items]
+    requested_urls = [extract_requested_url(item) for item in items]
     used = [False] * len(items)
     pages = []
+    retry_candidates = []
     for candidate in candidates:
-        idx = next((i for i, url in enumerate(crawled_urls) if not used[i] and url == candidate["url"]), None)
-        if idx is None:  # redirected/normalized URL no other candidate claims
-            idx = next(
-                (i for i, url in enumerate(crawled_urls) if not used[i] and url and url not in claimed and contents[i]),
-                None,
-            )
-        if idx is None or not contents[idx]:
+        idx = next(
+            (i for i, url in enumerate(requested_urls) if not used[i] and url == candidate["url"]),
+            None,
+        )
+        if idx is None:
+            retry_candidates.append(candidate)
             continue
+
         used[idx] = True
-        url = crawled_urls[idx] or candidate["url"]
-        if url != candidate["url"] and not await is_allowed_public_url(url):
+        crawled_url = extract_crawled_url(items[idx]) or candidate["url"]
+        if crawled_url != candidate["url"] and not await is_allowed_public_url(crawled_url):
             continue
-        pages.append({**candidate, "url": url, "content": contents[idx]})
-    return pages
+        content = extract_crawl_content(items[idx])
+        if not content:
+            retry_candidates.append(candidate)
+            continue
+        pages.append({
+            **candidate,
+            "url": crawled_url,
+            "content": content,
+            "_crawl_request_url": candidate["url"],
+        })
+    return pages, retry_candidates
 
 
 async def crawl_with_limit(semaphore: asyncio.Semaphore, client: httpx.AsyncClient, result: dict):
@@ -1329,23 +1384,22 @@ async def crawl_url(client: httpx.AsyncClient, result: dict):
     if not await is_allowed_public_url(result["url"]):
         return None
 
-    try:
-        # Same cleaned extraction as the bulk call: this is the per-URL fallback,
-        # and without the config it would quietly hand back raw nav markdown.
-        payload = await call_crawl4ai(
-            client, {"urls": [result["url"]], "crawler_config": SEARCH_CRAWLER_CONFIG}
-        )
-    except AppError:
-        return None
-
-    crawled_url = extract_crawled_url(payload)
-    if crawled_url and not await is_allowed_public_url(crawled_url):
+    payload = await call_crawl4ai(
+        client, {"urls": [result["url"]], "crawler_config": SEARCH_CRAWLER_CONFIG}
+    )
+    crawled_url = extract_crawled_url(payload) or result["url"]
+    if crawled_url != result["url"] and not await is_allowed_public_url(crawled_url):
         return None
 
     content = extract_crawl_content(payload)
     if not content:
         return None
-    return {**result, "content": content}
+    return {
+        **result,
+        "url": crawled_url,
+        "content": content,
+        "_crawl_request_url": result["url"],
+    }
 
 
 async def crawl_direct_url(client: httpx.AsyncClient, request: CrawlRequest):
@@ -1662,6 +1716,45 @@ def filtered_openapi(surface: Literal["search", "crawl"]):
     return schema
 
 
+def crawl_result_is_usable(payload) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if "success" in payload and payload["success"] is not True:
+        return False
+    if payload.get("error_message"):
+        return False
+
+    status = payload.get("status_code")
+    if status is not None and (
+        not isinstance(status, int) or isinstance(status, bool) or not 200 <= status < 300
+    ):
+        return False
+
+    raw_headers = payload.get("response_headers")
+    if raw_headers is not None and not isinstance(raw_headers, dict):
+        return False
+    headers = {str(key).lower(): str(value).lower() for key, value in (raw_headers or {}).items()}
+    content_type = headers.get("content-type", "").split(";", 1)[0].strip()
+    if content_type and not (
+        content_type.startswith("text/")
+        or content_type in {"application/json", "application/pdf", "application/xhtml+xml", "application/xml"}
+        or content_type.endswith(("+json", "+xml"))
+    ):
+        return False
+
+    metadata = payload.get("metadata")
+    title = str(metadata.get("title", "")).strip().lower() if isinstance(metadata, dict) else ""
+    cloudflare = "cloudflare" in headers.get("server", "") or "cf-ray" in headers
+    html = payload.get("html") if isinstance(payload.get("html"), str) else ""
+    if headers.get("cf-mitigated") == "challenge":
+        return False
+    if title in {"just a moment...", "attention required! | cloudflare"} and (
+        cloudflare or "/cdn-cgi/challenge-platform/" in html.lower()
+    ):
+        return False
+    return True
+
+
 def extract_crawl_content(payload, preferred_format: str = "markdown"):
     if isinstance(payload, list):
         for item in payload:
@@ -1670,7 +1763,7 @@ def extract_crawl_content(payload, preferred_format: str = "markdown"):
                 return content
         return ""
 
-    if not isinstance(payload, dict):
+    if not isinstance(payload, dict) or not crawl_result_is_usable(payload):
         return ""
 
     format_keys = [preferred_format, "markdown", "fit_markdown", "cleaned_html", "text", "content", "html"]
@@ -1697,6 +1790,28 @@ def extract_crawl_content(payload, preferred_format: str = "markdown"):
     return ""
 
 
+def extract_requested_url(payload):
+    if isinstance(payload, list):
+        for item in payload:
+            url = extract_requested_url(item)
+            if url:
+                return url
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+
+    for key in ("requested_url", "original_url", "url"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    for key in ("result", "results", "data"):
+        url = extract_requested_url(payload.get(key))
+        if url:
+            return url
+    return None
+
+
 def extract_crawled_url(payload):
     if isinstance(payload, list):
         for item in payload:
@@ -1708,15 +1823,14 @@ def extract_crawled_url(payload):
     if not isinstance(payload, dict):
         return None
 
-    value = payload.get("url")
-    if isinstance(value, str):
-        return value
-
+    for key in ("redirected_url", "final_url", "url"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
     for key in ("result", "results", "data"):
         url = extract_crawled_url(payload.get(key))
         if url:
             return url
-
     return None
 
 
@@ -1904,18 +2018,50 @@ async def cross_encode(client: httpx.AsyncClient, query: str, documents: list[st
         return None
 
 
+def query_aligned_passage(query: str, content: str) -> str:
+    width = RERANK_MAX_CHARS
+    if width <= 0:
+        return ""
+    if len(content) <= width:
+        return content
+
+    last = len(content) - width
+    starts = list(range(0, last + 1, max(width // 2, 1)))
+    if starts[-1] != last:
+        starts.append(last)
+    windows = [content[start : start + width] for start in starts]
+    scores = lexical_scores(query, windows)
+    return windows[max(range(len(windows)), key=scores.__getitem__)]
+
+
 async def rerank(client: httpx.AsyncClient, query: str, chunks: list[dict], top_k: int):
     """Two-stage rerank. Returns (results, path) where path names the ranking that won."""
     if not chunks:
         return [], "empty"
 
-    # Stage 1: cheap lexical pass decides which chunks the cross-encoder sees at all.
+    # Stage 1: reserve scored slots for distinct sources before filling by lexical rank.
     lexical = lexical_scores(query, [chunk["content"] for chunk in chunks])
     by_lexical = sorted(range(len(chunks)), key=lambda index: lexical[index], reverse=True)
-    head, tail = by_lexical[:RERANK_PREFILTER], by_lexical[RERANK_PREFILTER:]
+    head = []
+    seen_urls = set()
+    for index in by_lexical:
+        if len(head) >= RERANK_PREFILTER:
+            break
+        url = chunks[index]["url"]
+        if url not in seen_urls:
+            head.append(index)
+            seen_urls.add(url)
+    selected = set(head)
+    for index in by_lexical:
+        if len(head) >= RERANK_PREFILTER:
+            break
+        if index not in selected:
+            head.append(index)
+            selected.add(index)
+    tail = [index for index in by_lexical if index not in selected]
 
-    # Stage 2: cross-encoder over the prefiltered head, blended with discovery rank.
-    passages = [chunks[index]["content"][:RERANK_MAX_CHARS] for index in head]
+    # Stage 2: cross-encoder over the source-diverse head, blended with discovery rank.
+    passages = [query_aligned_passage(query, chunks[index]["content"]) for index in head]
     cross_encoder = await cross_encode(client, query, passages)
     if cross_encoder is None:
         order = [(index, None) for index in by_lexical]
