@@ -156,6 +156,10 @@ def test_failed_or_blocked_content_is_rejected_but_short_answers_survive():
         crawl_item("https://a.example/", content, response_headers={"Content-Type": "image/png"})
     ) == ""
     assert app.extract_crawl_content(
+        crawl_item("https://a.example/", content, response_headers={"Content-Type": "application/ld+json"})
+    ) == content
+    assert app.extract_crawl_content(crawl_item("https://a.example/", content, status_code=None)) == content
+    assert app.extract_crawl_content(
         crawl_item("https://a.example/", content, response_headers={"cf-mitigated": "challenge"})
     ) == ""
     assert app.extract_crawl_content(

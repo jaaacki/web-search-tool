@@ -1538,6 +1538,7 @@ def crawl_result_is_usable(payload) -> bool:
     if content_type and not (
         content_type.startswith("text/")
         or content_type in {"application/json", "application/pdf", "application/xhtml+xml", "application/xml"}
+        or content_type.endswith(("+json", "+xml"))
     ):
         return False
 
