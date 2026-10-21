@@ -32,7 +32,7 @@ All persistent/runtime data belongs under `./data`. The Compose file does not us
 
 ## Deploy
 
-Production runs on lab-001 from a clean `main` checkout at `/home/docker/websearch.sparkfn.io`. PRCI checks pull requests targeting `main`; deployment remains manual. After a merge:
+Production runs on lab-001 from a clean `main` checkout at `/home/docker/websearch.sparkfn.io`. PRCI on `prci.sparkfn.io` checks pull requests targeting `main`; CI on `ci.sparkfn.io` runs the same tests on pushes to `main`. Both are test-only; deployment remains manual and requires the owner's go-ahead. After a merge:
 
 ```bash
 git pull --ff-only
@@ -46,7 +46,7 @@ Crawl4AI is pinned to the 0.9.5 multi-platform image digest in `docker-compose.y
 
 ## Tests
 
-No framework; PRCI installs the pinned dependencies in Python 3.15, runs `pip check`, and executes every assert script fail-fast on pull requests targeting `main`. To test the packaged API image locally:
+No framework; PRCI on pull requests targeting `main` and CI on pushes to `main` install the pinned dependencies in Python 3.15, run `pip check`, and execute every assert script fail-fast. To test the packaged API image locally:
 
 ```bash
 cd api && docker build --target test -t websearch-api-test .
