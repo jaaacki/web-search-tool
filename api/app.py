@@ -913,10 +913,13 @@ class BraveKeyPool:
             try:
                 results = await self._search_with_key(client, key_idx, query, limit, deadline)
             except _BraveKeyError as exc:
-                self._cool(key_idx, exc.cooldown)
+                if exc.cooldown > 0:
+                    self._cool(key_idx, exc.cooldown)
+                    logger.warning("brave key %d failed (%s), cooling %.0fs", key_idx, exc.reason, exc.cooldown)
+                else:
+                    logger.warning("brave key %d failed (%s)", key_idx, exc.reason)
                 if exc.reason == "rate_limited":
                     retry_after = max(retry_after or 0.0, exc.cooldown)
-                logger.warning("brave key %d failed (%s), cooling %.0fs", key_idx, exc.reason, exc.cooldown)
                 if exc.partial:
                     self._calls[key_idx] += 1
                     _record_provider_health("brave", "ok")
@@ -991,7 +994,7 @@ class BraveKeyPool:
                 )
                 items.extend(page_candidates)
                 if not complete:
-                    raise _BraveKeyError("normalization_timeout", 60.0, items)
+                    raise _BraveKeyError("normalization_timeout", 0.0, items)
                 query_info = payload.get("query")
                 if not isinstance(query_info, dict):
                     query_info = {}
@@ -2323,15 +2326,20 @@ DNS_TTL = 60.0
 
 
 async def is_allowed_public_url(url: str):
-    parsed = urlparse(url)
-    if not _url_prefix_ok(parsed):
+    try:
+        parsed = urlparse(url)
+        if not _url_prefix_ok(parsed):
+            return False
+        port = parsed.port
+        hostname = (parsed.hostname or "").rstrip(".").lower()
+    except (TypeError, ValueError):
         return False
-    hostname = (parsed.hostname or "").rstrip(".").lower()
+
     async with _dns_lock:
         hit = _dns_cache.get(hostname)
     now = asyncio.get_running_loop().time()
     if hit is None or hit[0] <= now:
-        verdict = await asyncio.to_thread(_host_resolves_public, hostname, parsed.port)
+        verdict = await asyncio.to_thread(_host_resolves_public, hostname, port)
         async with _dns_lock:
             _dns_cache[hostname] = (asyncio.get_running_loop().time() + DNS_TTL, verdict)
         return verdict
@@ -2356,7 +2364,7 @@ def _host_resolves_public(hostname: str, port) -> bool:
 
 
 def is_public_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address):
-    return not any(
+    return ip.is_global and not any(
         (
             ip.is_private,
             ip.is_loopback,
@@ -2364,6 +2372,7 @@ def is_public_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address):
             ip.is_multicast,
             ip.is_reserved,
             ip.is_unspecified,
+            getattr(ip, "is_site_local", False),
         )
     )
 

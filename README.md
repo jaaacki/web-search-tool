@@ -46,7 +46,7 @@ Crawl4AI is pinned to the 0.9.5 multi-platform image digest in `docker-compose.y
 
 ## Tests
 
-No framework; PRCI installs the pinned dependencies in Python 3.14, runs `pip check`, and executes every assert script fail-fast on pull requests targeting `main`. To test the packaged API image locally:
+No framework; PRCI installs the pinned dependencies in Python 3.15, runs `pip check`, and executes every assert script fail-fast on pull requests targeting `main`. To test the packaged API image locally:
 
 ```bash
 cd api && docker build --target test -t websearch-api-test .
@@ -145,9 +145,11 @@ balances. A team-exhausted 402 can fail over to another declared group only afte
 team-usage check confirms zero remaining credits. Ambiguous/key-cap 402s do not rotate keys or
 balances; 429 cooldowns are shared across keys in a group. No pay-as-you-go or billing setting is
 enabled automatically, and no universal per-request credit cap is claimed; configure vendor key
-spend limits separately. Ambiguous 402 state recovers after a verified top-up or billing reset. The
-provider does not expose per-key reset dates; after verifying a daily/weekly key-cap reset, an API
-container recreation clears the local `/tmp` guard.
+spend limits separately. After a 15-minute ambiguous-402 cooldown and cached usage refresh, one
+caller-requested operation may retry only the same primary key; success clears the guard and another
+402 restarts it. There are no background or dummy probes. The provider exposes no per-key reset date;
+a verified daily/weekly cap reset can be retried by that same-key operation, while container
+recreation clears the local `/tmp` guard.
 
 Firecrawl search is discovery-only; page extraction uses a separate policy-checked scrape. LinkedIn,
 X/Twitter and known shortener domains are excluded from Firecrawl and may use the local Crawl4AI

@@ -135,15 +135,17 @@ def _retry_after(response: httpx.Response) -> float:
     value = response.headers.get("Retry-After")
     if value:
         try:
-            return min(max(float(value), 1.0), MAX_RETRY_AFTER)
+            delay = float(value)
         except ValueError:
             try:
                 date = parsedate_to_datetime(value)
                 if date.tzinfo is None:
                     date = date.replace(tzinfo=timezone.utc)
-                return min(max(date.timestamp() - time.time(), 1.0), MAX_RETRY_AFTER)
+                delay = date.timestamp() - time.time()
             except (TypeError, ValueError, OverflowError):
-                pass
+                return 60.0
+        if math.isfinite(delay):
+            return min(max(delay, 1.0), MAX_RETRY_AFTER)
     return 60.0
 
 
@@ -215,7 +217,7 @@ class FirecrawlControls:
             state = self._read_state()
             for budget in self._budgets:
                 group = self._group_state(state, budget.id)
-                blocked = await self._refresh_block(client, budget, group, deadline)
+                blocked = await self._refresh_block(client, budget, group, state, deadline)
                 if blocked is not None:
                     if blocked.category == "team_exhausted":
                         continue
@@ -228,13 +230,14 @@ class FirecrawlControls:
                 # config change after checking the team's key-spend policy.
                 key = budget.keys[0]
                 try:
-                    response = await client.post(
+                    request = client.post(
                         f"{API_ROOT}{endpoint}",
                         json=request_payload,
                         headers={"Authorization": "Bearer " + key, "Accept": "application/json"},
                         timeout=remaining,
                     )
-                except httpx.TimeoutException as exc:
+                    response = await asyncio.wait_for(request, timeout=max(0.0, deadline - loop.time()))
+                except (asyncio.TimeoutError, httpx.TimeoutException) as exc:
                     raise FirecrawlUnavailable(None, "transport_timeout", 1.0, True) from exc
                 except httpx.HTTPError as exc:
                     raise FirecrawlUnavailable(None, "transport_error", 1.0, True) from exc
@@ -255,7 +258,7 @@ class FirecrawlControls:
                     return response
 
                 if response.status_code == 402:
-                    usage = await self._credit_usage(client, key, max(0.0, deadline - loop.time()), budget.id)
+                    usage = await self._credit_usage(client, key, deadline, budget.id)
                     if usage is not None and usage["remaining"] <= 0:
                         self._block(group, "team_exhausted", usage)
                         self._write_state(state)
@@ -269,7 +272,7 @@ class FirecrawlControls:
                 if response.status_code == 429:
                     delay = _retry_after(response)
                     group.clear()
-                    group.update(blocked="rate_limited", next_check=time.time() + delay)
+                    group.update(blocked="rate_limited", next_check=time.monotonic() + delay)
                     self._write_state(state)
                     logger.warning("firecrawl budget rate limited budget=%s retry_after=%.0f", budget.id, delay)
                     raise FirecrawlUnavailable(429, "rate_limited", delay, True)
@@ -294,12 +297,13 @@ class FirecrawlControls:
         client: httpx.AsyncClient,
         budget: _Budget,
         group: dict[str, Any],
+        state: dict[str, Any],
         deadline: float,
     ) -> FirecrawlUnavailable | None:
         blocked = group.get("blocked")
         if not blocked:
             return None
-        now = time.time()
+        now = time.monotonic()
         next_check = group.get("next_check")
         if isinstance(next_check, (int, float)) and now < next_check:
             retry_after = max(1.0, next_check - now)
@@ -313,51 +317,49 @@ class FirecrawlControls:
             group.clear()
             return None
 
-        key = budget.keys[int(group.get("next_key", 0)) % len(budget.keys)]
-        usage = await self._credit_usage(
-            client, key, max(0.0, deadline - asyncio.get_running_loop().time()), budget.id
-        )
+        key = budget.keys[0]
+        usage = await self._credit_usage(client, key, deadline, budget.id)
         if usage is None:
             self._block(group, "key_cap_or_ambiguous", None)
+            self._write_state(state)
             return FirecrawlUnavailable(402, "key_cap_or_ambiguous", USAGE_RECHECK_SECONDS, True)
-        remaining = usage["remaining"]
-        if remaining <= 0:
+        if usage["remaining"] <= 0:
             self._block(group, "team_exhausted", usage)
+            self._write_state(state)
             return FirecrawlUnavailable(402, "team_exhausted", USAGE_RECHECK_SECONDS, True)
 
-        previous = group.get("remaining")
-        previous_period = group.get("billing_period_end")
-        period_reset = (
-            isinstance(previous_period, (int, float))
-            and previous_period <= now
-            and isinstance(usage["period_end"], (int, float))
-            and usage["period_end"] > now
-            and usage["period_end"] != previous_period
-        )
-        top_up = isinstance(previous, (int, float)) and remaining > previous
-        if blocked == "team_exhausted" or top_up or period_reset:
+        if blocked == "team_exhausted":
             group.clear()
-            logger.info("firecrawl budget recovered budget=%s remaining=%.0f", budget.id, remaining)
+            self._write_state(state)
+            logger.info("firecrawl budget recovered budget=%s remaining=%.0f", budget.id, usage["remaining"])
             return None
 
+        # After this cached usage check, allow one caller-driven request on the same
+        # primary key; success clears the block, while another 402 re-blocks the group.
         self._block(group, "key_cap_or_ambiguous", usage)
-        return FirecrawlUnavailable(402, "key_cap_or_ambiguous", USAGE_RECHECK_SECONDS, True)
+        self._write_state(state)
+        logger.info("firecrawl same-key retry allowed after cooldown budget=%s", budget.id)
+        return None
 
     async def _credit_usage(
-        self, client: httpx.AsyncClient, key: str, timeout: float, budget_id: str
+        self, client: httpx.AsyncClient, key: str, deadline: float, budget_id: str
     ) -> dict[str, Any] | None:
-        if timeout <= 0:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
             return None
         try:
-            response = await client.get(
+            request = client.get(
                 f"{API_ROOT}{CREDIT_USAGE_PATH}",
                 headers={"Authorization": "Bearer " + key, "Accept": "application/json"},
-                timeout=timeout,
+                timeout=remaining,
+            )
+            response = await asyncio.wait_for(
+                request, timeout=max(0.0, deadline - asyncio.get_running_loop().time())
             )
             if response.status_code != 200:
                 return None
             body = response.json()
-        except (httpx.HTTPError, ValueError):
+        except (asyncio.TimeoutError, httpx.HTTPError, ValueError):
             return None
 
         data = body.get("data") if isinstance(body, dict) and body.get("success") is True else None
@@ -382,7 +384,7 @@ class FirecrawlControls:
         group.clear()
         group.update(
             blocked=reason,
-            next_check=time.time() + USAGE_RECHECK_SECONDS,
+            next_check=time.monotonic() + USAGE_RECHECK_SECONDS,
             remaining=usage.get("remaining") if usage else None,
             billing_period_end=usage.get("period_end") if usage else None,
         )
