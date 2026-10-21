@@ -135,15 +135,17 @@ def _retry_after(response: httpx.Response) -> float:
     value = response.headers.get("Retry-After")
     if value:
         try:
-            return min(max(float(value), 1.0), MAX_RETRY_AFTER)
+            delay = float(value)
         except ValueError:
             try:
                 date = parsedate_to_datetime(value)
                 if date.tzinfo is None:
                     date = date.replace(tzinfo=timezone.utc)
-                return min(max(date.timestamp() - time.time(), 1.0), MAX_RETRY_AFTER)
+                delay = date.timestamp() - time.time()
             except (TypeError, ValueError, OverflowError):
-                pass
+                return 60.0
+        if math.isfinite(delay):
+            return min(max(delay, 1.0), MAX_RETRY_AFTER)
     return 60.0
 
 
@@ -228,13 +230,14 @@ class FirecrawlControls:
                 # config change after checking the team's key-spend policy.
                 key = budget.keys[0]
                 try:
-                    response = await client.post(
+                    request = client.post(
                         f"{API_ROOT}{endpoint}",
                         json=request_payload,
                         headers={"Authorization": "Bearer " + key, "Accept": "application/json"},
                         timeout=remaining,
                     )
-                except httpx.TimeoutException as exc:
+                    response = await asyncio.wait_for(request, timeout=max(0.0, deadline - loop.time()))
+                except (asyncio.TimeoutError, httpx.TimeoutException) as exc:
                     raise FirecrawlUnavailable(None, "transport_timeout", 1.0, True) from exc
                 except httpx.HTTPError as exc:
                     raise FirecrawlUnavailable(None, "transport_error", 1.0, True) from exc
@@ -255,7 +258,7 @@ class FirecrawlControls:
                     return response
 
                 if response.status_code == 402:
-                    usage = await self._credit_usage(client, key, max(0.0, deadline - loop.time()), budget.id)
+                    usage = await self._credit_usage(client, key, deadline, budget.id)
                     if usage is not None and usage["remaining"] <= 0:
                         self._block(group, "team_exhausted", usage)
                         self._write_state(state)
@@ -314,9 +317,7 @@ class FirecrawlControls:
             return None
 
         key = budget.keys[int(group.get("next_key", 0)) % len(budget.keys)]
-        usage = await self._credit_usage(
-            client, key, max(0.0, deadline - asyncio.get_running_loop().time()), budget.id
-        )
+        usage = await self._credit_usage(client, key, deadline, budget.id)
         if usage is None:
             self._block(group, "key_cap_or_ambiguous", None)
             return FirecrawlUnavailable(402, "key_cap_or_ambiguous", USAGE_RECHECK_SECONDS, True)
@@ -344,20 +345,24 @@ class FirecrawlControls:
         return FirecrawlUnavailable(402, "key_cap_or_ambiguous", USAGE_RECHECK_SECONDS, True)
 
     async def _credit_usage(
-        self, client: httpx.AsyncClient, key: str, timeout: float, budget_id: str
+        self, client: httpx.AsyncClient, key: str, deadline: float, budget_id: str
     ) -> dict[str, Any] | None:
-        if timeout <= 0:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
             return None
         try:
-            response = await client.get(
+            request = client.get(
                 f"{API_ROOT}{CREDIT_USAGE_PATH}",
                 headers={"Authorization": "Bearer " + key, "Accept": "application/json"},
-                timeout=timeout,
+                timeout=remaining,
+            )
+            response = await asyncio.wait_for(
+                request, timeout=max(0.0, deadline - asyncio.get_running_loop().time())
             )
             if response.status_code != 200:
                 return None
             body = response.json()
-        except (httpx.HTTPError, ValueError):
+        except (asyncio.TimeoutError, httpx.HTTPError, ValueError):
             return None
 
         data = body.get("data") if isinstance(body, dict) and body.get("success") is True else None

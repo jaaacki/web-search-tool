@@ -357,6 +357,99 @@ class SlowTransport(httpx.AsyncBaseTransport):
         return response(request)
 
 
+def test_provider_call_is_cancelled_at_the_shared_deadline():
+    class DelayedTransport(httpx.AsyncBaseTransport):
+        def __init__(self):
+            self.cancelled = asyncio.Event()
+
+        async def handle_async_request(self, request):
+            try:
+                await asyncio.sleep(0.2)
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+            return response(request)
+
+    async def check():
+        with tempfile.TemporaryDirectory() as tmp:
+            transport = DelayedTransport()
+            async with httpx.AsyncClient(transport=transport) as client:
+                started = asyncio.get_running_loop().time()
+                try:
+                    await controls(tmp, [("team", ["key"]) ]).request(
+                        client, "/v2/search", {"query": "q"}, timeout=0.02
+                    )
+                except fc.FirecrawlUnavailable as exc:
+                    assert exc.category == "transport_timeout", exc.category
+                    assert exc.retryable is True
+                else:
+                    raise AssertionError("progressing response exceeded its total deadline")
+                assert transport.cancelled.is_set(), "deadline did not cancel the provider request"
+                assert asyncio.get_running_loop().time() - started < 0.15
+
+    run(check())
+
+
+def test_credit_usage_check_is_bounded_by_remaining_deadline():
+    usage_cancelled = []
+
+    class DelayedUsageTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            if request.url.path == "/v2/search":
+                return response(request, 402, {"success": False, "error": "Insufficient credits"})
+            try:
+                await asyncio.sleep(0.2)
+            except asyncio.CancelledError:
+                usage_cancelled.append(True)
+                raise
+            return response(request, 200, {"success": True, "data": {"remainingCredits": 0}})
+
+    async def check():
+        with tempfile.TemporaryDirectory() as tmp:
+            async with httpx.AsyncClient(transport=DelayedUsageTransport()) as client:
+                started = asyncio.get_running_loop().time()
+                try:
+                    await controls(tmp, [("team", ["key"]) ]).request(
+                        client, "/v2/search", {"query": "q"}, timeout=0.03
+                    )
+                except fc.FirecrawlUnavailable as exc:
+                    assert exc.category == "key_cap_or_ambiguous", exc.category
+                    assert exc.retryable is True
+                else:
+                    raise AssertionError("timed-out usage check was treated as balance evidence")
+                assert asyncio.get_running_loop().time() - started < 0.15
+
+    run(check())
+    assert usage_cancelled == [True], usage_cancelled
+
+
+def test_nonfinite_retry_after_uses_bounded_cooldown():
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        return response(request, 429, {"success": False}, {"Retry-After": "NaN"})
+
+    async def check():
+        with tempfile.TemporaryDirectory() as tmp:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                instance = controls(tmp, [("team", ["primary", "sibling"]), ("other", ["independent"])])
+                for attempt in range(2):
+                    try:
+                        await instance.request(client, "/v2/search", {"query": "q"}, timeout=2)
+                    except fc.FirecrawlUnavailable as exc:
+                        assert exc.category == "rate_limited", exc.category
+                        if attempt == 0:
+                            assert exc.retry_after == 60, exc.retry_after
+                        else:
+                            assert 1 <= exc.retry_after <= 60, exc.retry_after
+                    else:
+                        raise AssertionError("NaN Retry-After disabled the shared cooldown")
+
+    run(check())
+    assert len(seen) == 1, len(seen)
+
+
 def test_two_controls_share_one_inflight_limit_and_timeout_waiting_requests():
     async def check():
         with tempfile.TemporaryDirectory() as tmp:
