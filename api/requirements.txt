@@ -2,10 +2,10 @@ fastapi==0.157.0
 uvicorn[standard]==0.54.0
 httpx==0.28.1
 pydantic==2.14.1
-# Keep FastAPI's transitive Starlette on 0.x until 1.x is separately qualified.
-starlette==0.52.1
+# Keep Starlette exact-pinned and qualify upgrades with the packaged API tests.
+starlette==1.9.0
 
-# Closure originally resolved on Python 3.14.8/linux-arm64; latest pins validated on Python 3.14/amd64 and 3.15.0 amd64/arm64.
+# Full pinned closure qualified on Python 3.15.0/linux-amd64.
 # Python 3.15 base: python:3.15-slim@sha256:f5b92f2a669a4c347044f29367f31983280b648250ca94dea66f98c53bc87e58.
 # PyYAML 6.0.3 uses its sdist on Python 3.15; runtime yaml.__with_libyaml__ is False on both architectures.
 annotated-doc==0.0.5
