@@ -28,7 +28,7 @@ mkdir -p data/searxng data/crawl4ai
 cp data.crawl4ai.llm.env.example data/crawl4ai/.llm.env
 ```
 
-All persistent/runtime data belongs under `./data`. The Compose file does not use named Docker volumes.
+Persistent service data belongs under `./data`. The Compose file does not use named Docker volumes; the API's temporary controls use a bounded 16 MiB `/tmp` tmpfs.
 
 ## Deploy
 
@@ -40,7 +40,9 @@ docker compose up -d --build          # or name one service, e.g. `api`
 curl -fsS https://websearch.sparkfn.io/health
 ```
 
-`/health` reuses recent discovery-provider outcomes and uses SearXNG's `/healthz` only before a search outcome is known. Polling never launches a search. It returns 503 when no configured discovery provider is available; Crawl4AI and the reranker remain diagnostic checks.
+The API waits only for local service startup, not their healthchecks. Unhealthy SearXNG/Crawl4AI must not prevent usable Firecrawl or Brave/basic search; an unavailable reranker falls back to lexical ranking. Local extraction and explicit Crawl4AI options still need Crawl4AI, and discovery fallback/top-up is reduced without SearXNG.
+
+Docker checks API process readiness through local `/openapi.json`, so traffic can reach cloud providers before their availability is known. This is not a provider-health verdict. Public `/health` reuses recent discovery-provider outcomes and uses SearXNG's `/healthz` only before a search outcome is known. Polling never launches a search. It returns 503 when no configured discovery provider is available; Crawl4AI and the reranker remain diagnostic checks. A cold API with unhealthy SearXNG stays 503 until an actual successful cloud/Brave search records availability; startup readiness does not fabricate health.
 
 Crawl4AI is pinned to the 0.9.5 multi-platform image digest in `docker-compose.yml`; its bundled Chrome for Testing is 156.0.8078.4. To roll back, restore `unclecode/crawl4ai:0.9.4` and set `CRAWL4AI_CHROMIUM_VERSION=153.0.8010.12` in `.env`. Crawl4AI 0.9.5 now verifies TLS certificates, refuses JavaScript `wait_for` conditions, and caps its delay fields at 60 seconds; the public API rejects negative, non-finite, or over-limit values for `delay_before_return_html`, `mean_delay`, and `max_range`.
 
@@ -50,6 +52,13 @@ No framework; PRCI on pull requests targeting `main` and CI on pushes to `main` 
 
 ```bash
 cd api && docker build --target test -t websearch-api-test .
+```
+
+The offline startup/restart regression uses Docker and Compose with private temporary env/config files, unhealthy local stubs and mocked cloud providers (no published ports or provider traffic):
+
+```bash
+docker build --target runtime -t websearch-api-runtime ./api
+python3 test_startup_safety.py websearch-api-runtime
 ```
 
 `eval/run.py` is the search-quality harness (golden queries against a running API; see `--help`).
@@ -148,8 +157,8 @@ enabled automatically, and no universal per-request credit cap is claimed; confi
 spend limits separately. After a 15-minute ambiguous-402 cooldown and cached usage refresh, one
 caller-requested operation may retry only the same primary key; success clears the guard and another
 402 restarts it. There are no background or dummy probes. The provider exposes no per-key reset date;
-a verified daily/weekly cap reset can be retried by that same-key operation, while container
-recreation clears the local `/tmp` guard.
+a verified daily/weekly cap reset can be retried by that same-key operation. Container stop/restart
+or recreation clears the local `/tmp` guard, not the provider's spending limits.
 
 Firecrawl search is discovery-only; page extraction uses a separate policy-checked scrape. LinkedIn,
 X/Twitter and known shortener domains are excluded from Firecrawl and may use the local Crawl4AI
@@ -158,8 +167,10 @@ are Markdown-only with PDF/image parsers disabled and Firecrawl cache storage di
 URLs stay local, and any unexpected base64/binary result is discarded. `storeInCache: false` is not a
 zero-data-retention guarantee. Firecrawl document parsing can incur per-page charges, so do not add
 PDF/LLM formats without an explicit budget decision. The shared limiter allows one in-flight request
-per API container across both Uvicorn workers; its cooldown state is in `/tmp`, so container
-recreation clears local state. It does not coordinate multiple API containers.
+per API container across both Uvicorn workers. State and locks share the API's `/tmp` tmpfs: worker
+restarts preserve sharing, but container/host restarts discard monotonic-clock deadlines before a
+new clock epoch can reuse them. Outside this Compose configuration, use equivalent ephemeral `/tmp`
+storage. It does not coordinate multiple API containers.
 
 ## Crawl stealth defaults
 

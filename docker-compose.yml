@@ -83,6 +83,9 @@ services:
     # Passes the optional knobs .env.example documents (RERANK_*, HEALTH_*, ...);
     # the entries under environment: still win over it (#38).
     env_file: .env
+    # Share monotonic cooldowns across workers, never across container/host restarts.
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m,mode=1777
     environment:
       - SEARXNG_URL=http://searxng:8080
       - CRAWL4AI_URL=http://crawl4ai:11235
@@ -98,10 +101,11 @@ services:
       - BRAVE_API_KEYS=${BRAVE_API_KEYS:-}
       - FIRECRAWL_BUDGETS_JSON=${FIRECRAWL_BUDGETS_JSON:-}
     depends_on:
+      # Local discovery/extraction are fallbacks; cloud/basic search can work without them.
       searxng:
-        condition: service_healthy
+        condition: service_started
       crawl4ai:
-        condition: service_healthy
+        condition: service_started
       reranker:
         # Only "started": a reranker still downloading its model must not hold the API
         # back, since search falls back to lexical order until it is up.
@@ -111,7 +115,9 @@ services:
       - internal
       - traefik
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      # Local readiness only: cloud availability is unknown until real traffic arrives.
+      # Public /health still reports provider failures, including genuine total outages.
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/openapi.json')\""]
       interval: 30s
       timeout: 5s
       retries: 3
