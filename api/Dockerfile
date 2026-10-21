@@ -14,6 +14,7 @@ RUN pip install -r requirements.txt \
 
 COPY --chown=app:app app.py .
 USER app
+COPY --chown=app:app firecrawl_controls.py .
 
 FROM base AS test
 COPY --chown=app:app test_*.py ./
