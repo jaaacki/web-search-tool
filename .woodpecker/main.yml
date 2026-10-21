@@ -1,0 +1,25 @@
+when:
+  - event:
+      - push
+    branch:
+      - main
+    evaluate: 'CI_SYSTEM_HOST == "ci.sparkfn.io"'
+
+steps:
+  - name: test
+    image: python:3.15-slim
+    commands:
+      - |
+        set -eu
+        python --version
+        cd api
+        python -m pip install --no-cache-dir -r requirements.txt
+        python -m pip check
+        set -- test_*.py
+        if [ ! -f "$$1" ]; then
+          printf '%s\n' 'No API test scripts found' >&2
+          exit 1
+        fi
+        for test in "$$@"; do
+          python "$$test"
+        done
