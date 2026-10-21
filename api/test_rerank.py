@@ -152,6 +152,59 @@ def test_passages_are_truncated_and_path_is_reported():
     assert results[0].score is not None
 
 
+def test_rerank_prefilter_is_source_diverse_and_ties_stable():
+    clear_breaker()
+    content = "needle evidence"
+    chunks = [chunk("https://long.example", content) for _ in range(12)]
+    chunks.extend([chunk("https://b.example", content), chunk("https://c.example", content)])
+    requests = []
+
+    def handler(request):
+        texts = json.loads(request.content)["texts"]
+        requests.append(texts)
+        return httpx.Response(200, json=[{"index": i, "score": 0.5} for i in range(len(texts))])
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    first, first_path = run_with_path("needle", chunks, 3, client)
+    second, second_path = run_with_path("needle", chunks, 3, client)
+
+    assert first_path == second_path == "cross-encoder"
+    assert [result.url for result in first] == ["https://long.example", "https://b.example", "https://c.example"]
+    assert [result.url for result in second] == [result.url for result in first], second
+    assert len(requests) == 2, requests
+    for texts in requests:
+        assert len(texts) == app.RERANK_PREFILTER == 10, len(texts)
+        assert sum(len(text) for text in texts) <= app.RERANK_PREFILTER * app.RERANK_MAX_CHARS
+        assert all(len(text) <= app.RERANK_MAX_CHARS for text in texts)
+    assert all(result.content == content for result in first), first
+
+
+def test_rerank_passage_window_captures_late_evidence_and_returns_full_chunk():
+    clear_breaker()
+    url = "https://answer.example/"
+    content = "unrelated background padding " * 40 + " quantum checkpoint evidence " + "closing prose " * 40
+    seen = []
+
+    def handler(request):
+        texts = json.loads(request.content)["texts"]
+        seen.extend(texts)
+        return httpx.Response(200, json=[{"index": i, "score": 0.7} for i in range(len(texts))])
+
+    result, path = run_with_path(
+        "quantum checkpoint",
+        [chunk(url, content)],
+        1,
+        httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+    assert path == "cross-encoder"
+    assert len(seen) == 1 and len(seen[0]) <= app.RERANK_MAX_CHARS, seen
+    assert "quantum checkpoint evidence" in seen[0], seen
+    assert seen[0] != content[: app.RERANK_MAX_CHARS], "reranker still sees only the head"
+    assert len(result) == 1 and result[0].url == url, result
+    assert result[0].content == content, "full original chunk must remain in the API result"
+
+
 if __name__ == "__main__":
     for name, test in sorted(globals().items()):
         if name.startswith("test_"):
