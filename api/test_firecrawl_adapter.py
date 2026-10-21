@@ -1,6 +1,7 @@
 """Firecrawl v2 adapter payload and normalization checks for #46."""
 
 import asyncio
+import json
 
 import httpx
 
@@ -153,6 +154,8 @@ def test_direct_firecrawl_rejects_nonpublic_reported_urls_without_local_retry():
     saved_key = app.WEBSEARCH_API_KEY
     saved_get_client = app.get_client
     saved_public_check = app.is_allowed_public_url
+    saved_resolver = app._host_resolves_public
+    saved_cache = app._dns_cache.copy()
     saved_firecrawl_check = app.firecrawl_url_allowed
     saved_firecrawl_request = app.firecrawl_request
     saved_crawl4ai = app.call_crawl4ai
@@ -161,31 +164,32 @@ def test_direct_firecrawl_rejects_nonpublic_reported_urls_without_local_retry():
     app.firecrawl_url_allowed = lambda _: True
     calls = []
 
-    async def public_check(url):
-        return url == "https://example.com/article"
+    def resolve(hostname, _port):
+        if chr(0xD800) in hostname:
+            raise UnicodeEncodeError("idna", hostname, 3, 4, "surrogates not allowed")
+        return True
 
-    async def firecrawl(_client, endpoint, payload, *, timeout):
+    async def firecrawl(_client, _endpoint, payload, *, timeout):
         calls.append(("firecrawl", payload["url"]))
-        return httpx.Response(
-            200,
-            json={
-                "success": True,
-                "data": {
-                    "markdown": "# Unsafe target body",
-                    "metadata": {
-                        "sourceURL": payload["url"],
-                        "url": reported_url,
-                        "statusCode": 200,
-                    },
+        body = {
+            "success": True,
+            "data": {
+                "markdown": "# Unsafe target body",
+                "metadata": {
+                    "sourceURL": payload["url"],
+                    "url": reported_url,
+                    "statusCode": 200,
                 },
             },
-        )
+        }
+        return httpx.Response(200, content=json.dumps(body).encode("ascii"))
 
     async def local_crawl(_client, _payload):
         calls.append(("crawl4ai", None))
         raise AssertionError("known nonpublic Firecrawl target must not fall back locally")
 
-    app.is_allowed_public_url = public_check
+    app._host_resolves_public = resolve
+    app._dns_cache.clear()
     app.firecrawl_request = firecrawl
     app.call_crawl4ai = local_crawl
 
@@ -195,7 +199,11 @@ def test_direct_firecrawl_rejects_nonpublic_reported_urls_without_local_retry():
             return await api.post("/crawl", headers={"X-API-Key": "test-key"}, json={"url": url})
 
     try:
-        for reported_url in ("http://127.0.0.1/", "file:///etc/passwd"):
+        for reported_url in (
+            "http://127.0.0.1/",
+            "file:///etc/passwd",
+            "https://bad" + chr(0xD800) + ".example/",
+        ):
             calls.clear()
             response = asyncio.run(request("https://example.com/article"))
             assert response.status_code == 422, response.text
@@ -205,6 +213,9 @@ def test_direct_firecrawl_rejects_nonpublic_reported_urls_without_local_retry():
         app.WEBSEARCH_API_KEY = saved_key
         app.get_client = saved_get_client
         app.is_allowed_public_url = saved_public_check
+        app._host_resolves_public = saved_resolver
+        app._dns_cache.clear()
+        app._dns_cache.update(saved_cache)
         app.firecrawl_url_allowed = saved_firecrawl_check
         app.firecrawl_request = saved_firecrawl_request
         app.call_crawl4ai = saved_crawl4ai

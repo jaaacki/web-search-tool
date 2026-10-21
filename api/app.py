@@ -2399,7 +2399,10 @@ async def is_allowed_public_url(url: str):
         hit = _dns_cache.get(hostname)
     now = asyncio.get_running_loop().time()
     if hit is None or hit[0] <= now:
-        verdict = await asyncio.to_thread(_host_resolves_public, hostname, port)
+        try:
+            verdict = await asyncio.to_thread(_host_resolves_public, hostname, port)
+        except UnicodeError:
+            return False
         async with _dns_lock:
             _dns_cache[hostname] = (asyncio.get_running_loop().time() + DNS_TTL, verdict)
         return verdict
