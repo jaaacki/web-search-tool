@@ -6,13 +6,16 @@ are used. No host ports, real providers, production containers or reboot.
 """
 
 import json
+import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parent
+COMPOSE_VARIABLES = set(re.findall(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)", (ROOT / "docker-compose.yml").read_text()))
 
 # Loaded by the unchanged two-worker runtime CMD; every upstream is in-memory.
 MOCK_UPSTREAMS = '''
@@ -138,7 +141,9 @@ print("ok socket auth, cloud extraction, Brave/basic, lexical fallback, total-ou
 
 
 def run(*command, **kwargs):
-    result = subprocess.run(command, text=True, capture_output=True, timeout=60, **kwargs)
+    # Exported app settings outrank --env-file; retain unrelated Docker CLI connection/context settings.
+    environment = {name: value for name, value in os.environ.items() if name not in COMPOSE_VARIABLES}
+    result = subprocess.run(command, text=True, capture_output=True, timeout=60, env=environment, **kwargs)
     if result.returncode:
         raise RuntimeError(f"{command}:\n{result.stdout}\n{result.stderr}")
     return result.stdout
@@ -148,12 +153,19 @@ def main(image):
     with tempfile.TemporaryDirectory(prefix="websearch-54-") as directory:
         scratch = Path(directory)
         private_env = scratch / "private.env"
-        private_env.write_text("SEARXNG_SECRET=dummy\nCRAWL4AI_API_TOKEN=dummy\nWEBSEARCH_API_KEY=dummy\n")
+        dummy = dict.fromkeys(("SEARXNG_SECRET", "CRAWL4AI_API_TOKEN", "WEBSEARCH_API_KEY", "BRAVE_API_KEYS"), "dummy")
+        dummy["FIRECRAWL_BUDGETS_JSON"] = '[{"id":"test","keys":["dummy"]}]'
+        private_env.write_text("".join(f"{name}={value}\n" for name, value in dummy.items()))
         private_env.chmod(0o600)
         # Explicit --env-file prevents default .env loading; skip default service env files too.
         base = ["docker", "compose", "--env-file", str(private_env), "-p", scratch.name]
         config = json.loads(run(*base, "-f", str(ROOT / "docker-compose.yml"), "config", "--no-env-resolution", "--format", "json"))
         api = config["services"]["api"]
+        # Fail before starting containers if adversarial host exports overrode any dummy credential.
+        assert all(api["environment"][name] == dummy[name] for name in dummy if name != "SEARXNG_SECRET")
+        assert config["services"]["searxng"]["environment"]["SEARXNG_SECRET"] == dummy["SEARXNG_SECRET"]
+        assert config["services"]["crawl4ai"]["environment"]["CRAWL4AI_API_TOKEN"] == dummy["CRAWL4AI_API_TOKEN"]
+        print("ok private Compose credentials ignore exported application settings")
         assert all(dep["condition"] == "service_started" for dep in api["depends_on"].values())
         assert api["tmpfs"] == ["/tmp:rw,noexec,nosuid,size=16m,mode=1777"], api["tmpfs"]
         assert set(api["networks"]) == {"internal", "traefik"}
@@ -170,8 +182,7 @@ def main(image):
                 })
         api["healthcheck"].update(interval="1s", start_period="0s")  # Same readiness command, faster test polling.
         api["env_file"] = [{"path": str(private_env), "required": True}]
-        api["environment"].update(PYTHONPATH="/proof", BRAVE_API_KEYS="dummy", HEALTH_CACHE_TTL="3600",
-                                     FIRECRAWL_BUDGETS_JSON='[{"id":"test","keys":["dummy"]}]')
+        api["environment"].update(PYTHONPATH="/proof", HEALTH_CACHE_TTL="3600")
         mock_code = scratch / "sitecustomize.py"
         mock_code.write_text(MOCK_UPSTREAMS)
         mock_code.chmod(0o644)
