@@ -143,7 +143,8 @@ never rotated around a per-key cap. Separate groups only for independently funde
 balances. A team-exhausted 402 can fail over to another declared group only after the non-billable
 team-usage check confirms zero remaining credits. Ambiguous/key-cap 402s do not rotate keys or
 balances; 429 cooldowns are shared across keys in a group. No pay-as-you-go or billing setting is
-enabled automatically. Ambiguous 402 state recovers after a verified top-up or billing reset. The
+enabled automatically, and no universal per-request credit cap is claimed; configure vendor key
+spend limits separately. Ambiguous 402 state recovers after a verified top-up or billing reset. The
 provider does not expose per-key reset dates; after verifying a daily/weekly key-cap reset, an API
 container recreation clears the local `/tmp` guard.
 
