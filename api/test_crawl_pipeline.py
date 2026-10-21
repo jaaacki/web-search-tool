@@ -148,6 +148,145 @@ def test_partial_results_survive_deadline_and_hanging_sibling_is_cancelled():
     run(check())
 
 
+def test_bulk_normalization_deadline_keeps_accepted_prefix():
+    a = candidate("https://a.example/", "A")
+    b = candidate("https://b.example/", "B")
+    final_url = "https://b.example/final"
+    calls = []
+    final_started = asyncio.Event()
+    cancelled = []
+
+    async def fake_call(_client, payload):
+        calls.append(payload["urls"])
+        return {
+            "success": True,
+            "results": [
+                crawl_item(a["url"], "finished A"),
+                crawl_item(b["url"], "finished B", redirected_url=final_url),
+            ],
+        }
+
+    async def allow(url):
+        if url == final_url:
+            final_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.append(url)
+        return True
+
+    async def check():
+        saved_call, saved_allow = app.call_crawl4ai, app.is_allowed_public_url
+        app.call_crawl4ai, app.is_allowed_public_url = fake_call, allow
+        try:
+            deadline = asyncio.get_running_loop().time() + 0.1
+            pages = await app.crawl_all(None, [a, b], deadline=deadline)
+        finally:
+            app.call_crawl4ai, app.is_allowed_public_url = saved_call, saved_allow
+        assert final_started.is_set(), "bulk final-URL validation did not start"
+        assert cancelled == [final_url], cancelled
+        assert calls == [[a["url"], b["url"]]], calls
+        assert [page["content"] for page in pages] == ["finished A"], pages
+
+    run(check())
+
+
+def test_incomplete_empty_bulk_normalization_is_retryable_error():
+    a = candidate("https://a.example/", "A")
+    b = candidate("https://b.example/", "B")
+    final_url = "https://b.example/final"
+    calls = []
+    final_started = asyncio.Event()
+    cancelled = []
+
+    async def fake_call(_client, payload):
+        calls.append(payload["urls"])
+        return {
+            "success": True,
+            "results": [
+                crawl_item(a["url"], ""),
+                crawl_item(b["url"], "finished B", redirected_url=final_url),
+            ],
+        }
+
+    async def allow(url):
+        if url == final_url:
+            final_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.append(url)
+        return True
+
+    async def check():
+        saved_call, saved_allow = app.call_crawl4ai, app.is_allowed_public_url
+        app.call_crawl4ai, app.is_allowed_public_url = fake_call, allow
+        try:
+            deadline = asyncio.get_running_loop().time() + 0.1
+            try:
+                await app.crawl_all(None, [a, b], deadline=deadline)
+            except app.AppError as exc:
+                assert exc.status_code == 502, exc.status_code
+                assert exc.code == "crawl4ai_error", exc.code
+                assert exc.retryable is True, exc.retryable
+            else:
+                raise AssertionError("incomplete empty bulk normalization became a successful empty result")
+        finally:
+            app.call_crawl4ai, app.is_allowed_public_url = saved_call, saved_allow
+        assert final_started.is_set(), "bulk final-URL validation did not start"
+        assert cancelled == [final_url], cancelled
+        assert calls == [[a["url"], b["url"]]], calls
+
+    run(check())
+
+
+def test_external_cancellation_propagates_during_bulk_normalization():
+    a = candidate("https://a.example/", "A")
+    b = candidate("https://b.example/", "B")
+    final_url = "https://b.example/final"
+    final_started = asyncio.Event()
+    cancelled = []
+
+    async def fake_call(_client, _payload):
+        return {
+            "success": True,
+            "results": [
+                crawl_item(a["url"], "finished A"),
+                crawl_item(b["url"], "finished B", redirected_url=final_url),
+            ],
+        }
+
+    async def allow(url):
+        if url == final_url:
+            final_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.append(url)
+        return True
+
+    async def check():
+        saved_call, saved_allow = app.call_crawl4ai, app.is_allowed_public_url
+        app.call_crawl4ai, app.is_allowed_public_url = fake_call, allow
+        try:
+            task = asyncio.create_task(
+                app.crawl_all(None, [a, b], deadline=asyncio.get_running_loop().time() + 1)
+            )
+            await asyncio.wait_for(final_started.wait(), timeout=0.2)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            else:
+                raise AssertionError("external cancellation was swallowed")
+        finally:
+            app.call_crawl4ai, app.is_allowed_public_url = saved_call, saved_allow
+        assert cancelled == [final_url], cancelled
+
+    run(check())
+
+
 def test_failed_or_blocked_content_is_rejected_but_short_answers_survive():
     content = "Useful content despite the provider status."
     assert app.extract_crawl_content({"success": False, "results": [crawl_item("https://a.example/", content)]}) == ""
