@@ -90,8 +90,8 @@ def firecrawl_url_allowed(url: str) -> bool:
         return False
     try:
         parsed = urlsplit(url)
-        host = (parsed.hostname or "").rstrip(".").lower()
-    except ValueError:
+        host = (parsed.hostname or "").encode("idna").decode("ascii").rstrip(".").lower()
+    except (UnicodeError, ValueError):
         return False
     if parsed.scheme not in {"http", "https"} or parsed.username or parsed.password:
         return False

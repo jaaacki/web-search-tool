@@ -1454,20 +1454,13 @@ async def crawl_all(
     if not allowed:
         return []
 
-    try:
-        bulk = await asyncio.wait_for(
-            _bulk_crawl(client, allowed), timeout=max(0, deadline - loop.time())
-        )
-    except asyncio.TimeoutError:
-        logger.warning("bulk crawl timed out; recovering candidates inside remaining deadline")
-        bulk = None
-
+    bulk = await _bulk_crawl(client, allowed, deadline=deadline)
     if bulk is None:
         pages, retry_candidates = [], allowed
     else:
         pages, retry_candidates = bulk
 
-    if retry_candidates:
+    if retry_candidates and loop.time() < deadline:
         semaphore = asyncio.Semaphore(CRAWL_CONCURRENCY)
         tasks = [
             asyncio.create_task(crawl_with_limit(semaphore, client, item))
@@ -1522,13 +1515,24 @@ SEARCH_CRAWLER_CONFIG = {
 }
 
 
-async def _bulk_crawl(client: httpx.AsyncClient, candidates: list[dict]):
+async def _bulk_crawl(
+    client: httpx.AsyncClient, candidates: list[dict], *, deadline: float | None = None
+):
     """Return mapped pages and candidates needing recovery; None means provider failure."""
+    loop = asyncio.get_running_loop()
+    if deadline is None:
+        deadline = loop.time() + CRAWL_TIMEOUT
+    remaining = deadline - loop.time()
+    if remaining <= 0:
+        return None
     try:
-        payload = await call_crawl4ai(
-            client, {"urls": [item["url"] for item in candidates], "crawler_config": SEARCH_CRAWLER_CONFIG}
+        payload = await asyncio.wait_for(
+            call_crawl4ai(
+                client, {"urls": [item["url"] for item in candidates], "crawler_config": SEARCH_CRAWLER_CONFIG}
+            ),
+            timeout=remaining,
         )
-    except AppError:
+    except (AppError, asyncio.TimeoutError):
         return None
     if isinstance(payload, dict) and not crawl_result_is_usable(payload):
         return None
@@ -1541,7 +1545,10 @@ async def _bulk_crawl(client: httpx.AsyncClient, candidates: list[dict]):
     used = [False] * len(items)
     pages = []
     retry_candidates = []
-    for candidate in candidates:
+    for candidate_index, candidate in enumerate(candidates):
+        if loop.time() >= deadline:
+            retry_candidates.extend(candidates[candidate_index:])
+            break
         idx = next(
             (i for i, url in enumerate(requested_urls) if not used[i] and url == candidate["url"]),
             None,
@@ -1552,8 +1559,18 @@ async def _bulk_crawl(client: httpx.AsyncClient, candidates: list[dict]):
 
         used[idx] = True
         crawled_url = extract_crawled_url(items[idx]) or candidate["url"]
-        if crawled_url != candidate["url"] and not await is_allowed_public_url(crawled_url):
-            continue
+        if crawled_url != candidate["url"]:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                retry_candidates.extend(candidates[candidate_index:])
+                break
+            try:
+                allowed = await asyncio.wait_for(is_allowed_public_url(crawled_url), timeout=remaining)
+            except asyncio.TimeoutError:
+                retry_candidates.extend(candidates[candidate_index:])
+                break
+            if not allowed:
+                continue
         content = extract_crawl_content(items[idx])
         if not content:
             retry_candidates.append(candidate)
