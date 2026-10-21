@@ -43,10 +43,10 @@ curl -fsS https://websearch.sparkfn.io/health
 
 ## Tests
 
-No framework; each file is a self-running assert script:
+No framework; the API test scripts run in the packaged Python image and fail the build on the first failure:
 
 ```bash
-cd api && for f in test_*.py; do python "$f" >/dev/null && echo "ok $f" || echo "FAIL $f"; done
+cd api && docker build --target test -t websearch-api-test .
 ```
 
 `eval/run.py` is the search-quality harness (golden queries against a running API; see `--help`).
