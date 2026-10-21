@@ -23,7 +23,7 @@ outgoing:
 # here. This list only tunes the engines we actually use.
 #
 # This set must stay in sync with SEARXNG_ENGINES in api/app.py.
-# All four verified enabled in /config and returning results on 2026-10-02.
+# All four verified enabled in /config on 2026-10-21 with image 2026.10.19-81371861f.
 # mojeek and marginalia are deliberately absent: the image marks them
 # `inactive: true` (mojeek needs a Proof-of-Work CAPTCHA, marginalia needs an
 # API key), and `inactive` is NOT overridable here — unlike `disabled`, it
