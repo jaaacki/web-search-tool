@@ -135,6 +135,28 @@ curl -X POST 'https://webcrawl.sparkfn.io/crawl' \
 - `extraction_config` is deprecated and ignored. It is accepted only when empty (`{}` or omitted);
   a non-empty value returns 422. Put extraction settings in `crawler_config`.
 
+## Firecrawl controls
+
+Firecrawl is disabled unless `FIRECRAWL_BUDGETS_JSON` is set in private `.env`. Group keys
+from one Firecrawl team together; only the first key in each group is active, and sibling keys are
+never rotated around a per-key cap. Separate groups only for independently funded and authorized
+balances. A team-exhausted 402 can fail over to another declared group only after the non-billable
+team-usage check confirms zero remaining credits. Ambiguous/key-cap 402s do not rotate keys or
+balances; 429 cooldowns are shared across keys in a group. No pay-as-you-go or billing setting is
+enabled automatically. Ambiguous 402 state recovers after a verified top-up or billing reset. The
+provider does not expose per-key reset dates; after verifying a daily/weekly key-cap reset, an API
+container recreation clears the local `/tmp` guard.
+
+Firecrawl search is discovery-only; page extraction uses a separate policy-checked scrape. LinkedIn,
+X/Twitter and known shortener domains are excluded from Firecrawl and may use the local Crawl4AI
+path instead. An explicit Firecrawl policy denial is not retried through another scraper. Scrapes
+are Markdown-only with PDF/image parsers disabled and Firecrawl cache storage disabled; obvious PDF
+URLs stay local, and any unexpected base64/binary result is discarded. `storeInCache: false` is not a
+zero-data-retention guarantee. Firecrawl document parsing can incur per-page charges, so do not add
+PDF/LLM formats without an explicit budget decision. The shared limiter allows one in-flight request
+per API container across both Uvicorn workers; its cooldown state is in `/tmp`, so container
+recreation clears local state. It does not coordinate multiple API containers.
+
 ## Crawl stealth defaults
 
 The API fills every crawl — search-path and `/crawl` — with server-owned browser settings:
