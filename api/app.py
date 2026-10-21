@@ -1164,7 +1164,12 @@ async def scrape_firecrawl_candidates(
     pages = []
     local_candidates = []
     policy_denied: set[str] = set()
+    seen_candidates: list[str] = []
     for candidate in candidates:
+        url = candidate["url"]
+        if any(same_url_identity(url, seen) for seen in seen_candidates):
+            continue
+        seen_candidates.append(url)
         if not candidate.get("_firecrawl_source"):
             local_candidates.append(candidate)
             continue
@@ -1227,11 +1232,15 @@ async def scrape_firecrawl_candidates(
                 }
             )
 
-    local_candidates = [
-        item for item in local_candidates
-        if not any(same_url_identity(item["url"], denied) for denied in policy_denied)
-    ]
-    return pages, local_candidates, policy_denied
+    seen_urls = [page["url"] for page in pages] + list(policy_denied)
+    unique_local_candidates = []
+    for item in local_candidates:
+        url = item["url"]
+        if any(same_url_identity(url, seen) for seen in seen_urls):
+            continue
+        seen_urls.append(url)
+        unique_local_candidates.append(item)
+    return pages, unique_local_candidates, policy_denied
 
 
 async def shape_candidates(

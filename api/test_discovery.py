@@ -504,7 +504,7 @@ def test_advanced_search_scrapes_firecrawl_once_and_skips_policy_denied_target()
                 200,
                 json={
                     "query": {"more_results_available": False},
-                    "web": {"results": [{"url": "https://denied.example", "title": "Denied alias", "description": "dup"}]},
+                    "web": {"results": [{"url": "https://allowed.example", "title": "Allowed alias", "description": "dup"}]},
                 },
                 request=httpx.Request("GET", url),
             )
@@ -535,6 +535,7 @@ def test_advanced_search_scrapes_firecrawl_once_and_skips_policy_denied_target()
         assert calls == [("/v2/search", None), ("/v2/scrape", allowed), ("/v2/scrape", denied)], calls
         assert brave_calls == [(0, app.BRAVE_PAGE_SIZE)], brave_calls
         assert crawled == [linked, pdf], crawled
+        assert "https://allowed.example" not in crawled, crawled
         assert denied not in {item.url for item in response.data.results}
     finally:
         app.BRAVE_POOL = saved["pool"]
