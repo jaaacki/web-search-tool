@@ -3,8 +3,9 @@
 Self-hosted stack for `websearch.sparkfn.io` and controlled headless crawling at `webcrawl.sparkfn.io`:
 
 - `api`: OpenAPI/Swagger-compatible search and crawl API exposed through Traefik.
-- `searxng`: internal URL discovery service.
-- `crawl4ai`: internal page extraction service used by the API.
+- `firecrawl`: optional managed web discovery and Markdown extraction when an authorized budget is configured.
+- `searxng`: internal discovery fallback and top-up service.
+- `crawl4ai`: internal page extraction fallback and service for explicit Crawl4AI options.
 - `reranker`: internal cross-encoder reranking service (Hugging Face TEI). The API's lexical
   prefilter lives in `api/app.py`; this container only scores query/document pairs.
 
@@ -31,7 +32,7 @@ All persistent/runtime data belongs under `./data`. The Compose file does not us
 
 ## Deploy
 
-Production runs on lab-001 from a clean `main` checkout at `/home/docker/websearch.sparkfn.io`. There is no CI or auto-deploy; after a merge:
+Production runs on lab-001 from a clean `main` checkout at `/home/docker/websearch.sparkfn.io`. PRCI checks pull requests targeting `main`; deployment remains manual. After a merge:
 
 ```bash
 git pull --ff-only
@@ -39,14 +40,16 @@ docker compose up -d --build          # or name one service, e.g. `api`
 curl -fsS https://websearch.sparkfn.io/health
 ```
 
-`/health` sends a real canary query through SearXNG. It returns 503 only when no engine answers; a partial engine outage stays 200.
+`/health` reuses recent discovery-provider outcomes and uses SearXNG's `/healthz` only before a search outcome is known. Polling never launches a search. It returns 503 when no configured discovery provider is available; Crawl4AI and the reranker remain diagnostic checks.
+
+Crawl4AI is pinned to the 0.9.5 multi-platform image digest in `docker-compose.yml`; its bundled Chrome for Testing is 156.0.8078.4. To roll back, restore `unclecode/crawl4ai:0.9.4` and set `CRAWL4AI_CHROMIUM_VERSION=153.0.8010.12` in `.env`. Crawl4AI 0.9.5 now verifies TLS certificates, refuses JavaScript `wait_for` conditions, and caps its delay fields at 60 seconds; the public API rejects negative, non-finite, or over-limit values for `delay_before_return_html`, `mean_delay`, and `max_range`.
 
 ## Tests
 
-No framework; each file is a self-running assert script:
+No framework; PRCI installs the pinned dependencies in Python 3.15, runs `pip check`, and executes every assert script fail-fast on pull requests targeting `main`. To test the packaged API image locally:
 
 ```bash
-cd api && for f in test_*.py; do python "$f" >/dev/null && echo "ok $f" || echo "FAIL $f"; done
+cd api && docker build --target test -t websearch-api-test .
 ```
 
 `eval/run.py` is the search-quality harness (golden queries against a running API; see `--help`).
@@ -133,6 +136,31 @@ curl -X POST 'https://webcrawl.sparkfn.io/crawl' \
 - `extraction_config` is deprecated and ignored. It is accepted only when empty (`{}` or omitted);
   a non-empty value returns 422. Put extraction settings in `crawler_config`.
 
+## Firecrawl controls
+
+Firecrawl is disabled unless `FIRECRAWL_BUDGETS_JSON` is set in private `.env`. Group keys
+from one Firecrawl team together; only the first key in each group is active, and sibling keys are
+never rotated around a per-key cap. Separate groups only for independently funded and authorized
+balances. A team-exhausted 402 can fail over to another declared group only after the non-billable
+team-usage check confirms zero remaining credits. Ambiguous/key-cap 402s do not rotate keys or
+balances; 429 cooldowns are shared across keys in a group. No pay-as-you-go or billing setting is
+enabled automatically, and no universal per-request credit cap is claimed; configure vendor key
+spend limits separately. After a 15-minute ambiguous-402 cooldown and cached usage refresh, one
+caller-requested operation may retry only the same primary key; success clears the guard and another
+402 restarts it. There are no background or dummy probes. The provider exposes no per-key reset date;
+a verified daily/weekly cap reset can be retried by that same-key operation, while container
+recreation clears the local `/tmp` guard.
+
+Firecrawl search is discovery-only; page extraction uses a separate policy-checked scrape. LinkedIn,
+X/Twitter and known shortener domains are excluded from Firecrawl and may use the local Crawl4AI
+path instead. An explicit Firecrawl policy denial is not retried through another scraper. Scrapes
+are Markdown-only with PDF/image parsers disabled and Firecrawl cache storage disabled; obvious PDF
+URLs stay local, and any unexpected base64/binary result is discarded. `storeInCache: false` is not a
+zero-data-retention guarantee. Firecrawl document parsing can incur per-page charges, so do not add
+PDF/LLM formats without an explicit budget decision. The shared limiter allows one in-flight request
+per API container across both Uvicorn workers; its cooldown state is in `/tmp`, so container
+recreation clears local state. It does not coordinate multiple API containers.
+
 ## Crawl stealth defaults
 
 The API fills every crawl — search-path and `/crawl` — with server-owned browser settings:
@@ -140,7 +168,7 @@ The API fills every crawl — search-path and `/crawl` — with server-owned bro
 a fixed viewport/locale/timezone, `remove_overlay_elements`, and a small post-load delay. Callers
 cannot change or disable these, and the fill only adds keys a caller left unset.
 
-`CRAWL4AI_CHROMIUM_VERSION` in `.env` must be bumped together with the Crawl4AI image tag: it is the
+`CRAWL4AI_CHROMIUM_VERSION` in `.env` must be bumped together with the Crawl4AI image pin: it is the
 Chrome version in the UA string, and a UA that disagrees with the engine is itself a signal.
 
 These defaults do not defeat a Cloudflare JS challenge or a DataDome captcha — see #15.

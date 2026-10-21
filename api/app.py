@@ -8,6 +8,8 @@ import secrets
 import socket
 import time
 from collections import Counter
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from typing import Any, Literal
@@ -21,6 +23,18 @@ from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import JSONResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, ConfigDict, Field
+
+from firecrawl_adapter import (
+    is_pdf_target,
+    scrape_payload as firecrawl_scrape_payload,
+    scrape_target_url as firecrawl_scrape_target_url,
+    scrape_result as firecrawl_scrape_result,
+    search_payload as firecrawl_search_payload,
+    search_results as firecrawl_search_results,
+    same_url_identity,
+    supports_markdown_crawl,
+)
+from firecrawl_controls import FirecrawlUnavailable, firecrawl_request, firecrawl_url_allowed
 
 SEARXNG_URL = os.getenv("SEARXNG_URL", "http://searxng:8080").rstrip("/")
 CRAWL4AI_URL = os.getenv("CRAWL4AI_URL", "http://crawl4ai:11235").rstrip("/")
@@ -37,33 +51,30 @@ MAX_PAGE_CHARS = int(os.getenv("MAX_PAGE_CHARS", "60000"))
 # `fit_markdown` below this length means pruning ate the page, so fall back to raw.
 MIN_FIT_MARKDOWN_CHARS = 300
 CRAWL_CONCURRENCY = int(os.getenv("CRAWL_CONCURRENCY", "8"))
-# Chrome version the Crawl4AI image bundles (Chrome for Testing 153.0.8010.12 in 0.9.4).
+# Chrome version the Crawl4AI image bundles (Chrome for Testing 156.0.8078.4 in 0.9.5).
 # The UA we send has to match the engine that renders the page, so bump this with the image.
-CRAWL4AI_CHROMIUM_VERSION = os.getenv("CRAWL4AI_CHROMIUM_VERSION", "153.0.8010.12")
+CRAWL4AI_CHROMIUM_VERSION = os.getenv("CRAWL4AI_CHROMIUM_VERSION", "156.0.8078.4")
 WEBSEARCH_API_KEY = os.getenv("WEBSEARCH_API_KEY", "")
 # Optional Brave Search API keys (comma-separated) for primary discovery.
 # Empty = SearXNG-only discovery, exactly today's behavior.
 BRAVE_API_KEYS = tuple(key.strip() for key in os.getenv("BRAVE_API_KEYS", "").split(",") if key.strip())
 BRAVE_SEARCH_URL = os.getenv("BRAVE_SEARCH_URL", "https://api.search.brave.com/res/v1/web/search").rstrip("/")
 BRAVE_TIMEOUT = float(os.getenv("BRAVE_TIMEOUT", "8"))
+BRAVE_PAGE_SIZE = 20
+BRAVE_PAGE_LIMIT = 10
 # Fences SearXNG discovery per request: settings.yml merges with defaults, so
 # the allowlist lives here where every search routes through. Every engine named
 # here must be active in the pinned image - an engine the image marks `inactive`
 # is absent from /config and can never be re-enabled by config, which silently
 # collapses discovery onto the remaining engines.
 SEARXNG_ENGINES = os.getenv("SEARXNG_ENGINES", "bing,brave,duckduckgo,google cse")
-# The canary query health sends through the real engine pool. It must be a term every
-# configured engine can answer, because an engine set that cannot answer it is exactly
-# the outage this probe exists to catch.
-HEALTH_CANARY_QUERY = os.getenv("HEALTH_CANARY_QUERY", "open source web search engines")
 # Bounded separately from SEARCH_TIMEOUT: health is polled, so it must not hold a
 # caller for as long as a real search would. Both are per-request ceilings, not
 # aggregate budgets.
 HEALTH_TIMEOUT = float(os.getenv("HEALTH_TIMEOUT", "5"))
 SEARCH_TIMEOUT = float(os.getenv("SEARCH_TIMEOUT", "10"))
-# A poll interval shorter than this reuses the last health verdict instead of firing a
-# real engine query again, so /health can be polled aggressively without turning into
-# engine load of its own.
+# Reuse per-provider outcomes and internal probes so frequent /health polls do not
+# trigger additional network checks or paid searches.
 HEALTH_CACHE_TTL = float(os.getenv("HEALTH_CACHE_TTL", "60"))
 # How long a caller should wait before retrying a downed pool. Engine outages clear in
 # seconds-to-minutes, not milliseconds, and a hot retry loop from every agent is how a
@@ -201,10 +212,10 @@ class HealthData(BaseModel):
     checks: dict[str, str] = Field(
         default_factory=dict,
         description=(
-            "Live per-service probe results. `searxng` is decided by a real canary query through the engine pool, so a total "
-            "search-backend outage is reported here instead of passing as a healthy process."
+            "Cached per-provider discovery outcomes plus bounded internal service probes. Public health polling never "
+            "issues paid search requests; a total discovery outage is still reported as unavailable."
         ),
-        examples=[{"searxng": "ok", "crawl4ai": "ok", "reranker": "ok"}],
+        examples=[{"firecrawl": "unknown", "brave": "unknown", "searxng": "unknown", "searxng_service": "ok", "crawl4ai": "ok", "reranker": "ok"}],
     )
 
 
@@ -399,6 +410,18 @@ ERROR_EXAMPLES = {
         "summary": "Crawl URL is not a public http(s) URL",
         "value": {"ok": False, "error": {"code": "invalid_url", "message": "URL must be a public http(s) URL", "details": None}},
     },
+    "firecrawl_policy_denied": {
+        "summary": "The provider policy denied this target",
+        "value": {
+            "ok": False,
+            "error": {
+                "code": "firecrawl_policy_denied",
+                "message": "The requested target is not available under provider policy",
+                "details": {"provider": "firecrawl"},
+                "retryable": False,
+            },
+        },
+    },
     "crawl4ai_error": {
         "summary": "Internal Crawl4AI service failed",
         "value": {"ok": False, "error": {"code": "crawl4ai_error", "message": "Crawl4AI crawl failed", "details": {"error": "upstream error details"}}},
@@ -410,6 +433,19 @@ ERROR_EXAMPLES = {
     "searxng_error": {
         "summary": "Internal SearXNG service failed",
         "value": {"ok": False, "error": {"code": "searxng_error", "message": "SearXNG search failed", "details": {"error": "upstream error details"}}},
+    },
+    "upstream_unavailable": {
+        "summary": "All configured discovery providers failed",
+        "value": {
+            "ok": False,
+            "error": {
+                "code": "upstream_unavailable",
+                "message": "All configured discovery providers failed",
+                "details": {"providers": {"brave": "unavailable", "searxng": "searxng_error"}},
+                "retryable": True,
+                "retry_after": 30,
+            },
+        },
     },
     "reranker_error": {
         "summary": "Internal reranker service failed",
@@ -425,13 +461,18 @@ SEARCH_ERROR_RESPONSES = {
     },
     422: {
         "model": ErrorEnvelope,
-        "description": "Invalid request. Fix the query/body values before retrying.",
-        "content": {"application/json": {"examples": {"validation_error": ERROR_EXAMPLES["validation_error"]}}},
+        "description": "Invalid request or permanent provider-policy denial. Do not retry unchanged values or targets.",
+        "content": {"application/json": {"examples": {"validation_error": ERROR_EXAMPLES["validation_error"], "firecrawl_policy_denied": ERROR_EXAMPLES["firecrawl_policy_denied"]}}},
     },
     502: {
         "model": ErrorEnvelope,
         "description": "A search, crawl, or rerank upstream service failed. Retry later or reduce `candidates` if timeouts persist.",
         "content": {"application/json": {"examples": {"searxng_error": ERROR_EXAMPLES["searxng_error"], "crawl4ai_error": ERROR_EXAMPLES["crawl4ai_error"], "reranker_error": ERROR_EXAMPLES["reranker_error"]}}},
+    },
+    503: {
+        "model": ErrorEnvelope,
+        "description": "All configured discovery providers failed. Retry after the indicated delay.",
+        "content": {"application/json": {"examples": {"upstream_unavailable": ERROR_EXAMPLES["upstream_unavailable"]}}},
     },
     500: {"model": ErrorEnvelope, "description": "Unexpected server error. Retry later or contact the service owner."},
 }
@@ -444,8 +485,8 @@ CRAWL_ERROR_RESPONSES = {
     },
     422: {
         "model": ErrorEnvelope,
-        "description": "Invalid request. Most often this is a non-public URL, unsupported URL scheme, credentialed URL, or malformed body.",
-        "content": {"application/json": {"examples": {"validation_error": ERROR_EXAMPLES["validation_error"], "invalid_url": ERROR_EXAMPLES["invalid_url"]}}},
+        "description": "Invalid request, non-public URL, unsupported option, or permanent provider-policy denial.",
+        "content": {"application/json": {"examples": {"validation_error": ERROR_EXAMPLES["validation_error"], "invalid_url": ERROR_EXAMPLES["invalid_url"], "firecrawl_policy_denied": ERROR_EXAMPLES["firecrawl_policy_denied"]}}},
     },
     502: {
         "model": ErrorEnvelope,
@@ -458,8 +499,8 @@ CRAWL_ERROR_RESPONSES = {
 HEALTH_ERROR_RESPONSES = {
     503: {
         "model": ErrorEnvelope,
-        "description": "The search backend is unavailable: no engine responded to a canary query. Retry later.",
-        "content": {"application/json": {"examples": {"upstream_unavailable": ERROR_EXAMPLES["searxng_error"]}}},
+        "description": "No configured discovery provider has a recent healthy outcome. Retry later.",
+        "content": {"application/json": {"examples": {"upstream_unavailable": ERROR_EXAMPLES["upstream_unavailable"]}}},
     },
     500: {"model": ErrorEnvelope, "description": "Unexpected server error. Retry later or contact the service owner."},
 }
@@ -526,53 +567,75 @@ async def probe_service(base_url: str, path: str, headers: dict[str, str] | None
     client = await get_client()
     try:
         response = await client.get(f"{base_url}{path}", headers=headers, timeout=HEALTH_TIMEOUT)
-        return "ok" if response.status_code < 500 else f"unavailable: http_{response.status_code}"
+        return "ok" if response.status_code < 400 else f"unavailable: http_{response.status_code}"
     except (httpx.HTTPError, ValueError) as exc:
         return f"unavailable: {type(exc).__name__}"
 
 
-async def _run_health_checks() -> dict[str, str]:
-    """Probe every service. Returns the checks map; raises AppError when search is down.
-
-    Every service is probed even after searxng fails, so the 503 body carries the same
-    information as the healthy one: an operator reading a failing health check learns
-    which dependency broke, not merely that something did.
-    """
-    client = await get_client()
-    checks: dict[str, str] = {}
-    search_failure: AppError | None = None
-    try:
-        # Reuses search_searxng, so health and search cannot disagree about an outage: a
-        # total engine failure raises upstream_unavailable here exactly as it does there.
-        # Bounded by HEALTH_TIMEOUT, not SEARCH_TIMEOUT — health is polled.
-        await search_searxng(client, HEALTH_CANARY_QUERY, 1, timeout=HEALTH_TIMEOUT)
-        checks["searxng"] = "ok"
-    except AppError as exc:
-        search_failure = exc
-        checks["searxng"] = f"unavailable: {exc.code}"
-    # Supporting services are reported, never fatal: search degrades to its lexical path
-    # without the reranker, so failing health on it would report an outage we do not have.
-    checks["crawl4ai"] = await probe_service(CRAWL4AI_URL, "/health", CRAWL4AI_HEADERS)
-    checks["reranker"] = await probe_service(RERANKER_URL, "/health")
-    if search_failure is not None:
-        raise AppError(
-            503,
-            "upstream_unavailable",
-            "No search engine responded to a canary query; search is unavailable",
-            {"checks": checks, **(search_failure.details if isinstance(search_failure.details, dict) else {})},
-            retryable=True,
-        )
-    return checks
-
-
-# Last verdict, reused for HEALTH_CACHE_TTL so a poll loop cannot become engine load.
-# Caches the failure too: a dead backend should not be hammered by its own health check.
+# Recent outcomes from real discovery requests. Health reads these instead of issuing
+# searches that may be paid or rate-limited.
+_PROVIDER_HEALTH: dict[str, dict[str, object]] = {
+    "firecrawl": {"at": 0.0, "status": "unknown"},
+    "brave": {"at": 0.0, "status": "unknown"},
+    "searxng": {"at": 0.0, "status": "unknown"},
+}
+# Last verdict, reused for HEALTH_CACHE_TTL so public polling cannot become engine load.
+# Caches failures too; an outage is not hammered by its own health check.
 _HEALTH_CACHE: dict[str, object] = {"at": 0.0, "result": None}
+
+
+def _record_provider_health(provider: str, status: str) -> None:
+    _PROVIDER_HEALTH[provider] = {"at": time.monotonic(), "status": status}
+    _HEALTH_CACHE["at"] = 0.0
+
+
+def _provider_health(provider: str, configured: bool) -> str:
+    if not configured:
+        return "not_configured"
+    result = _PROVIDER_HEALTH[provider]
+    if result["at"] == 0.0:
+        return "unknown"
+    if time.monotonic() - result["at"] >= HEALTH_CACHE_TTL:
+        return f"stale:{result['status']}"
+    return str(result["status"])
 
 
 def health_cache_reset() -> None:
     _HEALTH_CACHE["at"] = 0.0
     _HEALTH_CACHE["result"] = None
+    for result in _PROVIDER_HEALTH.values():
+        result.update(at=0.0, status="unknown")
+
+
+async def _run_health_checks() -> dict[str, str]:
+    """Report recent provider outcomes and probe supporting services without searching."""
+    checks = {
+        "firecrawl": _provider_health("firecrawl", True),
+        "brave": _provider_health("brave", bool(BRAVE_POOL)),
+        "searxng": _provider_health("searxng", bool(_engine_names())),
+    }
+    if checks["searxng"] == "unknown" and checks["searxng"] != "not_configured":
+        checks["searxng_service"] = await probe_service(SEARXNG_URL, "/healthz")
+    else:
+        checks["searxng_service"] = "not_probed"
+    checks["crawl4ai"] = await probe_service(CRAWL4AI_URL, "/health", CRAWL4AI_HEADERS)
+    checks["reranker"] = await probe_service(RERANKER_URL, "/health")
+
+    # A live SearXNG process is the cold-start fallback until a real search records
+    # whether its engine pool answered. Known provider failures always take precedence.
+    searxng_available = checks["searxng"] == "ok" or (
+        checks["searxng"] == "unknown" and checks["searxng_service"] == "ok"
+    )
+    if checks["firecrawl"] != "ok" and checks["brave"] != "ok" and not searxng_available:
+        raise AppError(
+            503,
+            "upstream_unavailable",
+            "No configured discovery provider is available",
+            {"checks": checks},
+            retryable=True,
+            retry_after=OUTAGE_RETRY_AFTER,
+        )
+    return checks
 
 
 @app.get(
@@ -581,11 +644,10 @@ def health_cache_reset() -> None:
     responses=HEALTH_ERROR_RESPONSES,
     summary="Check service health",
     description=(
-        "Public diagnostic endpoint for the search and crawl API hosts. It confirms the API process is running, reports the "
-        "internal service URLs configured for SearXNG, Crawl4AI, and the reranker, and probes each service. The SearXNG probe "
-        "is a real canary query through the engine pool, so a search-backend outage is reported as `upstream_unavailable` "
-        "instead of a healthy process. Results are cached for a few seconds so the endpoint can be polled cheaply. "
-        "Do not use this endpoint for search or crawl work."
+        "Public diagnostic endpoint for the search and crawl API hosts. It reports configured internal service URLs and "
+        "recent discovery-provider outcomes, using bounded service probes only when no search outcome is cached. Health "
+        "polling never performs a paid search. Results are cached for HEALTH_CACHE_TTL. Do not use this endpoint for search "
+        "or crawl work."
     ),
     operation_id="check_health",
     tags=["Diagnostics"],
@@ -633,9 +695,10 @@ def openapi(request: Request):
     dependencies=[Depends(require_api_key)],
     summary="Search the web and return extracted, reranked page content",
     description=(
-        "Use this endpoint when the caller has a question or topic and needs current web evidence. The service discovers candidate "
-        "URLs with SearXNG, crawls public pages through internal Crawl4AI, chunks extracted text, reranks chunks against the query, "
-        "and returns normalized results. Prefer this POST endpoint for MCP/CLI tools because the request body is explicit and easy to validate. "
+        "Use this endpoint when the caller has a question or topic and needs current web evidence. Firecrawl is the primary discovery "
+        "provider when configured, with Brave and SearXNG as fallbacks/top-up. Advanced search uses Firecrawl Markdown for eligible "
+        "Firecrawl results and Crawl4AI for remaining pages, then chunks and reranks the content. Basic search returns discovery snippets "
+        "without scraping. Prefer this POST endpoint for MCP/CLI tools because the request body is explicit and easy to validate. "
         "If `data.results` is empty, the request succeeded but no usable pages were found."
     ),
     operation_id="search_web",
@@ -664,20 +727,7 @@ def openapi(request: Request):
 async def search(request: SearchRequest):
     client = await get_client()
     started = time.perf_counter()
-    try:
-        candidates = await asyncio.wait_for(
-            discover_candidates(client, request.query, request.candidates),
-            timeout=DISCOVERY_TIMEOUT,
-        )
-    except asyncio.TimeoutError:
-        logger.warning("discovery timed out after %.0fs; trying searxng directly", DISCOVERY_TIMEOUT)
-        try:
-            candidates = await asyncio.wait_for(
-                search_searxng(client, request.query, request.candidates), timeout=10
-            )
-        except (asyncio.TimeoutError, AppError) as exc:
-            logger.warning("searxng fallback also failed (%r)", exc)
-            candidates = []
+    candidates = await discover_candidates(client, request.query, request.candidates)
     if not candidates:
         logger.info("search q=%r results=0 elapsed=%.0fms stage=discovery", request.query, _ms(started))
         return search_response(request.query, [])
@@ -686,11 +736,26 @@ async def search(request: SearchRequest):
     if request.depth == "basic":
         pages = snippet_pages(candidates)
     else:
-        try:
-            pages = await asyncio.wait_for(crawl_all(client, candidates), timeout=CRAWL_TIMEOUT)
-        except asyncio.TimeoutError:
-            logger.warning("crawl timed out after %.0fs", CRAWL_TIMEOUT)
-            pages = []
+        crawl_deadline = asyncio.get_running_loop().time() + CRAWL_TIMEOUT
+        firecrawl_pages, crawl_candidates, policy_denied = await scrape_firecrawl_candidates(
+            client, candidates, crawl_deadline
+        )
+        pages = firecrawl_pages
+        if crawl_candidates:
+            try:
+                pages.extend(await crawl_all(client, crawl_candidates, deadline=crawl_deadline))
+            except AppError as exc:
+                if not pages:
+                    raise
+                logger.warning("crawl fallback failed after Firecrawl content (%s)", exc.code)
+        if not pages and policy_denied and not crawl_candidates:
+            raise AppError(
+                422,
+                "firecrawl_policy_denied",
+                "The requested targets are not available under provider policy",
+                {"provider": "firecrawl"},
+                retryable=False,
+            )
     if not pages:
         logger.info(
             "search q=%r depth=%s candidates=%d results=0 discovery=%.0fms crawl=%.0fms elapsed=%.0fms",
@@ -766,9 +831,10 @@ async def search_get(
     dependencies=[Depends(require_api_key)],
     summary="Crawl one public URL and return extracted content",
     description=(
-        "Use this endpoint when the caller already has a URL and needs clean page content. This is a safe public facade over internal Crawl4AI: "
-        "it validates that the URL is public http(s), rejects localhost/private/internal targets, calls Crawl4AI on the private Docker network, "
-        "and returns only normalized `url` and `content`. Do not use this endpoint for discovery; call the search API first when you do not already know the URL."
+        "Use this endpoint when the caller already has a URL and needs Markdown. A plain, compatible Markdown request uses Firecrawl "
+        "when the target is allowed; explicit Crawl4AI formats/cache/options and Firecrawl-unavailable cases use internal Crawl4AI. "
+        "It validates public http(s) URLs and returns only normalized `url` and `content`. Do not use this endpoint for discovery; call "
+        "the search API first when you do not already know the URL."
     ),
     operation_id="crawl_url",
     tags=["Crawl"],
@@ -808,10 +874,11 @@ async def crawl(request: CrawlRequest):
 
 
 class _BraveKeyError(Exception):
-    def __init__(self, reason: str, cooldown: float):
+    def __init__(self, reason: str, cooldown: float, partial: list[dict] | None = None):
         super().__init__(reason)
         self.reason = reason
         self.cooldown = cooldown
+        self.partial = partial or []
 
 
 class BraveKeyPool:
@@ -828,25 +895,43 @@ class BraveKeyPool:
     def __bool__(self):
         return bool(self._keys)
 
-    async def search(self, client: httpx.AsyncClient, query: str, limit: int):
-        """Candidate dicts, or None when the whole pool is unusable (caller falls back)."""
+    async def search(
+        self, client: httpx.AsyncClient, query: str, limit: int, deadline: float
+    ) -> tuple[list[dict] | None, float | None]:
+        """Candidates and this request's Retry-After, or None when no key can answer."""
+        retry_after: float | None = None
         tried = 0
         while tried < len(self._keys):
+            if deadline <= asyncio.get_running_loop().time():
+                _record_provider_health("brave", "unavailable")
+                return None, retry_after
             key_idx = await self._take_key()
             if key_idx is None:
                 logger.warning("brave pool exhausted (all %d keys cooling)", len(self._keys))
-                return None
+                _record_provider_health("brave", "unavailable")
+                return None, retry_after
             tried += 1
             try:
-                results = await self._search_with_key(client, key_idx, query, limit)
+                results = await self._search_with_key(client, key_idx, query, limit, deadline)
             except _BraveKeyError as exc:
-                self._cool(key_idx, exc.cooldown)
-                logger.warning("brave key %d failed (%s), cooling %.0fs", key_idx, exc.reason, exc.cooldown)
+                if exc.cooldown > 0:
+                    self._cool(key_idx, exc.cooldown)
+                    logger.warning("brave key %d failed (%s), cooling %.0fs", key_idx, exc.reason, exc.cooldown)
+                else:
+                    logger.warning("brave key %d failed (%s)", key_idx, exc.reason)
+                if exc.reason == "rate_limited":
+                    retry_after = max(retry_after or 0.0, exc.cooldown)
+                if exc.partial:
+                    self._calls[key_idx] += 1
+                    _record_provider_health("brave", "ok")
+                    return exc.partial[:limit], retry_after
                 continue
             self._calls[key_idx] += 1
+            _record_provider_health("brave", "ok")
             logger.info("brave key %d ok (%d candidates, %d calls)", key_idx, len(results), self._calls[key_idx])
-            return results
-        return None
+            return results[:limit], None
+        _record_provider_health("brave", "unavailable")
+        return None, retry_after
 
     async def _take_key(self):
         async with self._lock:
@@ -859,86 +944,357 @@ class BraveKeyPool:
         return None
 
     def _cool(self, key_idx: int, cooldown: float):
-        self._cooled_until[key_idx] = asyncio.get_running_loop().time() + max(cooldown, 0.0)
+        until = asyncio.get_running_loop().time() + max(cooldown, 0.0)
+        self._cooled_until[key_idx] = max(self._cooled_until[key_idx], until)
 
-    async def _search_with_key(self, client: httpx.AsyncClient, key_idx: int, query: str, limit: int):
+    async def _search_with_key(self, client: httpx.AsyncClient, key_idx: int, query: str, limit: int, deadline: float):
         items: list[dict] = []
-        offset = 0
+        seen: set[str] = set()
         try:
-            while len(items) < limit and offset < limit:
-                count = min(limit - len(items), 20)  # Brave page cap
-                response = await client.get(
-                    BRAVE_SEARCH_URL,
-                    params={"q": query, "count": count, "offset": offset, "text_decorations": False},
-                    headers={"X-Subscription-Token": self._keys[key_idx], "Accept": "application/json"},
-                    timeout=BRAVE_TIMEOUT,
+            for page_index in range(BRAVE_PAGE_LIMIT):
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    if items:
+                        break
+                    raise _BraveKeyError("deadline_exceeded", 0.0)
+                response = await asyncio.wait_for(
+                    client.get(
+                        BRAVE_SEARCH_URL,
+                        params={
+                            "q": query,
+                            "count": BRAVE_PAGE_SIZE,
+                            "offset": page_index,
+                            "text_decorations": False,
+                        },
+                        headers={"X-Subscription-Token": self._keys[key_idx], "Accept": "application/json"},
+                        timeout=min(BRAVE_TIMEOUT, remaining),
+                    ),
+                    timeout=remaining,
                 )
                 if response.status_code == 429:
                     raise _BraveKeyError("rate_limited", _retry_after(response, 300.0))
                 if response.status_code in (401, 403):
                     raise _BraveKeyError(f"http_{response.status_code}", 86400.0)
                 if 400 <= response.status_code < 500:
-                    # Bad request, not a sick key (e.g. paging past Brave's
-                    # offset cap): keep what we have instead of burning the pool.
-                    logger.warning("brave key %d bad request (http_%d), stopping paging", key_idx, response.status_code)
-                    break
+                    # Invalid paging/config is not retried at later page indices.
+                    if items:
+                        break
+                    raise _BraveKeyError(f"http_{response.status_code}", 0.0)
                 response.raise_for_status()
-                page = (response.json().get("web") or {}).get("results") or []
+                payload = response.json()
+                if not isinstance(payload, dict) or not isinstance(payload.get("web"), dict):
+                    raise ValueError("invalid Brave response shape")
+                web = payload["web"]
+                page = web.get("results")
+                if not isinstance(page, list):
+                    raise ValueError("invalid Brave results")
                 if not page:
                     break
-                items.extend(page)
-                offset += len(page)
-        except _BraveKeyError:
+                page_candidates, complete = await shape_candidates(
+                    page, limit - len(items), "description", deadline=deadline, seen_urls=seen
+                )
+                items.extend(page_candidates)
+                if not complete:
+                    raise _BraveKeyError("normalization_timeout", 0.0, items)
+                query_info = payload.get("query")
+                if not isinstance(query_info, dict):
+                    query_info = {}
+                more_results = query_info.get(
+                    "more_results_available",
+                    payload.get("more_results_available", web.get("more_results_available", True)),
+                )
+                if more_results is False or len(items) >= limit:
+                    break
+        except _BraveKeyError as exc:
+            exc.partial = items
             raise
+        except asyncio.TimeoutError as exc:
+            raise _BraveKeyError("request_timeout", 60.0, items) from exc
         except (httpx.HTTPError, ValueError) as exc:
-            raise _BraveKeyError(str(exc), 60.0) from exc
-        return items
+            raise _BraveKeyError("request_failed", 60.0, items) from exc
+        return items[:limit]
 
 
 def _retry_after(response: httpx.Response, default: float) -> float:
-    try:
-        return max(float(response.headers.get("Retry-After", default)), 0.0)
-    except (TypeError, ValueError):
+    value = response.headers.get("Retry-After")
+    if value is None:
         return default
+    try:
+        seconds = float(value)
+        if not math.isfinite(seconds):
+            raise ValueError("Retry-After is not finite")
+        return max(seconds, 0.0)
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(value)
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=timezone.utc)
+            return max((retry_at - datetime.now(timezone.utc)).total_seconds(), 0.0)
+        except (TypeError, ValueError, OverflowError):
+            return default
 
 
 BRAVE_POOL = BraveKeyPool(BRAVE_API_KEYS)
 
 
 async def discover_candidates(client: httpx.AsyncClient, query: str, limit: int):
-    if BRAVE_POOL:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(DISCOVERY_TIMEOUT, 0.0)
+    failures: dict[str, str] = {}
+    retry_afters: list[float] = []
+    candidates: list[dict] = []
+    answered = False
+
+    payload = firecrawl_search_payload(query, limit)
+    if payload is None:
+        failures["firecrawl"] = "query_too_long"
+    else:
+        remaining = deadline - loop.time()
+        if remaining > 0:
+            try:
+                response = await firecrawl_request(client, "/v2/search", payload, timeout=remaining)
+                rows = firecrawl_search_results(response)
+                if rows is None:
+                    failures["firecrawl"] = "invalid_response"
+                    _record_provider_health("firecrawl", "unavailable")
+                else:
+                    firecrawl_candidates, complete = await shape_candidates(
+                        rows, limit, "description", deadline=deadline
+                    )
+                    if complete or firecrawl_candidates:
+                        pdf_urls = {
+                            row["url"] for row in rows if row.get("category", "").lower() == "pdf"
+                        }
+                        for candidate in firecrawl_candidates:
+                            candidate["_firecrawl_source"] = True
+                            if candidate["url"] in pdf_urls:
+                                candidate["_firecrawl_category"] = "pdf"
+                        candidates = firecrawl_candidates
+                        answered = True
+                        _record_provider_health("firecrawl", "ok")
+                    else:
+                        failures["firecrawl"] = "candidate_validation_timeout"
+                        _record_provider_health("firecrawl", "unavailable")
+            except FirecrawlUnavailable as exc:
+                failures["firecrawl"] = exc.category
+                if exc.retry_after is not None:
+                    retry_afters.append(exc.retry_after)
+                _record_provider_health(
+                    "firecrawl", "not_configured" if exc.category == "not_configured" else "unavailable"
+                )
+                if exc.category != "not_configured":
+                    logger.warning("firecrawl discovery failed (%s)", exc.category)
+            except asyncio.TimeoutError:
+                failures["firecrawl"] = "timeout"
+                _record_provider_health("firecrawl", "unavailable")
+            except Exception as exc:
+                failures["firecrawl"] = type(exc).__name__
+                _record_provider_health("firecrawl", "unavailable")
+                logger.warning("firecrawl discovery failed (%s)", type(exc).__name__)
+        else:
+            failures["firecrawl"] = "deadline_exceeded"
+            _record_provider_health("firecrawl", "unavailable")
+
+    if len(candidates) < limit and BRAVE_POOL:
+        brave_retry_after: float | None = None
+        remaining = deadline - loop.time()
+        if remaining > 0:
+            try:
+                brave, brave_retry_after = await BRAVE_POOL.search(
+                    client, query, limit - len(candidates), deadline
+                )
+                if brave is None:
+                    failures["brave"] = "unavailable"
+                else:
+                    seen_urls = {item["url"] for item in candidates}
+                    candidates.extend(item for item in brave if item["url"] not in seen_urls)
+                    answered = True
+            except asyncio.TimeoutError:
+                failures["brave"] = "timeout"
+                _record_provider_health("brave", "unavailable")
+            except Exception as exc:
+                failures["brave"] = type(exc).__name__
+                _record_provider_health("brave", "unavailable")
+                logger.warning("brave discovery failed (%s); continuing with SearXNG", type(exc).__name__)
+        else:
+            failures["brave"] = "deadline_exceeded"
+            _record_provider_health("brave", "unavailable")
+        if brave_retry_after is not None:
+            retry_afters.append(brave_retry_after)
+
+    if len(candidates) < limit:
+        remaining = deadline - loop.time()
+        if remaining > 0:
+            try:
+                extra = await search_searxng(
+                    client, query, limit - len(candidates), timeout=remaining, deadline=deadline
+                )
+                answered = True
+                seen_urls = {item["url"] for item in candidates}
+                candidates.extend(item for item in extra if item["url"] not in seen_urls)
+            except asyncio.TimeoutError:
+                failures["searxng"] = "timeout"
+                _record_provider_health("searxng", "unavailable")
+            except AppError as exc:
+                failures["searxng"] = exc.code
+                if exc.retry_after is not None:
+                    retry_afters.append(exc.retry_after)
+                logger.warning("searxng discovery failed (%s)", exc.code)
+        else:
+            failures["searxng"] = "deadline_exceeded"
+            _record_provider_health("searxng", "unavailable")
+
+    if answered:
+        return candidates[:limit]
+    if not BRAVE_POOL and not _engine_names() and failures.get("firecrawl") == "not_configured":
+        raise _NoEnginesError()
+    raise AppError(
+        503,
+        "upstream_unavailable",
+        "All configured discovery providers failed",
+        {"providers": failures},
+        retryable=True,
+        retry_after=max(retry_afters, default=OUTAGE_RETRY_AFTER),
+    )
+
+
+async def firecrawl_metadata_url_is_public(response: httpx.Response, deadline: float) -> bool:
+    present, url = firecrawl_scrape_target_url(response)
+    if not present:
+        return True
+    if not isinstance(url, str):
+        return False
+    remaining = deadline - asyncio.get_running_loop().time()
+    if remaining <= 0:
+        raise asyncio.TimeoutError
+    return await asyncio.wait_for(is_allowed_public_url(url), timeout=remaining)
+
+
+async def scrape_firecrawl_candidates(
+    client: httpx.AsyncClient, candidates: list[dict], deadline: float
+) -> tuple[list[dict], list[dict], set[str]]:
+    loop = asyncio.get_running_loop()
+    pages = []
+    local_candidates = []
+    policy_denied: set[str] = set()
+    rejected_metadata_urls: set[str] = set()
+    seen_candidates: list[str] = []
+    for candidate in candidates:
+        url = candidate["url"]
+        if any(same_url_identity(url, seen) for seen in seen_candidates):
+            continue
+        seen_candidates.append(url)
+        if not candidate.get("_firecrawl_source"):
+            local_candidates.append(candidate)
+            continue
+        url = candidate["url"]
+        if is_pdf_target(url, candidate.get("_firecrawl_category", "")) or not firecrawl_url_allowed(url):
+            local_candidates.append(candidate)
+            continue
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            local_candidates.append(candidate)
+            continue
         try:
-            brave = await BRAVE_POOL.search(client, query, limit)
-        except Exception as exc:  # never let the primary provider break search; SearXNG is the fallback
-            logger.warning("brave pool error (%r), falling back to searxng", exc)
-            brave = None
-        if brave:
-            shaped = await shape_candidates(brave, limit, snippet_key="description")
-            if len(shaped) < limit:  # Brave pages cap out; top up the shortfall from SearXNG
-                try:
-                    extra = await search_searxng(client, query, limit)
-                except AppError as exc:
-                    logger.warning("searxng top-up failed (%s)", exc.code)
-                    extra = []
-                seen_urls = {item["url"] for item in shaped}
-                shaped.extend(item for item in extra if item["url"] not in seen_urls)
-                shaped = shaped[:limit]
-            if shaped:
-                return shaped
-    return await search_searxng(client, query, limit)
+            allowed = await asyncio.wait_for(is_allowed_public_url(url), timeout=remaining)
+        except asyncio.TimeoutError:
+            local_candidates.append(candidate)
+            continue
+        if not allowed:
+            local_candidates.append(candidate)
+            continue
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            local_candidates.append(candidate)
+            continue
+        try:
+            response = await firecrawl_request(
+                client, "/v2/scrape", firecrawl_scrape_payload(url), timeout=remaining
+            )
+        except FirecrawlUnavailable as exc:
+            if exc.category == "policy_denied":
+                policy_denied.add(url)
+                _record_provider_health("firecrawl", "ok")
+                continue
+            if exc.category == "provider_routed_domain":
+                local_candidates.append(candidate)
+                continue
+            _record_provider_health(
+                "firecrawl", "not_configured" if exc.category == "not_configured" else "unavailable"
+            )
+            if exc.category != "not_configured":
+                logger.warning("firecrawl scrape failed (%s)", exc.category)
+            local_candidates.append(candidate)
+            continue
+        except asyncio.TimeoutError:
+            _record_provider_health("firecrawl", "unavailable")
+            local_candidates.append(candidate)
+            continue
+
+        if response.status_code < 500:
+            _record_provider_health("firecrawl", "ok")
+        try:
+            reported_url_allowed = await firecrawl_metadata_url_is_public(response, deadline)
+        except asyncio.TimeoutError:
+            rejected_metadata_urls.add(url)
+            continue
+        if not reported_url_allowed:
+            rejected_metadata_urls.add(url)
+            continue
+        page = firecrawl_scrape_result(response, url)
+        if page is None:
+            local_candidates.append(candidate)
+        else:
+            pages.append(
+                {
+                    "url": page["url"],
+                    "title": candidate["title"],
+                    "snippet": candidate.get("snippet", ""),
+                    "content": page["content"],
+                }
+            )
+
+    seen_urls = [page["url"] for page in pages] + list(policy_denied | rejected_metadata_urls)
+    unique_local_candidates = []
+    for item in local_candidates:
+        url = item["url"]
+        if any(same_url_identity(url, seen) for seen in seen_urls):
+            continue
+        seen_urls.append(url)
+        unique_local_candidates.append(item)
+    return pages, unique_local_candidates, policy_denied
 
 
-async def shape_candidates(items, limit: int, snippet_key: str = "content"):
-    seen = set()
+async def shape_candidates(
+    items,
+    limit: int,
+    snippet_key: str = "content",
+    *,
+    deadline: float,
+    seen_urls: set[str] | None = None,
+) -> tuple[list[dict], bool]:
+    loop = asyncio.get_running_loop()
+    seen = seen_urls if seen_urls is not None else set()
     results = []
     for item in items:
+        if loop.time() >= deadline:
+            return results, False
         if not isinstance(item, dict):
             continue
         url = item.get("url")
         if not isinstance(url, str) or url in seen:
             continue
         seen.add(url)
-        if not await is_allowed_public_url(url):
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return results, False
+        try:
+            allowed = await asyncio.wait_for(is_allowed_public_url(url), timeout=remaining)
+        except asyncio.TimeoutError:
+            return results, False
+        if loop.time() >= deadline:
+            return results, False
+        if not allowed:
             continue
         results.append(
             {
@@ -948,8 +1304,8 @@ async def shape_candidates(items, limit: int, snippet_key: str = "content"):
             }
         )
         if len(results) >= limit:
-            break
-    return results
+            return results, True
+    return results, True
 
 
 def _engine_names() -> list[str]:
@@ -974,48 +1330,85 @@ class _NoEnginesError(AppError):
         )
 
 
-async def search_searxng(client: httpx.AsyncClient, query: str, limit: int, timeout: float = SEARCH_TIMEOUT):
+async def search_searxng(
+    client: httpx.AsyncClient,
+    query: str,
+    limit: int,
+    timeout: float = SEARCH_TIMEOUT,
+    *,
+    deadline: float | None = None,
+):
+    loop = asyncio.get_running_loop()
+    if deadline is None:
+        deadline = loop.time() + max(timeout, 0.0)
     configured = _engine_names()
     # Zero configured engines must never look like an empty web. With no engine list,
     # searxng returns nothing and reports nothing dead, so the "all engines failed"
     # test below cannot fire and the caller is handed ok:true with zero results — the
     # exact silent-empty failure #986 exists to remove (#986 follow-up).
     if not configured:
+        _record_provider_health("searxng", "unavailable")
         raise _NoEnginesError()
 
+    remaining = deadline - loop.time()
+    if remaining <= 0:
+        _record_provider_health("searxng", "unavailable")
+        raise AppError(
+            503,
+            "upstream_unavailable",
+            "SearXNG discovery deadline expired",
+            {"provider": "searxng", "stage": "request"},
+            retryable=True,
+            retry_after=OUTAGE_RETRY_AFTER,
+        )
+    request_timeout = min(timeout, remaining)
     try:
-        response = await client.get(
-            f"{SEARXNG_URL}/search",
-            # timeout_limit makes searxng answer with whatever engines finished inside our
-            # budget; without it searxng waits out its slowest engine (8s), so one hung
-            # engine timed out the 5s health canary even while the others had answered (#36).
-            params={"q": query, "format": "json", "engines": SEARXNG_ENGINES, "timeout_limit": max(timeout - 1, 1)},
-            timeout=timeout,
+        response = await asyncio.wait_for(
+            client.get(
+                f"{SEARXNG_URL}/search",
+                # timeout_limit makes searxng answer with whatever engines finish inside the
+                # remaining discovery budget; without it one hung engine can stall the fallback
+                # even after other engines answered (#36).
+                params={"q": query, "format": "json", "engines": SEARXNG_ENGINES, "timeout_limit": max(request_timeout - 1, 1)},
+                timeout=request_timeout,
+            ),
+            timeout=remaining,
         )
         response.raise_for_status()
         payload = response.json()
+    except asyncio.TimeoutError as exc:
+        _record_provider_health("searxng", "unavailable")
+        raise AppError(
+            503,
+            "upstream_unavailable",
+            "SearXNG discovery request timed out",
+            {"provider": "searxng", "stage": "request"},
+            retryable=True,
+            retry_after=OUTAGE_RETRY_AFTER,
+        ) from exc
     except (httpx.HTTPError, ValueError) as exc:
-        raise AppError(502, "searxng_error", "SearXNG search failed", {"error": str(exc)}) from exc
+        _record_provider_health("searxng", "unavailable")
+        raise AppError(502, "searxng_error", "SearXNG search failed", {"error": type(exc).__name__}) from exc
 
+    if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
+        _record_provider_health("searxng", "unavailable")
+        raise AppError(502, "searxng_error", "SearXNG returned an invalid response")
     unresponsive = payload.get("unresponsive_engines") or []
+    if not isinstance(unresponsive, list):
+        _record_provider_health("searxng", "unavailable")
+        raise AppError(502, "searxng_error", "SearXNG returned invalid engine status")
     if unresponsive:
-        # A dead engine otherwise only shows up as fewer or zero results.
-        logger.warning("searxng engines unresponsive: %s", ", ".join(str(entry) for entry in unresponsive))
+        # A dead engine otherwise only shows up as fewer or zero results. Log names only;
+        # upstream error reasons are response data and can contain sensitive text.
+        names = sorted({str(entry[0] if isinstance(entry, (list, tuple)) else entry) for entry in unresponsive})
+        logger.warning("searxng engines unresponsive: %s", ", ".join(names))
 
     raw_results = payload.get("results", [])
-    candidates = await shape_candidates(raw_results, limit)
-    # An outage is EVERY configured engine failing, not one of them. searxng reports the
-    # engines that failed, so a single answerer is proof the pool is partly alive: an
-    # empty result set from a live engine is a real answer ("nothing matched") and must
-    # stay `ok: true, results: []`, or a partial outage becomes a fake retry loop (#986).
-    #
-    # The test is on the RAW payload, not the shaped candidates: shape_candidates drops
-    # non-public and duplicate URLs, so a healthy engine whose rows were all filtered
-    # out would otherwise be misreported as an outage and retried forever.
-    # searxng reports each dead engine as an [engine, reason] pair, not a bare name (#36).
+    # Grade raw results, before URL filtering: a healthy empty engine answer is not an outage.
     dead = {str(entry[0] if isinstance(entry, (list, tuple)) else entry).strip().lower() for entry in unresponsive}
     answered = bool(raw_results) or bool(set(configured) - dead)
     if not answered and dead:
+        _record_provider_health("searxng", "unavailable")
         raise AppError(
             503,
             "upstream_unavailable",
@@ -1024,6 +1417,19 @@ async def search_searxng(client: httpx.AsyncClient, query: str, limit: int, time
             retryable=True,
             retry_after=OUTAGE_RETRY_AFTER,
         )
+
+    candidates, complete = await shape_candidates(raw_results, limit, deadline=deadline)
+    if not complete and not candidates:
+        _record_provider_health("searxng", "unavailable")
+        raise AppError(
+            503,
+            "upstream_unavailable",
+            "SearXNG candidate validation deadline expired",
+            {"provider": "searxng", "stage": "candidate_validation"},
+            retryable=True,
+            retry_after=OUTAGE_RETRY_AFTER,
+        )
+    _record_provider_health("searxng", "ok")
     return candidates
 
 
@@ -1046,26 +1452,72 @@ def snippet_pages(candidates: list[dict]) -> list[dict]:
     ]
 
 
-async def crawl_all(client: httpx.AsyncClient, candidates: list[dict]):
-    """One bulk Crawl4AI call for the search path; per-URL fallback if bulk fails."""
-    flags = await asyncio.gather(*(is_allowed_public_url(item["url"]) for item in candidates))
+async def crawl_all(
+    client: httpx.AsyncClient, candidates: list[dict], *, deadline: float | None = None
+):
+    """Bulk crawl, recover missing candidates, and keep successes inside one deadline."""
+    loop = asyncio.get_running_loop()
+    if deadline is None:
+        deadline = loop.time() + CRAWL_TIMEOUT
+    try:
+        flags = await asyncio.wait_for(
+            asyncio.gather(*(is_allowed_public_url(item["url"]) for item in candidates)),
+            timeout=max(0, deadline - loop.time()),
+        )
+    except asyncio.TimeoutError as exc:
+        raise AppError(
+            502,
+            "crawl4ai_error",
+            "Crawl timed out while validating target URLs",
+            retryable=True,
+            retry_after=OUTAGE_RETRY_AFTER,
+        ) from exc
     allowed = [item for item, ok in zip(candidates, flags) if ok]
     if not allowed:
         return []
 
-    pages = await _bulk_crawl(client, allowed)
-    if not pages:  # transport failure OR zero parsed content: per-URL is the known-good shape
-        if pages is None:
-            logger.warning("bulk crawl failed, falling back to per-URL")
-        else:
-            logger.warning("bulk crawl returned no usable pages, falling back to per-URL")
+    bulk = await _bulk_crawl(client, allowed, deadline=deadline)
+    if bulk is None:
+        pages, retry_candidates = [], allowed
+    else:
+        pages, retry_candidates = bulk
+
+    if retry_candidates and loop.time() < deadline:
         semaphore = asyncio.Semaphore(CRAWL_CONCURRENCY)
-        results = await asyncio.gather(
-            *(crawl_with_limit(semaphore, client, item) for item in allowed),
-            return_exceptions=True,
+        tasks = [
+            asyncio.create_task(crawl_with_limit(semaphore, client, item))
+            for item in retry_candidates
+        ]
+        done = set()
+        try:
+            done, _ = await asyncio.wait(tasks, timeout=max(0, deadline - loop.time()))
+        finally:
+            pending = [task for task in tasks if not task.done()]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+        for task in tasks:
+            if task not in done or task.cancelled():
+                continue
+            try:
+                page = task.result()
+            except Exception:
+                continue
+            if isinstance(page, dict) and page.get("content"):
+                pages.append(page)
+
+    if not pages:
+        raise AppError(
+            502,
+            "crawl4ai_error",
+            "Crawl4AI returned no usable page content",
+            retryable=True,
+            retry_after=OUTAGE_RETRY_AFTER,
         )
-        pages = [page for page in results if isinstance(page, dict) and page.get("content")]
-    return pages
+    order = {item["url"]: index for index, item in enumerate(allowed)}
+    pages.sort(key=lambda page: order.get(page["_crawl_request_url"], len(order)))
+    return [{key: value for key, value in page.items() if key != "_crawl_request_url"} for page in pages]
 
 
 # Search-path crawler config. Without a markdown generator the response carries no
@@ -1085,40 +1537,73 @@ SEARCH_CRAWLER_CONFIG = {
 }
 
 
-async def _bulk_crawl(client: httpx.AsyncClient, candidates: list[dict]):
-    """Bulk crawl, mapped back to candidates. [] = no content; None = transport failure."""
+async def _bulk_crawl(
+    client: httpx.AsyncClient, candidates: list[dict], *, deadline: float | None = None
+):
+    """Return mapped pages and candidates needing recovery; None means provider failure."""
+    loop = asyncio.get_running_loop()
+    if deadline is None:
+        deadline = loop.time() + CRAWL_TIMEOUT
+    remaining = deadline - loop.time()
+    if remaining <= 0:
+        return None
     try:
-        payload = await call_crawl4ai(
-            client, {"urls": [item["url"] for item in candidates], "crawler_config": SEARCH_CRAWLER_CONFIG}
+        payload = await asyncio.wait_for(
+            call_crawl4ai(
+                client, {"urls": [item["url"] for item in candidates], "crawler_config": SEARCH_CRAWLER_CONFIG}
+            ),
+            timeout=remaining,
         )
-    except AppError:
+    except (AppError, asyncio.TimeoutError):
+        return None
+    if isinstance(payload, dict) and not crawl_result_is_usable(payload):
         return None
 
     items = payload.get("results", payload) if isinstance(payload, dict) else payload
     if not isinstance(items, list):
         items = [items]
 
-    by_url = {item["url"]: item for item in candidates}
-    claimed = set(by_url)
-    crawled_urls = [extract_crawled_url(item) for item in items]
-    contents = [extract_crawl_content(item) for item in items]
+    requested_urls = [extract_requested_url(item) for item in items]
     used = [False] * len(items)
     pages = []
-    for candidate in candidates:
-        idx = next((i for i, url in enumerate(crawled_urls) if not used[i] and url == candidate["url"]), None)
-        if idx is None:  # redirected/normalized URL no other candidate claims
-            idx = next(
-                (i for i, url in enumerate(crawled_urls) if not used[i] and url and url not in claimed and contents[i]),
-                None,
-            )
-        if idx is None or not contents[idx]:
+    retry_candidates = []
+    for candidate_index, candidate in enumerate(candidates):
+        if loop.time() >= deadline:
+            retry_candidates.extend(candidates[candidate_index:])
+            break
+        idx = next(
+            (i for i, url in enumerate(requested_urls) if not used[i] and url == candidate["url"]),
+            None,
+        )
+        if idx is None:
+            retry_candidates.append(candidate)
             continue
+
         used[idx] = True
-        url = crawled_urls[idx] or candidate["url"]
-        if url != candidate["url"] and not await is_allowed_public_url(url):
+        crawled_url = extract_crawled_url(items[idx]) or candidate["url"]
+        if crawled_url != candidate["url"]:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                retry_candidates.extend(candidates[candidate_index:])
+                break
+            try:
+                allowed = await asyncio.wait_for(is_allowed_public_url(crawled_url), timeout=remaining)
+            except asyncio.TimeoutError:
+                retry_candidates.extend(candidates[candidate_index:])
+                break
+            if not allowed:
+                continue
+        content = extract_crawl_content(items[idx])
+        if not content:
+            retry_candidates.append(candidate)
             continue
-        pages.append({**candidate, "url": url, "content": contents[idx]})
-    return pages
+        pages.append({
+            **candidate,
+            "url": crawled_url,
+            "content": content,
+            "_crawl_request_url": candidate["url"],
+        })
+    return pages, retry_candidates
 
 
 async def crawl_with_limit(semaphore: asyncio.Semaphore, client: httpx.AsyncClient, result: dict):
@@ -1130,28 +1615,74 @@ async def crawl_url(client: httpx.AsyncClient, result: dict):
     if not await is_allowed_public_url(result["url"]):
         return None
 
-    try:
-        # Same cleaned extraction as the bulk call: this is the per-URL fallback,
-        # and without the config it would quietly hand back raw nav markdown.
-        payload = await call_crawl4ai(
-            client, {"urls": [result["url"]], "crawler_config": SEARCH_CRAWLER_CONFIG}
-        )
-    except AppError:
-        return None
-
-    crawled_url = extract_crawled_url(payload)
-    if crawled_url and not await is_allowed_public_url(crawled_url):
+    payload = await call_crawl4ai(
+        client, {"urls": [result["url"]], "crawler_config": SEARCH_CRAWLER_CONFIG}
+    )
+    crawled_url = extract_crawled_url(payload) or result["url"]
+    if crawled_url != result["url"] and not await is_allowed_public_url(crawled_url):
         return None
 
     content = extract_crawl_content(payload)
     if not content:
         return None
-    return {**result, "content": content}
+    return {
+        **result,
+        "url": crawled_url,
+        "content": content,
+        "_crawl_request_url": result["url"],
+    }
 
 
 async def crawl_direct_url(client: httpx.AsyncClient, request: CrawlRequest):
     if not await is_allowed_public_url(request.url):
         raise AppError(422, "invalid_url", "URL must be a public http(s) URL")
+
+    if (
+        supports_markdown_crawl(request)
+        and not is_pdf_target(request.url)
+        and firecrawl_url_allowed(request.url)
+    ):
+        firecrawl_deadline = asyncio.get_running_loop().time() + CRAWL_TIMEOUT
+        try:
+            response = await firecrawl_request(
+                client,
+                "/v2/scrape",
+                firecrawl_scrape_payload(request.url),
+                timeout=max(firecrawl_deadline - asyncio.get_running_loop().time(), 0.0),
+            )
+        except FirecrawlUnavailable as exc:
+            if exc.category == "policy_denied":
+                _record_provider_health("firecrawl", "ok")
+                raise AppError(
+                    422,
+                    "firecrawl_policy_denied",
+                    "The requested target is not available under provider policy",
+                    {"provider": "firecrawl"},
+                    retryable=False,
+                ) from exc
+            if exc.category != "provider_routed_domain":
+                _record_provider_health(
+                    "firecrawl", "not_configured" if exc.category == "not_configured" else "unavailable"
+                )
+                if exc.category != "not_configured":
+                    logger.warning("firecrawl scrape failed (%s)", exc.category)
+        else:
+            if response.status_code < 500:
+                _record_provider_health("firecrawl", "ok")
+            try:
+                reported_url_allowed = await firecrawl_metadata_url_is_public(response, firecrawl_deadline)
+            except asyncio.TimeoutError as exc:
+                raise AppError(
+                    503,
+                    "upstream_unavailable",
+                    "Firecrawl returned a URL that could not be validated before the deadline",
+                    retryable=True,
+                ) from exc
+            if not reported_url_allowed:
+                raise AppError(422, "invalid_crawled_url", "Crawled URL must be a public http(s) URL")
+            result = firecrawl_scrape_result(response, request.url)
+            if result is not None:
+                return result
 
     payload = await call_crawl4ai(client, build_crawl_payload(request))
     crawled_url = extract_crawled_url(payload) or request.url
@@ -1269,6 +1800,8 @@ CRAWL_FORBIDDEN_KEYS = frozenset({
 _CRAWL_SCALARS = (str, bool, int, float)
 CRAWL_ALLOWED_KEYS_HINT = ", ".join(sorted(CRAWL_ALLOWED_KEYS))
 CRAWL_MAX_RETRIES = 2
+CRAWL_MAX_DELAY_SECONDS = 60
+CRAWL_DELAY_KEYS = frozenset({"delay_before_return_html", "mean_delay", "max_range"})
 
 
 def _crawl_violation(loc: list[str], message: str) -> dict[str, Any]:
@@ -1295,6 +1828,17 @@ def _crawl_value_violation(key: str, value: Any) -> str | None:
         isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= CRAWL_MAX_RETRIES
     ):
         return f"'max_retries' must be an integer between 0 and {CRAWL_MAX_RETRIES}"
+    if key in CRAWL_DELAY_KEYS and not (
+        (
+            isinstance(value, int) and not isinstance(value, bool)
+            and 0 <= value <= CRAWL_MAX_DELAY_SECONDS
+        )
+        or (
+            isinstance(value, float) and math.isfinite(value)
+            and 0 <= value <= CRAWL_MAX_DELAY_SECONDS
+        )
+    ):
+        return f"'{key}' must be a finite number between 0 and {CRAWL_MAX_DELAY_SECONDS} seconds"
     if key == "cache_mode" and not (isinstance(value, str) and value.lower() in CRAWL_CACHE_MODES):
         return f"'cache_mode' must be one of: {', '.join(CRAWL_CACHE_MODES)}"
     return None
@@ -1419,8 +1963,9 @@ def filtered_openapi(surface: Literal["search", "crawl"]):
         schema["info"]["title"] = "SparkFN Web Search API"
         schema["info"]["description"] = (
             "Tool-facing API for web discovery plus extracted, reranked page content. Use this service when an agent, CLI, or MCP tool "
-            "has a natural-language question/topic and needs current web evidence. The pipeline is: SearXNG discovers candidate URLs, "
-            "internal Crawl4AI extracts content from public pages, and the reranker returns the most relevant extracted chunks.\n\n"
+            "has a natural-language question/topic and needs current web evidence. The pipeline is: Firecrawl discovers web candidates "
+            "when configured, Brave and SearXNG fill fallbacks, eligible Firecrawl results are scraped once through Firecrawl, other pages "
+            "use internal Crawl4AI, and the reranker returns the most relevant extracted chunks.\n\n"
             "How to use: send POST /search with JSON body {\"query\": \"your concise query\", \"max_results\": 5, \"candidates\": 10} "
             "and an X-API-Key header. Start with max_results 3-5 and candidates 10. Increase candidates only when recall matters more than latency. "
             "An empty results array is a successful no-results response, not a failure."
@@ -1449,6 +1994,45 @@ def filtered_openapi(surface: Literal["search", "crawl"]):
     return schema
 
 
+def crawl_result_is_usable(payload) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if "success" in payload and payload["success"] is not True:
+        return False
+    if payload.get("error_message"):
+        return False
+
+    status = payload.get("status_code")
+    if status is not None and (
+        not isinstance(status, int) or isinstance(status, bool) or not 200 <= status < 300
+    ):
+        return False
+
+    raw_headers = payload.get("response_headers")
+    if raw_headers is not None and not isinstance(raw_headers, dict):
+        return False
+    headers = {str(key).lower(): str(value).lower() for key, value in (raw_headers or {}).items()}
+    content_type = headers.get("content-type", "").split(";", 1)[0].strip()
+    if content_type and not (
+        content_type.startswith("text/")
+        or content_type in {"application/json", "application/pdf", "application/xhtml+xml", "application/xml"}
+        or content_type.endswith(("+json", "+xml"))
+    ):
+        return False
+
+    metadata = payload.get("metadata")
+    title = str(metadata.get("title", "")).strip().lower() if isinstance(metadata, dict) else ""
+    cloudflare = "cloudflare" in headers.get("server", "") or "cf-ray" in headers
+    html = payload.get("html") if isinstance(payload.get("html"), str) else ""
+    if headers.get("cf-mitigated") == "challenge":
+        return False
+    if title in {"just a moment...", "attention required! | cloudflare"} and (
+        cloudflare or "/cdn-cgi/challenge-platform/" in html.lower()
+    ):
+        return False
+    return True
+
+
 def extract_crawl_content(payload, preferred_format: str = "markdown"):
     if isinstance(payload, list):
         for item in payload:
@@ -1457,7 +2041,7 @@ def extract_crawl_content(payload, preferred_format: str = "markdown"):
                 return content
         return ""
 
-    if not isinstance(payload, dict):
+    if not isinstance(payload, dict) or not crawl_result_is_usable(payload):
         return ""
 
     format_keys = [preferred_format, "markdown", "fit_markdown", "cleaned_html", "text", "content", "html"]
@@ -1484,6 +2068,28 @@ def extract_crawl_content(payload, preferred_format: str = "markdown"):
     return ""
 
 
+def extract_requested_url(payload):
+    if isinstance(payload, list):
+        for item in payload:
+            url = extract_requested_url(item)
+            if url:
+                return url
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+
+    for key in ("requested_url", "original_url", "url"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    for key in ("result", "results", "data"):
+        url = extract_requested_url(payload.get(key))
+        if url:
+            return url
+    return None
+
+
 def extract_crawled_url(payload):
     if isinstance(payload, list):
         for item in payload:
@@ -1495,15 +2101,14 @@ def extract_crawled_url(payload):
     if not isinstance(payload, dict):
         return None
 
-    value = payload.get("url")
-    if isinstance(value, str):
-        return value
-
+    for key in ("redirected_url", "final_url", "url"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
     for key in ("result", "results", "data"):
         url = extract_crawled_url(payload.get(key))
         if url:
             return url
-
     return None
 
 
@@ -1691,18 +2296,50 @@ async def cross_encode(client: httpx.AsyncClient, query: str, documents: list[st
         return None
 
 
+def query_aligned_passage(query: str, content: str) -> str:
+    width = RERANK_MAX_CHARS
+    if width <= 0:
+        return ""
+    if len(content) <= width:
+        return content
+
+    last = len(content) - width
+    starts = list(range(0, last + 1, max(width // 2, 1)))
+    if starts[-1] != last:
+        starts.append(last)
+    windows = [content[start : start + width] for start in starts]
+    scores = lexical_scores(query, windows)
+    return windows[max(range(len(windows)), key=scores.__getitem__)]
+
+
 async def rerank(client: httpx.AsyncClient, query: str, chunks: list[dict], top_k: int):
     """Two-stage rerank. Returns (results, path) where path names the ranking that won."""
     if not chunks:
         return [], "empty"
 
-    # Stage 1: cheap lexical pass decides which chunks the cross-encoder sees at all.
+    # Stage 1: reserve scored slots for distinct sources before filling by lexical rank.
     lexical = lexical_scores(query, [chunk["content"] for chunk in chunks])
     by_lexical = sorted(range(len(chunks)), key=lambda index: lexical[index], reverse=True)
-    head, tail = by_lexical[:RERANK_PREFILTER], by_lexical[RERANK_PREFILTER:]
+    head = []
+    seen_urls = set()
+    for index in by_lexical:
+        if len(head) >= RERANK_PREFILTER:
+            break
+        url = chunks[index]["url"]
+        if url not in seen_urls:
+            head.append(index)
+            seen_urls.add(url)
+    selected = set(head)
+    for index in by_lexical:
+        if len(head) >= RERANK_PREFILTER:
+            break
+        if index not in selected:
+            head.append(index)
+            selected.add(index)
+    tail = [index for index in by_lexical if index not in selected]
 
-    # Stage 2: cross-encoder over the prefiltered head, blended with discovery rank.
-    passages = [chunks[index]["content"][:RERANK_MAX_CHARS] for index in head]
+    # Stage 2: cross-encoder over the source-diverse head, blended with discovery rank.
+    passages = [query_aligned_passage(query, chunks[index]["content"]) for index in head]
     cross_encoder = await cross_encode(client, query, passages)
     if cross_encoder is None:
         order = [(index, None) for index in by_lexical]
@@ -1749,15 +2386,23 @@ DNS_TTL = 60.0
 
 
 async def is_allowed_public_url(url: str):
-    parsed = urlparse(url)
-    if not _url_prefix_ok(parsed):
+    try:
+        parsed = urlparse(url)
+        if not _url_prefix_ok(parsed):
+            return False
+        port = parsed.port
+        hostname = (parsed.hostname or "").rstrip(".").lower()
+    except (TypeError, ValueError):
         return False
-    hostname = (parsed.hostname or "").rstrip(".").lower()
+
     async with _dns_lock:
         hit = _dns_cache.get(hostname)
     now = asyncio.get_running_loop().time()
     if hit is None or hit[0] <= now:
-        verdict = await asyncio.to_thread(_host_resolves_public, hostname, parsed.port)
+        try:
+            verdict = await asyncio.to_thread(_host_resolves_public, hostname, port)
+        except UnicodeError:
+            return False
         async with _dns_lock:
             _dns_cache[hostname] = (asyncio.get_running_loop().time() + DNS_TTL, verdict)
         return verdict
@@ -1782,7 +2427,7 @@ def _host_resolves_public(hostname: str, port) -> bool:
 
 
 def is_public_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address):
-    return not any(
+    return ip.is_global and not any(
         (
             ip.is_private,
             ip.is_loopback,
@@ -1790,6 +2435,7 @@ def is_public_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address):
             ip.is_multicast,
             ip.is_reserved,
             ip.is_unspecified,
+            getattr(ip, "is_site_local", False),
         )
     )
 

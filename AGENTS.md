@@ -1,7 +1,7 @@
 # Agent policy
 
 ## Facts an agent cannot guess
-- **No CI.** Nothing runs on push or PR. Run the test scripts yourself (README "Tests") and put the output in the PR body.
+- **PRCI.** Pull requests targeting `main` run the pinned API dependency check and fail-fast assert scripts in Python 3.15 (`.woodpecker/pr.yml`). Packaged Docker-image regression remains a separate required check; CI does not deploy. Record actual CI and packaged-image evidence in the batch PR body.
 - **Deploy is manual** on lab-001 (README "Deploy"). Merging does not ship. Deploying needs the owner's go-ahead.
 - **Traefik routes live in `sparkfn/lab-001-cluster`**, not here.
 - **`searxng/settings.yml` and `SEARXNG_ENGINES` in `api/app.py` must name the same engines.** Check the pinned image's `/config` before adding an engine.

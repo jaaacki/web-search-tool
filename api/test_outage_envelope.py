@@ -27,13 +27,16 @@ def use(handler):
     helper does not exist, and a test that dies on a missing test helper proves
     nothing. These checks must fail on their own behavioural assertion instead.
     """
-    saved = app.get_client
+    saved_client = app.get_client
+    saved_url_check = app.is_allowed_public_url
     app.get_client = lambda: asyncio.sleep(0, result=client(handler))
-    getattr(app, "health_cache_reset", lambda: None)()
+    app.is_allowed_public_url = lambda url: asyncio.sleep(0, result=not url.startswith("http://localhost"))
+    app.health_cache_reset()
 
     def restore():
-        app.get_client = saved
-        getattr(app, "health_cache_reset", lambda: None)()
+        app.get_client = saved_client
+        app.is_allowed_public_url = saved_url_check
+        app.health_cache_reset()
 
     return restore
 
@@ -124,11 +127,14 @@ def test_genuinely_empty_results_are_not_an_outage():
 
 def test_partial_outage_still_returns_results():
     # One dead engine must not fail a search the other engines answered.
+    restore = use(partial_pool)
     exc = None
     try:
         run(app.search_searxng(client(partial_pool), "anything", 5))
     except app.AppError as caught:
         exc = caught
+    finally:
+        restore()
     assert exc is None, f"a partial outage was escalated: {exc}"
 
 
@@ -172,9 +178,10 @@ def test_search_endpoint_returns_the_error_envelope():
 
 
 def test_health_fails_during_a_total_outage():
-    # Health used to echo its configured URLs, so it stayed green while search was dead.
+    # Health consumes the last real provider outcome rather than launching a query.
     restore = use(dead_pool)
     try:
+        raises_app_error(app.search_searxng(client(dead_pool), "anything", 1))
         exc = raises_app_error(app.health())
         assert exc.status_code == 503, exc.status_code
         assert exc.code == "upstream_unavailable", exc.code
@@ -182,8 +189,7 @@ def test_health_fails_during_a_total_outage():
         restore()
 
 
-def test_health_actually_issues_a_query():
-    # The probe must reach searxng's /search, not just read a config value.
+def test_health_does_not_issue_a_search():
     seen: list[str] = []
 
     def watcher(request: httpx.Request) -> httpx.Response:
@@ -193,7 +199,8 @@ def test_health_actually_issues_a_query():
     restore = use(watcher)
     try:
         run(app.health())
-        assert "/search" in seen, f"health never queried an engine; saw {seen}"
+        assert "/healthz" in seen, f"health did not probe SearXNG readiness; saw {seen}"
+        assert "/search" not in seen, f"health issued a search request; saw {seen}"
     finally:
         restore()
 
@@ -201,6 +208,7 @@ def test_health_actually_issues_a_query():
 def test_health_is_green_when_engines_answer():
     restore = use(answered_with_results)
     try:
+        run(app.search_searxng(client(answered_with_results), "anything", 1))
         envelope = run(app.health())
         assert envelope.ok is True
         assert envelope.data.checks["searxng"] == "ok", envelope.data.checks
@@ -208,33 +216,37 @@ def test_health_is_green_when_engines_answer():
         restore()
 
 
-def test_health_canary_is_bounded_by_health_timeout():
-    # The canary runs through search_searxng, which hardcoded a 10s search timeout.
-    # Health is polled, so it must be bounded by HEALTH_TIMEOUT instead — otherwise a
-    # hung backend makes every poll block for the full search timeout. Asserted through
-    # the signature so the failure is about the missing bound, not a missing test hook.
-    import inspect
+def test_health_service_probes_are_bounded_by_health_timeout():
+    seen = []
 
-    params = inspect.signature(app.search_searxng).parameters
-    assert "timeout" in params, f"search_searxng takes no timeout; health cannot be bounded: {params}"
-    assert getattr(app, "HEALTH_TIMEOUT", None) is not None, "HEALTH_TIMEOUT is gone"
-    assert app.HEALTH_TIMEOUT < app.SEARCH_TIMEOUT, (
-        f"health canary must be bounded below the search timeout "
-        f"(health={app.HEALTH_TIMEOUT}, search={app.SEARCH_TIMEOUT})"
-    )
+    class CapturingClient:
+        async def get(self, url, headers=None, timeout=None):
+            seen.append(timeout)
+            return httpx.Response(200)
+
+    saved = app.get_client
+    app.get_client = lambda: asyncio.sleep(0, result=CapturingClient())
+    try:
+        assert run(app.probe_service("http://probe", "/health")) == "ok"
+        assert seen == [app.HEALTH_TIMEOUT], seen
+    finally:
+        app.get_client = saved
 
 
 def test_searxng_is_told_to_answer_inside_the_budget():
-    # Without timeout_limit searxng waits out its slowest engine (8s) and the 5s canary
-    # times out even though the other engines answered (#36).
+    # Without timeout_limit searxng can wait out its slowest engine (#36).
     sent: list[float] = []
 
     def watcher(request: httpx.Request) -> httpx.Response:
         sent.append(float(request.url.params["timeout_limit"]))
         return answered_with_results(request)
 
-    run(app.search_searxng(client(watcher), "anything", 5, timeout=app.HEALTH_TIMEOUT))
-    assert sent and sent[0] < app.HEALTH_TIMEOUT, sent
+    restore = use(watcher)
+    try:
+        run(app.search_searxng(client(watcher), "anything", 5, timeout=app.HEALTH_TIMEOUT))
+        assert sent and sent[0] < app.HEALTH_TIMEOUT, sent
+    finally:
+        restore()
 
 
 def test_search_still_gets_the_search_timeout():
@@ -270,11 +282,14 @@ def test_health_outage_body_reports_every_service():
     # red health check should learn WHICH dependency broke, not just that one did.
     restore = use(dead_pool)
     try:
+        raises_app_error(app.search_searxng(client(dead_pool), "anything", 1))
         exc = raises_app_error(app.health())
         checks = (exc.details or {}).get("checks")
         assert isinstance(checks, dict), exc.details
-        assert set(checks) == {"searxng", "crawl4ai", "reranker"}, checks
-        assert checks["searxng"].startswith("unavailable"), checks
+        assert set(checks) == {"firecrawl", "brave", "searxng", "searxng_service", "crawl4ai", "reranker"}, checks
+        assert checks["firecrawl"] == "unknown", checks
+        assert checks["searxng"] == "unavailable", checks
+        assert checks["brave"] == "not_configured", checks
     finally:
         restore()
 
@@ -334,7 +349,7 @@ def test_zero_configured_engines_fails_the_health_searxng_check():
         assert exc.status_code == 503, exc.status_code
         checks = (exc.details or {}).get("checks")
         assert isinstance(checks, dict), exc.details
-        assert checks["searxng"].startswith("unavailable"), checks
+        assert checks["searxng"] == "not_configured", checks
     finally:
         app.SEARXNG_ENGINES = saved
         restore()
