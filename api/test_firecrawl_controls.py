@@ -216,38 +216,56 @@ def test_team_exhaustion_fails_over_only_to_an_independent_budget():
     ], seen
 
 
-def test_positive_or_malformed_usage_never_rotates_to_siblings_or_backup():
+def test_positive_balance_blocks_during_cooldown_then_retries_same_key():
     seen = []
+    posts = 0
 
     def handler(request):
+        nonlocal posts
         key = request.headers["Authorization"]
         seen.append((request.url.path, key))
         if request.url.path == "/v2/search":
-            return response(request, 402, {"success": False, "error": "Insufficient credits"})
+            posts += 1
+            if posts == 1:
+                return response(request, 402, {"success": False, "error": "Insufficient credits"})
+            return response(request, 200)
         if request.url.path == fc.CREDIT_USAGE_PATH:
             return response(request, 200, {"success": True, "data": {"remainingCredits": 3}})
         raise AssertionError(f"unexpected request {request.url}")
 
     async def check():
         with tempfile.TemporaryDirectory() as tmp:
-            transport = httpx.MockTransport(handler)
-            async with httpx.AsyncClient(transport=transport) as client:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
                 instance = controls(
                     tmp,
                     [("team-a", ["primary", "sibling"]), ("team-b", ["independent"])],
                 )
-                for _ in range(2):
-                    try:
-                        await instance.request(client, "/v2/search", {"query": "q"}, timeout=2)
-                    except fc.FirecrawlUnavailable as exc:
-                        assert exc.category == "key_cap_or_ambiguous", exc.category
-                    else:
-                        raise AssertionError("ambiguous 402 was treated as success")
+                try:
+                    await instance.request(client, "/v2/search", {"query": "q"}, timeout=2)
+                except fc.FirecrawlUnavailable as exc:
+                    assert exc.category == "key_cap_or_ambiguous", exc.category
+                else:
+                    raise AssertionError("positive-balance 402 was treated as team exhaustion")
+
+                try:
+                    await instance.request(client, "/v2/search", {"query": "q"}, timeout=2)
+                except fc.FirecrawlUnavailable as exc:
+                    assert exc.category == "key_cap_or_ambiguous", exc.category
+                else:
+                    raise AssertionError("request bypassed the positive-balance cooldown")
+
+                state = instance._read_state()
+                state["budgets"]["team-a"]["next_check"] = time.monotonic() - 1
+                instance._write_state(state)
+                result = await instance.request(client, "/v2/search", {"query": "q"}, timeout=2)
+                assert result.status_code == 200, result.status_code
 
     run(check())
     assert seen == [
         ("/v2/search", "Bearer primary"),
         (fc.CREDIT_USAGE_PATH, "Bearer primary"),
+        (fc.CREDIT_USAGE_PATH, "Bearer primary"),
+        ("/v2/search", "Bearer primary"),
     ], seen
 
 
