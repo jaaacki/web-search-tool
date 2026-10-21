@@ -847,46 +847,46 @@ class BraveKeyPool:
         self._index = 0
         self._lock = asyncio.Lock()
         self._cooled_until = [0.0] * len(self._keys)
-        self._last_retry_after: float | None = None
         # ponytail: in-memory counters reset on restart; persist when real metrics exist
         self._calls = [0] * len(self._keys)
 
     def __bool__(self):
         return bool(self._keys)
 
-    async def search(self, client: httpx.AsyncClient, query: str, limit: int, deadline: float):
-        """Candidate dicts, or None when no key can answer within the request budget."""
-        self._last_retry_after = None
+    async def search(
+        self, client: httpx.AsyncClient, query: str, limit: int, deadline: float
+    ) -> tuple[list[dict] | None, float | None]:
+        """Candidates and this request's Retry-After, or None when no key can answer."""
+        retry_after: float | None = None
         tried = 0
         while tried < len(self._keys):
             if deadline <= asyncio.get_running_loop().time():
                 _record_provider_health("brave", "unavailable")
-                return None
+                return None, retry_after
             key_idx = await self._take_key()
             if key_idx is None:
                 logger.warning("brave pool exhausted (all %d keys cooling)", len(self._keys))
                 _record_provider_health("brave", "unavailable")
-                return None
+                return None, retry_after
             tried += 1
             try:
                 results = await self._search_with_key(client, key_idx, query, limit, deadline)
             except _BraveKeyError as exc:
                 self._cool(key_idx, exc.cooldown)
                 if exc.reason == "rate_limited":
-                    self._last_retry_after = max(self._last_retry_after or 0.0, exc.cooldown)
+                    retry_after = max(retry_after or 0.0, exc.cooldown)
                 logger.warning("brave key %d failed (%s), cooling %.0fs", key_idx, exc.reason, exc.cooldown)
                 if exc.partial:
                     self._calls[key_idx] += 1
                     _record_provider_health("brave", "ok")
-                    return exc.partial[:limit]
+                    return exc.partial[:limit], retry_after
                 continue
             self._calls[key_idx] += 1
-            self._last_retry_after = None
             _record_provider_health("brave", "ok")
             logger.info("brave key %d ok (%d candidates, %d calls)", key_idx, len(results), self._calls[key_idx])
-            return results[:limit]
+            return results[:limit], None
         _record_provider_health("brave", "unavailable")
-        return None
+        return None, retry_after
 
     async def _take_key(self):
         async with self._lock:
@@ -899,7 +899,8 @@ class BraveKeyPool:
         return None
 
     def _cool(self, key_idx: int, cooldown: float):
-        self._cooled_until[key_idx] = asyncio.get_running_loop().time() + max(cooldown, 0.0)
+        until = asyncio.get_running_loop().time() + max(cooldown, 0.0)
+        self._cooled_until[key_idx] = max(self._cooled_until[key_idx], until)
 
     async def _search_with_key(self, client: httpx.AsyncClient, key_idx: int, query: str, limit: int, deadline: float):
         items: list[dict] = []
@@ -911,16 +912,19 @@ class BraveKeyPool:
                     if items:
                         break
                     raise _BraveKeyError("deadline_exceeded", 0.0)
-                response = await client.get(
-                    BRAVE_SEARCH_URL,
-                    params={
-                        "q": query,
-                        "count": BRAVE_PAGE_SIZE,
-                        "offset": page_index,
-                        "text_decorations": False,
-                    },
-                    headers={"X-Subscription-Token": self._keys[key_idx], "Accept": "application/json"},
-                    timeout=min(BRAVE_TIMEOUT, remaining),
+                response = await asyncio.wait_for(
+                    client.get(
+                        BRAVE_SEARCH_URL,
+                        params={
+                            "q": query,
+                            "count": BRAVE_PAGE_SIZE,
+                            "offset": page_index,
+                            "text_decorations": False,
+                        },
+                        headers={"X-Subscription-Token": self._keys[key_idx], "Accept": "application/json"},
+                        timeout=min(BRAVE_TIMEOUT, remaining),
+                    ),
+                    timeout=remaining,
                 )
                 if response.status_code == 429:
                     raise _BraveKeyError("rate_limited", _retry_after(response, 300.0))
@@ -958,6 +962,8 @@ class BraveKeyPool:
         except _BraveKeyError as exc:
             exc.partial = items
             raise
+        except asyncio.TimeoutError as exc:
+            raise _BraveKeyError("request_timeout", 60.0, items) from exc
         except (httpx.HTTPError, ValueError) as exc:
             raise _BraveKeyError("request_failed", 60.0, items) from exc
         return items[:limit]
@@ -994,10 +1000,11 @@ async def discover_candidates(client: httpx.AsyncClient, query: str, limit: int)
     answered = False
 
     if BRAVE_POOL:
+        brave_retry_after: float | None = None
         remaining = deadline - loop.time()
         if remaining > 0:
             try:
-                brave = await BRAVE_POOL.search(client, query, limit, deadline)
+                brave, brave_retry_after = await BRAVE_POOL.search(client, query, limit, deadline)
                 if brave is None:
                     failures["brave"] = "unavailable"
                 else:
@@ -1020,8 +1027,8 @@ async def discover_candidates(client: httpx.AsyncClient, query: str, limit: int)
         else:
             failures["brave"] = "deadline_exceeded"
             _record_provider_health("brave", "unavailable")
-        if BRAVE_POOL._last_retry_after is not None:
-            retry_afters.append(BRAVE_POOL._last_retry_after)
+        if brave_retry_after is not None:
+            retry_afters.append(brave_retry_after)
 
     if len(candidates) < limit:
         remaining = deadline - loop.time()

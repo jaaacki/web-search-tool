@@ -95,6 +95,55 @@ def test_retry_after_accepts_seconds_and_http_date():
     assert app._retry_after(response, 300) == 300
 
 
+def test_concurrent_brave_calls_keep_retry_after_per_request():
+    async def exercise():
+        pool = app.BraveKeyPool(("test-key",))
+        long_started = asyncio.Event()
+        short_finished = asyncio.Event()
+        long_finished = asyncio.Event()
+
+        class ConcurrentClient:
+            async def get(self, url, params, headers, timeout):
+                if params["q"] == "long":
+                    long_started.set()
+                    await short_finished.wait()
+                    return httpx.Response(429, headers={"Retry-After": "300"})
+                await long_started.wait()
+                return httpx.Response(429, headers={"Retry-After": "20"})
+
+        client = ConcurrentClient()
+        deadline = asyncio.get_running_loop().time() + 5
+
+        async def long_request():
+            result = await pool.search(client, "long", 5, deadline)
+            long_finished.set()
+            return result
+
+        async def short_request():
+            result = await pool.search(client, "short", 5, deadline)
+            short_finished.set()
+            await long_finished.wait()
+            return result
+
+        long, short = await asyncio.gather(long_request(), short_request())
+        return long, short
+
+    long, short = run(exercise())
+    assert long == (None, 300), long
+    assert short == (None, 20), short
+
+
+def test_shorter_concurrent_cooldown_never_shortens_key_cooldown():
+    async def exercise():
+        pool = app.BraveKeyPool(("test-key",))
+        pool._cool(0, 300)
+        long_cooldown = pool._cooled_until[0]
+        pool._cool(0, 20)
+        assert pool._cooled_until[0] >= long_cooldown
+
+    run(exercise())
+
+
 def test_discovery_outage_returns_retryable_error_and_does_not_retry_searxng():
     paths = []
     saved_pool = app.BRAVE_POOL
@@ -121,38 +170,28 @@ def test_discovery_outage_returns_retryable_error_and_does_not_retry_searxng():
         app.health_cache_reset()
 
 
-def test_discovery_deadline_returns_retryable_error_without_restarting_fallback():
+def test_brave_response_is_bounded_by_the_discovery_deadline():
     saved_pool = app.BRAVE_POOL
     saved_timeout = app.DISCOVERY_TIMEOUT
-    calls = []
+    app.BRAVE_POOL = app.BraveKeyPool(("test-key",))
+    app.DISCOVERY_TIMEOUT = 0.02
 
-    class SlowPool:
-        _last_retry_after = None
+    class SlowClient:
+        async def get(self, *args, **kwargs):
+            await asyncio.sleep(0.2)
+            return httpx.Response(200, json={"web": {"results": []}})
 
-        def __bool__(self):
-            return True
-
-        async def search(self, client, query, limit, deadline):
-            remaining = deadline - asyncio.get_running_loop().time()
-            await asyncio.wait_for(asyncio.sleep(1), timeout=remaining)
-
-    app.BRAVE_POOL = SlowPool()
-    app.DISCOVERY_TIMEOUT = 0.01
-
-    def handler(request):
-        calls.append(request.url.path)
-        return httpx.Response(503)
-
+    started = time.monotonic()
     try:
         try:
-            run(app.discover_candidates(client(handler), "q", 5))
+            run(app.discover_candidates(SlowClient(), "q", 5))
         except app.AppError as exc:
             assert exc.retryable is True
             assert exc.code == "upstream_unavailable"
-            assert exc.details["providers"] == {"brave": "timeout", "searxng": "deadline_exceeded"}
+            assert exc.details["providers"] == {"brave": "unavailable", "searxng": "deadline_exceeded"}
         else:
             raise AssertionError("discovery deadline became an empty success")
-        assert calls == [], calls
+        assert time.monotonic() - started < 0.15
     finally:
         app.BRAVE_POOL = saved_pool
         app.DISCOVERY_TIMEOUT = saved_timeout
