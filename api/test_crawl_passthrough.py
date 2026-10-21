@@ -22,6 +22,9 @@ ALLOWED = [
     ("crawler_config", {"exclude_domains": ["example.com"]}),
     ("crawler_config", {"cache_mode": "BYPASS"}),
     ("crawler_config", {"wait_for": "css:main article"}),
+    ("crawler_config", {"delay_before_return_html": 60}),
+    ("crawler_config", {"mean_delay": 0.5}),
+    ("crawler_config", {"max_range": 60.0}),
     ("crawler_config", {"max_retries": 2}),
     ("crawl_options", {"screenshot": True}),
     ("crawl_options", {"css_selector": "h1"}),
@@ -42,6 +45,9 @@ FORBIDDEN = [
     ("crawler_config", {"wait_for": "() => true"}),
     ("crawler_config", {"wait_for": "fetch('http://169.254.169.254/')"}),
     ("crawler_config", {"max_retries": 3}),
+    ("crawler_config", {"delay_before_return_html": 60.1}),
+    ("crawler_config", {"mean_delay": -0.1}),
+    ("crawler_config", {"max_range": True}),
     ("crawler_config", {"cache_mode": "nope"}),
     ("crawl_options", {"llm_config": {}}),
     ("crawl_options", {"urls": ["http://169.254.169.254/"]}),
@@ -101,6 +107,11 @@ def demo() -> None:
             raise AssertionError(f"expected the request model to refuse {field}")
 
     assert rejects("crawler_config", {"wait_for": "js:1"})["loc"] == ["crawler_config", "wait_for"]
+    assert rejects("crawler_config", {"delay_before_return_html": 60.1})["loc"] == ["crawler_config", "delay_before_return_html"]
+    assert rejects("crawler_config", {"mean_delay": -0.1})["loc"] == ["crawler_config", "mean_delay"]
+    assert rejects("crawler_config", {"mean_delay": float("nan")})["loc"] == ["crawler_config", "mean_delay"]
+    assert rejects("crawler_config", {"max_range": float("inf")})["loc"] == ["crawler_config", "max_range"]
+    assert rejects("crawler_config", {"max_range": True})["loc"] == ["crawler_config", "max_range"]
     assert rejects("crawler_config", {"max_retries": 3})["loc"] == ["crawler_config", "max_retries"]
     assert rejects("crawler_config", {"browser_config": {"headless": True}})["loc"][1] == "browser_config"
     assert "allowed keys:" in rejects("crawler_config", {"nope": 1})["msg"]

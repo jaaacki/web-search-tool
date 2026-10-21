@@ -41,6 +41,8 @@ curl -fsS https://websearch.sparkfn.io/health
 
 `/health` sends a real canary query through SearXNG. It returns 503 only when no engine answers; a partial engine outage stays 200.
 
+Crawl4AI is pinned to the 0.9.5 multi-platform image digest in `docker-compose.yml`; its bundled Chrome for Testing is 156.0.8078.4. To roll back, restore `unclecode/crawl4ai:0.9.4` and set `CRAWL4AI_CHROMIUM_VERSION=153.0.8010.12` in `.env`. Crawl4AI 0.9.5 now verifies TLS certificates, refuses JavaScript `wait_for` conditions, and caps its delay fields at 60 seconds; the public API rejects negative, non-finite, or over-limit values for `delay_before_return_html`, `mean_delay`, and `max_range`.
+
 ## Tests
 
 No framework; each file is a self-running assert script:
@@ -140,7 +142,7 @@ The API fills every crawl — search-path and `/crawl` — with server-owned bro
 a fixed viewport/locale/timezone, `remove_overlay_elements`, and a small post-load delay. Callers
 cannot change or disable these, and the fill only adds keys a caller left unset.
 
-`CRAWL4AI_CHROMIUM_VERSION` in `.env` must be bumped together with the Crawl4AI image tag: it is the
+`CRAWL4AI_CHROMIUM_VERSION` in `.env` must be bumped together with the Crawl4AI image pin: it is the
 Chrome version in the UA string, and a UA that disagrees with the engine is itself a signal.
 
 These defaults do not defeat a Cloudflare JS challenge or a DataDome captcha — see #15.
