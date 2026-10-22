@@ -2,13 +2,17 @@
 
 import asyncio
 import logging
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
+from pathlib import Path
+from unittest.mock import patch
 
 import httpx
 
 import app
+import firecrawl_controls as fc
 
 
 def run(coro):
@@ -377,6 +381,132 @@ def test_unconfigured_firecrawl_falls_back_to_brave_before_searxng():
         app.BRAVE_SEARCH_URL = saved_url
         app.firecrawl_request = saved_request
         app.is_allowed_public_url = saved_check
+        app.health_cache_reset()
+
+
+def test_busy_or_slow_firecrawl_reserves_budget_for_brave_and_searxng():
+    async def exercise(total, busy):
+        now = 0.0
+        calls = []
+        real_sleep = asyncio.sleep
+        with tempfile.TemporaryDirectory() as tmp:
+            controls = fc.FirecrawlControls(
+                (fc._Budget("team", ("test-key", "unused-key")),),
+                state_path=Path(tmp) / "state.json", lock_path=Path(tmp) / "lock",
+            )
+            held_lock = None
+
+            async def sleep(delay):
+                nonlocal now, held_lock
+                now += delay
+                if not busy and now >= total / 4 and held_lock is not None:
+                    controls._release_lock(held_lock)
+                    held_lock = None
+                await real_sleep(0)
+
+            async def handler(request):
+                nonlocal now
+                if request.method == "POST":
+                    calls.append("firecrawl")
+                    now += request.extensions["timeout"]["read"]
+                    raise httpx.ReadTimeout("mock primary stall", request=request)
+                provider = "brave" if "offset" in request.url.params else "searxng"
+                calls.append(provider)
+                assert abs(now - total / 2) < 1e-8, (total, busy, now)
+                if provider == "brave":
+                    return brave_response([result(1)], False)
+                return httpx.Response(200, json={"results": [result(2)], "unresponsive_engines": []})
+
+            with patch.object(asyncio, "get_running_loop") as get_loop, patch.object(
+                asyncio, "sleep", sleep
+            ), patch.object(app, "firecrawl_request", controls.request), patch.object(
+                app, "DISCOVERY_TIMEOUT", total
+            ), patch.object(app, "BRAVE_POOL", app.BraveKeyPool(("test-key",))), patch.object(
+                app, "is_allowed_public_url", lambda _: real_sleep(0, result=True)
+            ):
+                get_loop.return_value.time.side_effect = lambda: now
+                held_lock = await controls._acquire_lock(total)
+                try:
+                    async with client(handler) as http_client:
+                        rows = await app.discover_candidates(http_client, "q", 2)
+                    assert [row["url"] for row in rows] == [result(1)["url"], result(2)["url"]]
+                    assert calls == (["brave", "searxng"] if busy else ["firecrawl", "brave", "searxng"]), calls
+                finally:
+                    if held_lock is not None:
+                        controls._release_lock(held_lock)
+
+    try:
+        for total in (20.0, 6.0):
+            for busy in (True, False):
+                run(exercise(total, busy))
+    finally:
+        app.health_cache_reset()
+
+
+def test_firecrawl_validation_uses_one_subdeadline_and_preserves_answer_semantics():
+    async def exercise(mode):
+        now = 0.0
+        visited = []
+        legacy = []
+        validation_timeouts = []
+        prefix = result("prefix")
+        stalled = result("stalled")
+        tail = result("tail")
+
+        async def firecrawl(*_args, **_kwargs):
+            nonlocal now
+            now += 5.0  # HTTP already consumed part of the default ten-second share.
+            rows = [] if mode == "complete_empty" else [stalled, tail]
+            if mode == "prefix":
+                rows.insert(0, prefix)
+            return httpx.Response(200, json={"success": True, "data": {"web": rows}})
+
+        async def allow(url):
+            nonlocal now
+            visited.append(url)
+            if url == stalled["url"]:
+                remaining = wait_for.call_args.kwargs["timeout"]
+                validation_timeouts.append(remaining)
+                now += remaining
+                raise asyncio.TimeoutError
+            return True
+
+        def handler(request):
+            legacy.append("brave" if "offset" in request.url.params else "searxng")
+            assert now < 20.0, now
+            if mode == "fallback":
+                return brave_response([result(1), result(2)], False)
+            return httpx.Response(500)
+
+        with patch.object(asyncio, "get_running_loop") as get_loop, patch.object(
+            asyncio, "wait_for", wraps=asyncio.wait_for
+        ) as wait_for, patch.object(app, "firecrawl_request", firecrawl), patch.object(
+            app, "DISCOVERY_TIMEOUT", 20.0
+        ), patch.object(app, "BRAVE_POOL", app.BraveKeyPool(("test-key",))), patch.object(
+            app, "is_allowed_public_url", allow
+        ):
+            get_loop.return_value.time.side_effect = lambda: now
+            async with client(handler) as http_client:
+                try:
+                    rows = await app.discover_candidates(http_client, "q", 2)
+                except app.AppError as exc:
+                    assert mode == "incomplete_empty", mode
+                    assert exc.status_code == 503 and exc.retryable
+                    assert exc.details["providers"]["firecrawl"] == "candidate_validation_timeout"
+                else:
+                    assert mode != "incomplete_empty", "unfinished validation became a successful no-match"
+                    expected = [result(1)["url"], result(2)["url"]] if mode == "fallback" else (
+                        [prefix["url"]] if mode == "prefix" else []
+                    )
+                    assert [row["url"] for row in rows] == expected, (mode, rows)
+            assert legacy == (["brave"] if mode == "fallback" else ["brave", "searxng"]), legacy
+            assert tail["url"] not in visited, visited
+            assert validation_timeouts == ([] if mode == "complete_empty" else [5.0]), validation_timeouts
+
+    try:
+        for mode in ("fallback", "prefix", "complete_empty", "incomplete_empty"):
+            run(exercise(mode))
+    finally:
         app.health_cache_reset()
 
 

@@ -743,9 +743,11 @@ async def search(request: SearchRequest):
     if request.depth == "basic":
         pages = snippet_pages(candidates)
     else:
-        crawl_deadline = asyncio.get_running_loop().time() + CRAWL_TIMEOUT
+        crawl_started = asyncio.get_running_loop().time()
+        crawl_deadline = crawl_started + CRAWL_TIMEOUT
+        firecrawl_deadline = crawl_started + CRAWL_TIMEOUT / 2
         firecrawl_pages, crawl_candidates, policy_denied = await scrape_firecrawl_candidates(
-            client, candidates, crawl_deadline
+            client, candidates, firecrawl_deadline
         )
         pages = firecrawl_pages
         if crawl_candidates:
@@ -1046,7 +1048,10 @@ BRAVE_POOL = BraveKeyPool(BRAVE_API_KEYS)
 
 async def discover_candidates(client: httpx.AsyncClient, query: str, limit: int):
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + max(DISCOVERY_TIMEOUT, 0.0)
+    started = loop.time()
+    deadline = started + max(DISCOVERY_TIMEOUT, 0.0)
+    # ponytail: fixed half-stage primary ceiling; adaptive shares only if measured latency needs them.
+    firecrawl_deadline = started + max(DISCOVERY_TIMEOUT, 0.0) / 2
     failures: dict[str, str] = {}
     retry_afters: list[float] = []
     candidates: list[dict] = []
@@ -1056,7 +1061,7 @@ async def discover_candidates(client: httpx.AsyncClient, query: str, limit: int)
     if payload is None:
         failures["firecrawl"] = "query_too_long"
     else:
-        remaining = deadline - loop.time()
+        remaining = firecrawl_deadline - loop.time()
         if remaining > 0:
             try:
                 response = await firecrawl_request(client, "/v2/search", payload, timeout=remaining)
@@ -1066,7 +1071,7 @@ async def discover_candidates(client: httpx.AsyncClient, query: str, limit: int)
                     _record_provider_health("firecrawl", "unavailable")
                 else:
                     firecrawl_candidates, complete = await shape_candidates(
-                        rows, limit, "description", deadline=deadline
+                        rows, limit, "description", deadline=firecrawl_deadline
                     )
                     if complete or firecrawl_candidates:
                         pdf_urls = {

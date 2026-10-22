@@ -1,6 +1,9 @@
 """Mocked identity, recovery, and result-validity checks for #45."""
 
 import asyncio
+from unittest.mock import patch
+
+import httpx
 
 import app
 
@@ -27,6 +30,90 @@ def crawl_item(url, content, **kwargs):
 
 async def allow_public(_url):
     return True
+
+
+def test_firecrawl_subdeadline_preserves_pages_and_runs_crawl4ai_with_original_deadline():
+    async def exercise(total, stall):
+        now = 0.0
+        candidates = [candidate(f"https://{name}.example/", name) for name in ("prefix", "slow", "tail")]
+        for item in candidates:
+            item["_firecrawl_source"] = True
+        prefix, slow, tail = candidates
+        final_url = "https://slow.example/final"
+        scraped = []
+        scrape_timeouts = []
+        validation_timeouts = []
+        crawled = []
+        stalled = False
+
+        async def allow(url):
+            nonlocal now, stalled
+            if not stalled and url == (final_url if stall == "metadata" else slow["url"]) and stall != "http":
+                stalled = True
+                remaining = wait_for.call_args.kwargs["timeout"]
+                validation_timeouts.append(remaining)
+                now += remaining
+                raise asyncio.TimeoutError
+            return True
+
+        async def firecrawl(_client, endpoint, payload, *, timeout):
+            nonlocal now
+            assert endpoint == "/v2/scrape", endpoint
+            url = payload["url"]
+            scraped.append(url)
+            scrape_timeouts.append(timeout)
+            if url == slow["url"] and stall == "http":
+                now += timeout
+                raise app.FirecrawlUnavailable(None, "transport_timeout", 1.0, True)
+            now += total / 8
+            return httpx.Response(200, json={"success": True, "data": {
+                "markdown": f"# Firecrawl content for {url}",
+                "metadata": {"sourceURL": url, "statusCode": 200, "url": final_url if url == slow["url"] else url},
+            }})
+
+        async def crawl4ai(_client, payload):
+            assert now == total / 2, now
+            crawled.extend(payload["urls"])
+            return {"success": True, "results": [
+                crawl_item(url, f"# Crawl4AI content for {url}") for url in payload["urls"]
+            ]}
+
+        async def rerank(_client, _query, chunks, _top_k):
+            return [app.SearchResult(
+                title=item["title"], url=item["url"], snippet=item["snippet"],
+                content=item["content"], score=None,
+            ) for item in chunks], "mock"
+
+        with patch.object(asyncio, "get_running_loop") as get_loop, patch.object(
+            asyncio, "wait_for", wraps=asyncio.wait_for
+        ) as wait_for, patch.object(app, "CRAWL_TIMEOUT", total), patch.object(
+            app, "discover_candidates", lambda *_: asyncio.sleep(0, result=candidates)
+        ), patch.object(app, "get_client", lambda: asyncio.sleep(0, result=None)), patch.object(
+            app, "firecrawl_request", firecrawl
+        ), patch.object(app, "firecrawl_url_allowed", lambda _: True), patch.object(
+            app, "is_allowed_public_url", allow
+        ), patch.object(app, "call_crawl4ai", crawl4ai), patch.object(
+            app, "crawl_all", wraps=app.crawl_all
+        ) as crawl_all, patch.object(app, "rerank", rerank):
+            get_loop.return_value.time.side_effect = lambda: now
+            response = await app.search(app.SearchRequest(query="q", candidates=3, depth="advanced"))
+            expected_local = [tail["url"]] if stall == "metadata" else [slow["url"], tail["url"]]
+            assert crawled == expected_local, (stall, crawled)
+            assert scrape_timeouts == ([total / 2] if stall == "target" else [total / 2, total * 3 / 8]), scrape_timeouts
+            assert validation_timeouts == ([] if stall == "http" else [total * (1 / 4 if stall == "metadata" else 3 / 8)])
+            assert crawl_all.call_args.kwargs["deadline"] == total
+            assert scraped == ([prefix["url"]] if stall == "target" else [prefix["url"], slow["url"]]), scraped
+            results = {item.url: item.content for item in response.data.results}
+            assert set(results) == {prefix["url"], *expected_local}, results
+            assert "Firecrawl content" in results[prefix["url"]], results
+            assert all("Crawl4AI content" in results[url] for url in expected_local), results
+
+    try:
+        for total in (45.0, 8.0):
+            for stall in ("http", "target", "metadata"):
+                run(exercise(total, stall))
+    finally:
+        app.health_cache_reset()
 
 
 def test_bulk_reordered_redirects_keep_original_candidate_identity():
