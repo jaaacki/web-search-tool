@@ -162,6 +162,11 @@ caller-requested operation may retry only the same primary key; success clears t
 a verified daily/weekly cap reset can be retried by that same-key operation. Container stop/restart
 or recreation clears the local `/tmp` guard, not the provider's spending limits.
 
+Search gives Firecrawl at most half of each stage's existing budget, including shared-lock waits,
+HTTP and URL validation: 10 of 20 seconds for discovery and 22.5 of 45 seconds for extraction by default.
+Custom totals scale the same way; Brave/SearXNG and Crawl4AI keep the original absolute stage deadlines.
+Accepted partial results survive the Firecrawl cutoff; a timeout does not rotate credentials.
+
 Firecrawl search is discovery-only; page extraction uses a separate policy-checked scrape. LinkedIn,
 X/Twitter and known shortener domains are excluded from Firecrawl and may use the local Crawl4AI
 path instead. An explicit Firecrawl policy denial is not retried through another scraper. Scrapes
