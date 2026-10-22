@@ -1049,6 +1049,56 @@ def test_health_accepts_healthy_firecrawl_when_searxng_is_down_without_searching
         app.health_cache_reset()
 
 
+def test_health_keeps_stale_success_available_without_provider_requests():
+    saved_pool = app.BRAVE_POOL
+    saved_engines = app.SEARXNG_ENGINES
+    saved_get_client = app.get_client
+    app.BRAVE_POOL = app.BraveKeyPool(("test-key",))
+    app.SEARXNG_ENGINES = "bing"
+    requests = []
+
+    def handler(request):
+        requests.append((request.method, request.url.path))
+        assert request.method == "GET" and request.url.path == "/health", requests
+        return httpx.Response(200)
+
+    app.get_client = lambda: asyncio.sleep(0, result=client(handler))
+    try:
+        for provider in ("firecrawl", "brave", "searxng"):
+            requests.clear()
+            app.health_cache_reset()
+            for name in ("firecrawl", "brave", "searxng"):
+                app._record_provider_health(name, "ok" if name == provider else "unavailable")
+            assert run(app.health()).data.checks[provider] == "ok"
+            stale_at = time.monotonic() - app.HEALTH_CACHE_TTL - 1
+            for result in app._PROVIDER_HEALTH.values():
+                result["at"] = stale_at
+            app._HEALTH_CACHE["at"] = stale_at
+            health = run(app.health())
+            assert health.data.checks[provider] == "stale:ok", health.data.checks
+            assert health.data.checks["searxng_service"] == "not_probed", health.data.checks
+            assert requests == [("GET", "/health")] * 4, requests
+
+            app._record_provider_health(provider, "unavailable")
+            for _ in range(2):
+                try:
+                    run(app.health())
+                except app.AppError as exc:
+                    assert exc.status_code == 503
+                    assert exc.details["checks"][provider] == "unavailable"
+                else:
+                    raise AssertionError("last-known success masked a newer provider failure")
+            assert requests == [("GET", "/health")] * 6, requests
+            app._record_provider_health(provider, "ok")
+            assert run(app.health()).data.checks[provider] == "ok"
+            assert requests == [("GET", "/health")] * 8, requests
+    finally:
+        app.get_client = saved_get_client
+        app.BRAVE_POOL = saved_pool
+        app.SEARXNG_ENGINES = saved_engines
+        app.health_cache_reset()
+
+
 def test_health_is_red_when_all_configured_discovery_providers_are_unavailable():
     saved_pool = app.BRAVE_POOL
     app.BRAVE_POOL = app.BraveKeyPool(("test-key",))
@@ -1076,6 +1126,7 @@ def test_health_does_not_upgrade_stale_provider_failures_from_service_readiness(
     saved_pool = app.BRAVE_POOL
     app.BRAVE_POOL = app.BraveKeyPool(("test-key",))
     app.health_cache_reset()
+    app._record_provider_health("firecrawl", "unavailable")
     app._record_provider_health("brave", "unavailable")
     app._record_provider_health("searxng", "unavailable")
     for result in app._PROVIDER_HEALTH.values():
@@ -1087,6 +1138,7 @@ def test_health_does_not_upgrade_stale_provider_failures_from_service_readiness(
             run(app.health())
         except app.AppError as exc:
             checks = exc.details["checks"]
+            assert checks["firecrawl"] == "stale:unavailable", checks
             assert checks["brave"] == "stale:unavailable", checks
             assert checks["searxng"] == "stale:unavailable", checks
             assert checks["searxng_service"] == "not_probed", checks

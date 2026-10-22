@@ -212,8 +212,9 @@ class HealthData(BaseModel):
     checks: dict[str, str] = Field(
         default_factory=dict,
         description=(
-            "Cached per-provider discovery outcomes plus bounded internal service probes. Public health polling never "
-            "issues paid search requests; a total discovery outage is still reported as unavailable."
+            "Last-known discovery outcomes plus bounded internal service probes. A stale: prefix reports age; "
+            "last-known success remains available until a newer outcome supersedes it. Public health polling never "
+            "issues paid searches or refreshes provider timestamps; recorded total discovery failure stays unavailable."
         ),
         examples=[{"firecrawl": "unknown", "brave": "unknown", "searxng": "unknown", "searxng_service": "ok", "crawl4ai": "ok", "reranker": "ok"}],
     )
@@ -608,7 +609,7 @@ def health_cache_reset() -> None:
 
 
 async def _run_health_checks() -> dict[str, str]:
-    """Report recent provider outcomes and probe supporting services without searching."""
+    """Report last-known provider outcomes and probe supporting services without searching."""
     checks = {
         "firecrawl": _provider_health("firecrawl", True),
         "brave": _provider_health("brave", bool(BRAVE_POOL)),
@@ -623,10 +624,15 @@ async def _run_health_checks() -> dict[str, str]:
 
     # A live SearXNG process is the cold-start fallback until a real search records
     # whether its engine pool answered. Known provider failures always take precedence.
-    searxng_available = checks["searxng"] == "ok" or (
+    # Freshness labels do not turn a recorded success into an observed failure.
+    searxng_available = checks["searxng"] in ("ok", "stale:ok") or (
         checks["searxng"] == "unknown" and checks["searxng_service"] == "ok"
     )
-    if checks["firecrawl"] != "ok" and checks["brave"] != "ok" and not searxng_available:
+    if (
+        checks["firecrawl"] not in ("ok", "stale:ok")
+        and checks["brave"] not in ("ok", "stale:ok")
+        and not searxng_available
+    ):
         raise AppError(
             503,
             "upstream_unavailable",
@@ -645,9 +651,10 @@ async def _run_health_checks() -> dict[str, str]:
     summary="Check service health",
     description=(
         "Public diagnostic endpoint for the search and crawl API hosts. It reports configured internal service URLs and "
-        "recent discovery-provider outcomes, using bounded service probes only when no search outcome is cached. Health "
-        "polling never performs a paid search. Results are cached for HEALTH_CACHE_TTL. Do not use this endpoint for search "
-        "or crawl work."
+        "last-known discovery-provider outcomes; stale: marks age rather than a new failure. Last-known success remains "
+        "available until a newer outcome supersedes it. SearXNG readiness is used only before an outcome is observed. "
+        "Health polling never performs a paid search or refreshes provider timestamps. Verdicts are cached for "
+        "HEALTH_CACHE_TTL. This is passive availability metadata, not a live-provider guarantee or search/crawl endpoint."
     ),
     operation_id="check_health",
     tags=["Diagnostics"],
