@@ -2,6 +2,7 @@
 
 import asyncio
 import fcntl
+import hashlib
 import json
 import logging
 import math
@@ -57,14 +58,25 @@ class _Budget:
     keys: tuple[str, ...] = field(repr=False)
 
 
+def _key_slots(keys: list[str]) -> tuple[_Budget, ...]:
+    if any(not isinstance(key, str) or not re.fullmatch(r"[!-~]+", key) or "," in key for key in keys):
+        raise ValueError("invalid key list")
+    # Each credential has its own guard, independent of its position or legacy label.
+    return tuple(_Budget(hashlib.sha256(key.encode("ascii")).hexdigest(), (key,)) for key in dict.fromkeys(keys))
+
+
+def _parse_keys(raw: str) -> tuple[_Budget, ...]:
+    return _key_slots([key.strip() for key in raw.split(",")]) if raw.strip() else ()
+
+
 def _parse_budgets(raw: str) -> tuple[_Budget, ...]:
+    """Accept the legacy schema, but make every key eligible in declaration order."""
     value = json.loads(raw)
     if not isinstance(value, list) or not value:
         raise ValueError("budget list required")
 
-    budgets = []
     ids = set()
-    keys = set()
+    keys = []
     for item in value:
         if not isinstance(item, dict) or set(item) != {"id", "keys"}:
             raise ValueError("each budget requires only id and keys")
@@ -73,15 +85,9 @@ def _parse_budgets(raw: str) -> tuple[_Budget, ...]:
             raise ValueError("invalid or duplicate budget id")
         if not isinstance(raw_keys, list) or not raw_keys:
             raise ValueError("each budget requires at least one key")
-        group_keys = []
-        for key in raw_keys:
-            if not isinstance(key, str) or not key.strip() or key != key.strip() or key in keys:
-                raise ValueError("invalid or duplicate key")
-            group_keys.append(key)
-            keys.add(key)
+        keys.extend(raw_keys)
         ids.add(name)
-        budgets.append(_Budget(name, tuple(group_keys)))
-    return tuple(budgets)
+    return _key_slots(keys)
 
 
 def firecrawl_url_allowed(url: str) -> bool:
@@ -177,13 +183,14 @@ class FirecrawlControls:
 
     @classmethod
     def from_env(cls) -> "FirecrawlControls":
-        raw = os.getenv("FIRECRAWL_BUDGETS_JSON", "").strip()
-        if not raw:
-            return cls(())
+        raw = os.getenv("FIRECRAWL_API_KEYS")
         try:
-            return cls(_parse_budgets(raw))
-        except (TypeError, ValueError, json.JSONDecodeError):
-            logger.warning("Firecrawl budget configuration is invalid; Firecrawl is disabled")
+            if raw is not None:
+                return cls(_parse_keys(raw))
+            legacy = os.getenv("FIRECRAWL_BUDGETS_JSON", "").strip()
+            return cls(_parse_budgets(legacy) if legacy else ())
+        except (TypeError, ValueError):
+            logger.warning("Firecrawl key configuration is invalid; Firecrawl is disabled")
             return cls((), config_error=True)
 
     async def request(
@@ -229,8 +236,6 @@ class FirecrawlControls:
                 remaining = deadline - loop.time()
                 if remaining <= 0:
                     raise FirecrawlUnavailable(None, "request_timeout", 1.0, True)
-                # ponytail: one active key per team; rotate it only by an operator
-                # config change after checking the team's key-spend policy.
                 key = budget.keys[0]
                 try:
                     request = client.post(
@@ -327,7 +332,7 @@ class FirecrawlControls:
             group.clear()
             return None
         if blocked == "invalid_auth":
-            # Only a caller retries the same primary key; another 401 re-arms the guard.
+            # Only a caller retries the same key; another 401 re-arms the guard.
             group.clear()
             self._write_state(state)
             logger.info("firecrawl same-key retry allowed after cooldown budget=%s", budget.id)
@@ -351,7 +356,7 @@ class FirecrawlControls:
             return None
 
         # After this cached usage check, allow one caller-driven request on the same
-        # primary key; success clears the block, while another 402 re-blocks the group.
+        # key; success clears the block, while another 402 re-blocks its slot.
         self._block(group, "key_cap_or_ambiguous", usage)
         self._write_state(state)
         logger.info("firecrawl same-key retry allowed after cooldown budget=%s", budget.id)
@@ -449,7 +454,11 @@ class FirecrawlControls:
             raise FirecrawlUnavailable(None, "control_state_error", None, False) from exc
         if not isinstance(state, dict):
             raise FirecrawlUnavailable(None, "control_state_error", None, False)
-        return state
+        groups = state.get("budgets", {})
+        if not isinstance(groups, dict):
+            raise FirecrawlUnavailable(None, "control_state_error", None, False)
+        # Discard removed credentials and pre-pool operator labels, never reuse their guards.
+        return {"budgets": {budget.id: groups[budget.id] for budget in self._budgets if budget.id in groups}}
 
     def _write_state(self, state: dict[str, Any]) -> None:
         path = self._state_path
@@ -470,16 +479,8 @@ class FirecrawlControls:
             raise FirecrawlUnavailable(None, "control_state_error", None, False) from exc
 
 
-
 def _load_controls() -> FirecrawlControls:
-    raw = os.getenv("FIRECRAWL_BUDGETS_JSON", "").strip()
-    if not raw:
-        return FirecrawlControls(())
-    try:
-        return FirecrawlControls(_parse_budgets(raw))
-    except (TypeError, ValueError, json.JSONDecodeError):
-        logger.warning("Firecrawl budget configuration is invalid; Firecrawl is disabled")
-        return FirecrawlControls((), config_error=True)
+    return FirecrawlControls.from_env()
 
 
 CONTROLS = _load_controls()

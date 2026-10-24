@@ -1,4 +1,4 @@
-"""Mocked shared-budget, policy, and concurrency checks for #47."""
+"""Mocked key-pool, shared guard, policy, and concurrency checks."""
 
 import asyncio
 import json
@@ -17,7 +17,7 @@ def run(coro):
 
 
 def controls(root, groups):
-    budgets = tuple(fc._Budget(name, tuple(keys)) for name, keys in groups)
+    budgets = fc._parse_budgets(json.dumps([{"id": name, "keys": keys} for name, keys in groups]))
     root = Path(root)
     return fc.FirecrawlControls(
         budgets,
@@ -52,15 +52,69 @@ def test_missing_budget_short_circuits_without_network():
     assert calls == [], calls
 
 
-def test_budget_parser_requires_explicit_groups_and_rejects_duplicate_keys():
-    groups = fc._parse_budgets('[{"id":"primary","keys":["key-a","key-b"]}]')
-    assert groups[0].id == "primary" and groups[0].keys == ("key-a", "key-b"), groups
-    try:
-        fc._parse_budgets('[{"id":"a","keys":["same"]},{"id":"b","keys":["same"]}]')
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("same credential cannot be declared as two independent budgets")
+def test_flat_and_legacy_inputs_preserve_order_deduplicate_and_hash_identity():
+    slots = fc._parse_keys(" key-a, key-b,key-a, key-c ")
+    legacy = fc._parse_budgets('[{"id":"old-label","keys":["key-a","key-b","key-a"]},'
+                               '{"id":"other-label","keys":["key-c","key-b"]}]')
+    assert slots == legacy
+    assert [slot.keys for slot in slots] == [("key-a",), ("key-b",), ("key-c",)]
+    reordered = fc._parse_keys("key-c,key-a,key-replacement")
+    assert reordered[0].id == slots[2].id and reordered[1].id == slots[0].id
+    assert reordered[2].id not in {slot.id for slot in slots}
+    assert all(len(slot.id) == 64 and set(slot.id) <= set("0123456789abcdef") for slot in slots)
+    assert "key-a" not in repr(slots) and "old-label" not in repr(legacy)
+    for raw in ("key-a,", ",key-a", "key-a,,key-b", "key a", "key\u007fa", "key\u0000a", "kéy"):
+        try:
+            fc._parse_keys(raw)
+        except ValueError as exc:
+            assert str(exc) == "invalid key list"
+        else:
+            raise AssertionError("invalid flat key list accepted")
+    for raw in ('[]', '{}', 'not-json', '[{"id":"a","keys":[]}]',
+                '[{"id":"a","keys":[1]}]', '[{"id":"a","keys":[" key"]}]',
+                '[{"id":"a","keys":["key"],"extra":true}]'):
+        try:
+            fc._parse_budgets(raw)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid legacy key list accepted")
+
+
+def test_environment_precedence_empty_disable_and_sanitized_invalid_configuration():
+    legacy = '[{"id":"private-label","keys":["legacy-secret","sibling-secret"]}]'
+    for raw in (None, "flat-secret,flat-secret,second-secret", "", "  ", "bad-secret,,"):
+        environment = {"FIRECRAWL_BUDGETS_JSON": legacy}
+        if raw is not None:
+            environment["FIRECRAWL_API_KEYS"] = raw
+        with patch.dict("os.environ", environment, clear=True), patch.object(fc, "logger") as logs:
+            instance = fc._load_controls()
+            assert instance._budgets == fc.FirecrawlControls.from_env()._budgets
+            assert instance._config_error == (raw == "bad-secret,,")
+        expected = [("legacy-secret",), ("sibling-secret",)] if raw is None else (
+            [("flat-secret",), ("second-secret",)] if raw.startswith("flat") else []
+        )
+        assert [slot.keys for slot in instance._budgets] == expected
+        assert not any(secret in str(logs.mock_calls) for secret in ("secret", "private-label"))
+    with patch.dict("os.environ", {"FIRECRAWL_API_KEYS": "", "FIRECRAWL_BUDGETS_JSON": "invalid"}, clear=True):
+        assert not fc._load_controls()._config_error
+    with patch.dict("os.environ", {"FIRECRAWL_BUDGETS_JSON": "invalid"}, clear=True):
+        instance = fc._load_controls()
+        assert instance._config_error and not instance._budgets
+
+    def handler(request):
+        raise AssertionError("invalid config must not use the network")
+
+    async def check():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            try:
+                await instance.request(client, "/v2/search", {"query": "q"}, timeout=1)
+            except fc.FirecrawlUnavailable as exc:
+                assert (exc.status, str(exc), exc.retryable) == (None, "invalid_configuration", False)
+            else:
+                raise AssertionError("invalid config was accepted")
+
+    run(check())
 
 
 def test_search_policy_merges_domain_exclusions_without_mutating_payload():
@@ -221,16 +275,19 @@ def test_idna_provider_host_aliases_are_blocked_before_scrape():
     assert len(calls) == 1 and calls[0].url.host == "api.firecrawl.dev", calls
 
 
-def test_team_exhaustion_fails_over_only_to_an_independent_budget():
+def test_verified_zero_or_negative_usage_tries_all_keys_including_same_team_siblings():
     seen = []
 
     def handler(request):
         key = request.headers["Authorization"]
         seen.append((request.url.path, key))
-        if key == "Bearer same-team-primary" and request.url.path == "/v2/search":
-            return response(request, 402, {"success": False, "error": "Insufficient credits"})
-        if key == "Bearer same-team-primary" and request.url.path == fc.CREDIT_USAGE_PATH:
-            return response(request, 200, {"success": True, "data": {"remainingCredits": 0, "billingPeriodEnd": None}})
+        if key in ("Bearer same-team-primary", "Bearer same-team-sibling"):
+            if request.url.path == "/v2/search":
+                return response(request, 402, {"success": False, "error": "Insufficient credits"})
+            if request.url.path == fc.CREDIT_USAGE_PATH:
+                # Both credentials see the same depleted team, not fresh funds.
+                remaining = 0 if key.endswith("primary") else -1
+                return response(request, body={"success": True, "data": {"remainingCredits": remaining}})
         if key == "Bearer independent" and request.url.path == "/v2/search":
             return response(request, 200, {"success": True, "data": {"web": {"results": []}}})
         raise AssertionError(f"unexpected request {request.url} {key}")
@@ -248,6 +305,8 @@ def test_team_exhaustion_fails_over_only_to_an_independent_budget():
     assert seen == [
         ("/v2/search", "Bearer same-team-primary"),
         (fc.CREDIT_USAGE_PATH, "Bearer same-team-primary"),
+        ("/v2/search", "Bearer same-team-sibling"),
+        (fc.CREDIT_USAGE_PATH, "Bearer same-team-sibling"),
         ("/v2/search", "Bearer independent"),
     ], seen
 
@@ -277,24 +336,65 @@ def test_invalid_auth_fails_over_with_shared_cooldown_and_same_key_recovery():
                         result = await controls(tmp, groups).request(client, endpoint, payload, timeout=2)
                         assert result.status_code == 200
                     state = instance._read_state()
-                    assert state["budgets"]["team-a"]["blocked"] == "invalid_auth", state
-                    state["budgets"]["team-a"]["next_check"] = time.monotonic() - 1
+                    assert state["budgets"][instance._budgets[0].id]["blocked"] == "invalid_auth", state
+                    state["budgets"][instance._budgets[0].id]["next_check"] = time.monotonic() - 1
                     instance._write_state(state)
                     # Still invalid: one same-key attempt re-blocks, then callers skip it again.
                     for _ in range(2):
                         assert (await instance.request(client, endpoint, payload, timeout=2)).status_code == 200
                     state = instance._read_state()
-                    assert state["budgets"]["team-a"]["next_check"] > time.monotonic(), state
-                    state["budgets"]["team-a"]["next_check"] = time.monotonic() - 1
+                    assert state["budgets"][instance._budgets[0].id]["next_check"] > time.monotonic(), state
+                    state["budgets"][instance._budgets[0].id]["next_check"] = time.monotonic() - 1
                     instance._write_state(state)
                     primary_status = 200
                     assert (await instance.request(client, endpoint, payload, timeout=2)).status_code == 200
-                    assert instance._read_state()["budgets"]["team-a"] == {}
+                    assert instance._read_state()["budgets"][instance._budgets[0].id] == {}
 
         run(check())
         assert seen == [(endpoint, "Bearer " + key) for key in (
-            "primary", "independent", "independent", "primary", "independent", "independent", "primary",
+            "primary", "sibling", "sibling", "primary", "sibling", "sibling", "primary",
         )], seen
+
+
+def test_reordered_and_replaced_keys_keep_their_own_sanitized_guards():
+    seen = []
+    secrets = ("invalid-secret", "capped-secret", "fresh-secret", "replacement-secret")
+
+    def handler(request):
+        seen.append(request.headers["Authorization"])
+        return response(request)
+
+    async def check():
+        with tempfile.TemporaryDirectory() as tmp:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                original = controls(tmp, [("private-operator-label", list(secrets[:2]))])
+                bad_id, cap_id = [slot.id for slot in original._budgets]
+                state = {"budgets": {"private-operator-label": {"blocked": "invalid_auth"}}}
+                original._block(original._group_state(state, bad_id), "invalid_auth", None)
+                original._block(original._group_state(state, cap_id), "key_cap_or_ambiguous", {"remaining": 3})
+                original._write_state(state)
+                reordered = controls(tmp, [("renamed-label", [secrets[1], secrets[0], secrets[2]])])
+                try:
+                    await reordered.request(client, "/v2/search", {"query": "q"}, timeout=1)
+                except fc.FirecrawlUnavailable as exc:
+                    assert exc.category == "key_cap_or_ambiguous"
+                else:
+                    raise AssertionError("reordering lost the cap guard")
+                assert seen == []
+                reordered = controls(tmp, [("renamed-label", [secrets[0], secrets[2], secrets[1]])])
+                assert (await reordered.request(client, "/v2/search", {"query": "q"}, timeout=1)).status_code == 200
+                assert reordered._read_state()["budgets"][bad_id]["blocked"] == "invalid_auth"
+                assert reordered._read_state()["budgets"][cap_id]["blocked"] == "key_cap_or_ambiguous"
+                replaced = controls(tmp, [("private-operator-label", [secrets[3], secrets[1]])])
+                assert (await replaced.request(client, "/v2/search", {"query": "q"}, timeout=1)).status_code == 200
+                assert bad_id not in replaced._read_state()["budgets"]
+                persisted = replaced._state_path.read_text()
+                assert not any(value in persisted for value in (*secrets, "private-operator-label", "renamed-label"))
+
+    with patch.object(fc, "logger") as logs:
+        run(check())
+    assert seen == ["Bearer " + secrets[2], "Bearer " + secrets[3]], seen
+    assert not any(value in str(logs.mock_calls) for value in (*secrets, "private-operator-label", "renamed-label"))
 
 
 def test_all_skipped_budgets_preserve_the_last_failure_and_safe_metadata():
@@ -312,7 +412,7 @@ def test_all_skipped_budgets_preserve_the_last_failure_and_safe_metadata():
 
         async def check():
             with tempfile.TemporaryDirectory() as tmp:
-                groups = [("a", [secrets[0], "sibling"]), ("b", [secrets[1]])]
+                groups = [("private-operator-label", list(secrets[:2]))]
                 async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
                     for _ in range(2):
                         try:
@@ -336,7 +436,7 @@ def test_all_skipped_budgets_preserve_the_last_failure_and_safe_metadata():
             run(check())
         logged = str(logs.mock_calls)
         assert "category=invalid_auth" in logged or statuses == (402, 402), logged
-        assert not any(secret in logged for secret in (*secrets, "Authorization", "Bearer", "https://")), logged
+        assert not any(secret in logged for secret in (*secrets, "private-operator-label", "Authorization", "Bearer", "https://")), logged
         expected_calls = []
         for key, status in zip(secrets[:2], statuses):
             expected_calls.append(("/v2/scrape", "Bearer " + key))
@@ -361,8 +461,7 @@ def test_invalid_auth_does_not_bypass_later_cap_policy_rate_or_provider_errors()
             with tempfile.TemporaryDirectory() as tmp:
                 async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
                     try:
-                        await controls(tmp, [("a", ["primary", "sibling"]), ("b", ["backup", "other"]),
-                                             ("c", ["unused"])]).request(
+                        await controls(tmp, [("a", ["primary", "backup", "unused"])]).request(
                             client, "/v2/search", {"query": "q"}, timeout=2
                         )
                     except fc.FirecrawlUnavailable as exc:
@@ -394,7 +493,7 @@ def test_auth_recovery_does_not_fail_over_after_policy_or_provider_errors():
                     instance = controls(tmp, [("a", ["primary"]), ("b", ["backup"])])
                     assert (await instance.request(client, "/v2/search", {"query": "q"}, timeout=2)).status_code == 200
                     state = instance._read_state()
-                    state["budgets"]["a"]["next_check"] = time.monotonic() - 1
+                    state["budgets"][instance._budgets[0].id]["next_check"] = time.monotonic() - 1
                     instance._write_state(state)
                     primary_status = status
                     for _ in range(2):
@@ -480,7 +579,7 @@ def test_positive_balance_blocks_during_cooldown_then_retries_same_key():
                     raise AssertionError("request bypassed the positive-balance cooldown")
 
                 state = instance._read_state()
-                state["budgets"]["team-a"]["next_check"] = time.monotonic() - 1
+                state["budgets"][instance._budgets[0].id]["next_check"] = time.monotonic() - 1
                 instance._write_state(state)
                 result = await instance.request(client, "/v2/search", {"query": "q"}, timeout=2)
                 assert result.status_code == 200, result.status_code
@@ -571,7 +670,7 @@ def test_top_up_recovers_exhausted_budget():
                     else:
                         raise AssertionError("zero-credit team was not blocked")
                 state = instance._read_state()
-                state["budgets"]["team"]["next_check"] = time.monotonic() - 1
+                state["budgets"][instance._budgets[0].id]["next_check"] = time.monotonic() - 1
                 instance._write_state(state)
                 result = await instance.request(client, "/v2/search", {"query": "q"}, timeout=2)
                 assert result.status_code == 200
