@@ -2,6 +2,7 @@
 
 import asyncio
 import fcntl
+import hashlib
 import json
 import logging
 import math
@@ -55,33 +56,59 @@ class FirecrawlUnavailable(Exception):
 class _Budget:
     id: str
     keys: tuple[str, ...] = field(repr=False)
+    label: str = ""
+
+
+def _key_slots(value: Any) -> tuple[_Budget, ...]:
+    if not isinstance(value, list):
+        raise ValueError("labeled key list required")
+    labels, keys = set(), set()
+    slots = []
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {"label", "key"}:
+            raise ValueError("each key requires only label and key")
+        label, key = item["label"], item["key"]
+        if not isinstance(label, str) or not label.isprintable() or not label.strip():
+            raise ValueError("nonempty printable label required")
+        label = label.strip()
+        # Removed or unknown credentials must not become readable labels either.
+        if re.search(
+            r"[a-f0-9]{32}|[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}|fc-[a-z0-9_-]{20,}",
+            label,
+            re.IGNORECASE,
+        ):
+            raise ValueError("labels must not contain credentials")
+        if label in labels:
+            raise ValueError("duplicate label")
+        if not isinstance(key, str) or not re.fullmatch(r"[!-~]+", key) or "," in key or key in keys:
+            raise ValueError("invalid or duplicate key")
+        labels.add(label)
+        keys.add(key)
+        # State follows the credential, not its mutable display label or list position.
+        slots.append(_Budget(hashlib.sha256(key.encode("ascii")).hexdigest(), (key,), label))
+    if any(key in label for label in labels for key in keys):
+        raise ValueError("labels must not contain credentials")
+    return tuple(slots)
+
+
+def _parse_keys(raw: str) -> tuple[_Budget, ...]:
+    return _key_slots(json.loads(raw)) if raw.strip() else ()
 
 
 def _parse_budgets(raw: str) -> tuple[_Budget, ...]:
+    """Legacy singleton entries already have an unambiguous required label."""
     value = json.loads(raw)
     if not isinstance(value, list) or not value:
-        raise ValueError("budget list required")
-
-    budgets = []
-    ids = set()
-    keys = set()
+        raise ValueError("legacy labeled key list required")
+    entries = []
     for item in value:
         if not isinstance(item, dict) or set(item) != {"id", "keys"}:
-            raise ValueError("each budget requires only id and keys")
-        name, raw_keys = item["id"], item["keys"]
-        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}", name) or name in ids:
-            raise ValueError("invalid or duplicate budget id")
-        if not isinstance(raw_keys, list) or not raw_keys:
-            raise ValueError("each budget requires at least one key")
-        group_keys = []
-        for key in raw_keys:
-            if not isinstance(key, str) or not key.strip() or key != key.strip() or key in keys:
-                raise ValueError("invalid or duplicate key")
-            group_keys.append(key)
-            keys.add(key)
-        ids.add(name)
-        budgets.append(_Budget(name, tuple(group_keys)))
-    return tuple(budgets)
+            raise ValueError("legacy entry requires only id and keys")
+        raw_keys = item["keys"]
+        if not isinstance(raw_keys, list) or len(raw_keys) != 1:
+            raise ValueError("legacy entry requires exactly one labeled key")
+        entries.append({"label": item["id"], "key": raw_keys[0]})
+    return _key_slots(entries)
 
 
 def firecrawl_url_allowed(url: str) -> bool:
@@ -177,13 +204,14 @@ class FirecrawlControls:
 
     @classmethod
     def from_env(cls) -> "FirecrawlControls":
-        raw = os.getenv("FIRECRAWL_BUDGETS_JSON", "").strip()
-        if not raw:
-            return cls(())
+        raw = os.getenv("FIRECRAWL_KEYS_JSON")
         try:
-            return cls(_parse_budgets(raw))
-        except (TypeError, ValueError, json.JSONDecodeError):
-            logger.warning("Firecrawl budget configuration is invalid; Firecrawl is disabled")
+            if raw is not None:
+                return cls(_parse_keys(raw))
+            legacy = os.getenv("FIRECRAWL_BUDGETS_JSON", "").strip()
+            return cls(_parse_budgets(legacy) if legacy else ())
+        except (TypeError, ValueError):
+            logger.warning("Firecrawl key configuration is invalid; Firecrawl is disabled")
             return cls((), config_error=True)
 
     async def request(
@@ -229,8 +257,6 @@ class FirecrawlControls:
                 remaining = deadline - loop.time()
                 if remaining <= 0:
                     raise FirecrawlUnavailable(None, "request_timeout", 1.0, True)
-                # ponytail: one active key per team; rotate it only by an operator
-                # config change after checking the team's key-spend policy.
                 key = budget.keys[0]
                 try:
                     request = client.post(
@@ -251,26 +277,26 @@ class FirecrawlControls:
                         self._write_state(state)
                     except FirecrawlUnavailable:
                         # The provider response is already billable; do not discard it.
-                        logger.warning("firecrawl control state not persisted budget=%s", budget.id)
+                        logger.warning("firecrawl control state not persisted label=%s", budget.label)
                     logger.info(
-                        "firecrawl request ok budget=%s endpoint=%s elapsed_ms=%d",
-                        budget.id,
+                        "firecrawl request ok label=%s endpoint=%s elapsed_ms=%d",
+                        budget.label,
                         endpoint,
                         int((timeout - max(0, deadline - loop.time())) * 1000),
                     )
                     return response
 
                 if response.status_code == 402:
-                    usage = await self._credit_usage(client, key, deadline, budget.id)
+                    usage = await self._credit_usage(client, key, deadline, budget.label)
                     if usage is not None and usage["remaining"] <= 0:
                         self._block(group, "team_exhausted", usage)
                         self._write_state(state)
-                        logger.warning("firecrawl budget exhausted budget=%s remaining=0", budget.id)
+                        logger.warning("firecrawl key exhausted label=%s remaining=0", budget.label)
                         last_error = exhausted_error
                         continue
                     self._block(group, "key_cap_or_ambiguous", usage)
                     self._write_state(state)
-                    logger.warning("firecrawl budget blocked budget=%s category=key_cap_or_ambiguous", budget.id)
+                    logger.warning("firecrawl key blocked label=%s category=key_cap_or_ambiguous", budget.label)
                     raise FirecrawlUnavailable(402, "key_cap_or_ambiguous", USAGE_RECHECK_SECONDS, True)
 
                 if response.status_code == 429:
@@ -278,13 +304,13 @@ class FirecrawlControls:
                     group.clear()
                     group.update(blocked="rate_limited", next_check=time.monotonic() + delay)
                     self._write_state(state)
-                    logger.warning("firecrawl budget rate limited budget=%s retry_after=%.0f", budget.id, delay)
+                    logger.warning("firecrawl key rate limited label=%s retry_after=%.0f", budget.label, delay)
                     raise FirecrawlUnavailable(429, "rate_limited", delay, True)
 
                 if response.status_code == 401:
                     self._block(group, "invalid_auth", None)
                     self._write_state(state)
-                    logger.warning("firecrawl budget blocked budget=%s category=invalid_auth", budget.id)
+                    logger.warning("firecrawl key blocked label=%s category=invalid_auth", budget.label)
                     last_error = FirecrawlUnavailable(401, "invalid_auth", USAGE_RECHECK_SECONDS, True)
                     continue
                 if response.status_code == 403:
@@ -327,14 +353,14 @@ class FirecrawlControls:
             group.clear()
             return None
         if blocked == "invalid_auth":
-            # Only a caller retries the same primary key; another 401 re-arms the guard.
+            # Only a caller retries the same key; another 401 re-arms the guard.
             group.clear()
             self._write_state(state)
-            logger.info("firecrawl same-key retry allowed after cooldown budget=%s", budget.id)
+            logger.info("firecrawl same-key retry allowed after cooldown label=%s", budget.label)
             return None
 
         key = budget.keys[0]
-        usage = await self._credit_usage(client, key, deadline, budget.id)
+        usage = await self._credit_usage(client, key, deadline, budget.label)
         if usage is None:
             self._block(group, "key_cap_or_ambiguous", None)
             self._write_state(state)
@@ -347,18 +373,18 @@ class FirecrawlControls:
         if blocked == "team_exhausted":
             group.clear()
             self._write_state(state)
-            logger.info("firecrawl budget recovered budget=%s remaining=%.0f", budget.id, usage["remaining"])
+            logger.info("firecrawl key recovered label=%s remaining=%.0f", budget.label, usage["remaining"])
             return None
 
         # After this cached usage check, allow one caller-driven request on the same
-        # primary key; success clears the block, while another 402 re-blocks the group.
+        # key; success clears the block, while another 402 re-blocks its slot.
         self._block(group, "key_cap_or_ambiguous", usage)
         self._write_state(state)
-        logger.info("firecrawl same-key retry allowed after cooldown budget=%s", budget.id)
+        logger.info("firecrawl same-key retry allowed after cooldown label=%s", budget.label)
         return None
 
     async def _credit_usage(
-        self, client: httpx.AsyncClient, key: str, deadline: float, budget_id: str
+        self, client: httpx.AsyncClient, key: str, deadline: float, label: str
     ) -> dict[str, Any] | None:
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
@@ -383,7 +409,7 @@ class FirecrawlControls:
         if not isinstance(remaining, (int, float)) or isinstance(remaining, bool) or not math.isfinite(remaining):
             return None
         period_end = _period_end(data.get("billingPeriodEnd"))
-        logger.info("firecrawl usage budget_checked budget=%s remaining=%.0f", budget_id, remaining)
+        logger.info("firecrawl usage checked label=%s remaining=%.0f", label, remaining)
         return {"remaining": float(remaining), "period_end": period_end}
 
     def _group_state(self, state: dict[str, Any], budget_id: str) -> dict[str, Any]:
@@ -449,7 +475,11 @@ class FirecrawlControls:
             raise FirecrawlUnavailable(None, "control_state_error", None, False) from exc
         if not isinstance(state, dict):
             raise FirecrawlUnavailable(None, "control_state_error", None, False)
-        return state
+        groups = state.get("budgets", {})
+        if not isinstance(groups, dict):
+            raise FirecrawlUnavailable(None, "control_state_error", None, False)
+        # Discard removed credentials and pre-pool operator labels, never reuse their guards.
+        return {"budgets": {budget.id: groups[budget.id] for budget in self._budgets if budget.id in groups}}
 
     def _write_state(self, state: dict[str, Any]) -> None:
         path = self._state_path
@@ -470,16 +500,8 @@ class FirecrawlControls:
             raise FirecrawlUnavailable(None, "control_state_error", None, False) from exc
 
 
-
 def _load_controls() -> FirecrawlControls:
-    raw = os.getenv("FIRECRAWL_BUDGETS_JSON", "").strip()
-    if not raw:
-        return FirecrawlControls(())
-    try:
-        return FirecrawlControls(_parse_budgets(raw))
-    except (TypeError, ValueError, json.JSONDecodeError):
-        logger.warning("Firecrawl budget configuration is invalid; Firecrawl is disabled")
-        return FirecrawlControls((), config_error=True)
+    return FirecrawlControls.from_env()
 
 
 CONTROLS = _load_controls()
