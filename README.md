@@ -147,20 +147,42 @@ curl -X POST 'https://webcrawl.sparkfn.io/crawl' \
 
 ## Firecrawl controls
 
-Firecrawl is disabled unless `FIRECRAWL_BUDGETS_JSON` is set in private `.env`. Group keys
-from one Firecrawl team together; only the first key in each group is active, and sibling keys are
-never rotated around a per-key cap. Separate groups only for independently funded and authorized
-balances. An invalid-auth 401 can fail over to the next declared group; the bad primary is skipped
-for 15 minutes before one caller-requested operation may retry that same key, without a usage probe.
-A team-exhausted 402 can fail over only after the non-billable team-usage check confirms zero remaining
-credits. Ambiguous/key-cap 402s, policy 403s and rate 429s do not rotate keys or balances; 429 cooldowns
-are shared across keys in a group. No pay-as-you-go or billing setting is
-enabled automatically, and no universal per-request credit cap is claimed; configure vendor key
-spend limits separately. After a 15-minute ambiguous-402 cooldown and cached usage refresh, one
-caller-requested operation may retry only the same primary key; success clears the guard and another
-402 restarts it. There are no background or dummy probes. The provider exposes no per-key reset date;
-a verified daily/weekly cap reset can be retried by that same-key operation. Container stop/restart
-or recreation clears the local `/tmp` guard, not the provider's spending limits.
+Set `FIRECRAWL_KEYS_JSON` in private `.env` to an ordered list of labeled keys:
+
+```dotenv
+FIRECRAWL_KEYS_JSON='[{"label":"primary@example.test","key":"fc-REPLACE-ONE"},{"label":"secondary@example.test","key":"fc-REPLACE-TWO"}]'
+```
+
+Every entry requires exactly `label` and `key`. Labels are human-readable identifiers, not separate
+balances; email-style labels are allowed. Labels are trimmed and must be nonempty and printable,
+without control characters or credentials. Duplicate labels (after trimming), duplicate credentials,
+and unlabeled/bare keys are rejected with a sanitized configuration error. No labels are invented,
+and no account/funding or active/spare decisions are needed.
+
+An explicitly empty value or `[]` disables Firecrawl. Only when this variable is absent, legacy
+`FIRECRAWL_BUDGETS_JSON` is accepted: each entry must contain exactly one key, with its existing
+`id` used as the required label. Multi-key legacy entries are ambiguous and must be migrated to
+explicit labeled entries; they are not auto-labeled. Compose forwards the new variable through its
+existing `env_file`; no unlabeled CSV interface is supported.
+
+An invalid-auth 401 tries the next key; the bad key is skipped for 15 minutes before one
+caller-requested operation may retry it, without a usage probe. A 402 tries the next key only after
+the non-billable team-usage check confirms remaining credits are zero or negative. Keys from the
+same Firecrawl team share credits: another key does not create funds, and the same depleted team
+will still deny requests. Balances are not summed or assumed independent. Positive, malformed or
+unavailable usage leaves a 402 ambiguous/key-cap-like and stops rotation, as do policy 403s and
+rate 429s. Failover never bypasses spending caps, rate limits or policy restrictions. Cooldowns
+are shared across workers by a credential hash, not by list position or label. Renaming a label or
+reordering entries preserves that credential's guard; replacing a credential does not inherit it.
+Logs show the readable label, never the key; control state stores only the credential hash.
+
+No pay-as-you-go or billing setting is enabled automatically, and no universal per-request credit
+cap is claimed; configure vendor key spend limits separately. After a 15-minute ambiguous-402
+cooldown and cached usage refresh, one caller-requested operation may retry only the same key;
+success clears the guard and another 402 restarts it. There are no background or dummy probes.
+The provider exposes no per-key reset date; a verified daily/weekly cap reset can be retried by
+that same-key operation. Container stop/restart or recreation clears the local `/tmp` guard,
+not the provider's spending limits.
 
 Search gives Firecrawl at most half of each stage's existing budget, including shared-lock waits,
 HTTP and URL validation: 10 of 20 seconds for discovery and 22.5 of 45 seconds for extraction by default.
