@@ -106,6 +106,54 @@ def test_required_labels_and_unique_credentials_reject_unsafe_or_ambiguous_input
             raise AssertionError("ambiguous or unlabeled legacy input accepted")
 
 
+def test_unknown_or_removed_credential_shaped_labels_fail_before_logging_or_network():
+    credentials = (
+        "fc-01234567-89ab-4cde-8fab-0123456789ab",
+        "fc-" + "0123456789abcdef" * 2,
+        "FC-" + "q7R2x9Z4" * 4,
+        "0123456789abcdef" * 2,
+        "01234567-89ab-4cde-8fab-0123456789ab",
+    )
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        return response(request, 401)
+
+    async def check():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            for index, credential in enumerate(credentials):
+                # A formerly configured credential is still valid as a key, never as a label.
+                previous = fc._parse_keys(json.dumps([{"label": "previous@example.test", "key": credential}]))
+                assert previous[0].keys == (credential,)
+                label = credential if index == 0 else f"retired {credential} @example.test"
+                raw = json.dumps([{"label": label, "key": "different-secret"}])
+                try:
+                    fc._parse_keys(raw)
+                except ValueError as exc:
+                    assert str(exc) == "labels must not contain credentials"
+                else:
+                    raise AssertionError("credential-shaped label accepted")
+                with patch.dict("os.environ", {"FIRECRAWL_KEYS_JSON": raw}, clear=True), patch.object(fc, "logger") as logs:
+                    instance = fc._load_controls()
+                    assert instance._config_error and not instance._budgets
+                    try:
+                        await instance.request(client, "/v2/search", {"query": "q"}, timeout=1)
+                    except fc.FirecrawlUnavailable as exc:
+                        assert str(exc) == "invalid_configuration" and exc.status is None
+                    else:
+                        raise AssertionError("credential-shaped label reached the provider")
+                logged = str(logs.mock_calls)
+                assert credential not in logged and label not in logged and "different-secret" not in logged
+                assert logs.warning.call_count == 1
+            for label in ("first.last+api@example.test", "fc-primary@example.test", "fc-primary"):
+                accepted = fc._parse_keys(json.dumps([{"label": label, "key": "different-secret"}]))
+                assert accepted[0].label == label
+
+    run(check())
+    assert seen == [], seen
+
+
 def test_environment_precedence_empty_disable_and_sanitized_invalid_configuration():
     legacy = '[{"id":"legacy@example.test","keys":["legacy-secret"]}]'
     labeled = '[{"label":"first@example.test","key":"labeled-secret"}]'

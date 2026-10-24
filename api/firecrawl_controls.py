@@ -71,6 +71,13 @@ def _key_slots(value: Any) -> tuple[_Budget, ...]:
         if not isinstance(label, str) or not label.isprintable() or not label.strip():
             raise ValueError("nonempty printable label required")
         label = label.strip()
+        # Removed or unknown credentials must not become readable labels either.
+        if re.search(
+            r"[a-f0-9]{32}|[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}|fc-[a-z0-9_-]{20,}",
+            label,
+            re.IGNORECASE,
+        ):
+            raise ValueError("labels must not contain credentials")
         if label in labels:
             raise ValueError("duplicate label")
         if not isinstance(key, str) or not re.fullmatch(r"[!-~]+", key) or "," in key or key in keys:
