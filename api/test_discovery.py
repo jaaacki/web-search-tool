@@ -1745,6 +1745,13 @@ def test_strict_not_configured_firecrawl_is_unsupported_not_retryable():
         app.health_cache_reset()
 
 
+def test_custom_tbs_is_firecrawl_only():
+    request = app.SearchRequest(query="q", tbs="qdr:w")
+    assert app.unsupported_search_features(request, "brave") == ["tbs"]
+    assert app.unsupported_search_features(request, "searxng") == ["tbs"]
+    assert app.search_filters(request)["tbs"] == "qdr:w"
+
+
 def test_fallback_query_and_params_translate_free_filters():
     request = app.SearchRequest(
         query="q",

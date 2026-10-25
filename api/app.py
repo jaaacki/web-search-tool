@@ -1381,6 +1381,7 @@ SEARCH_FEATURE_NAMES = (
     "include_domains",
     "exclude_domains",
     "time_range",
+    "tbs",
     "country",
     "location",
     "safe",
@@ -1409,8 +1410,10 @@ def requested_search_features(request: SearchRequest | None) -> dict[str, Any]:
         features["include_domains"] = request.include_domains
     if request.exclude_domains:
         features["exclude_domains"] = request.exclude_domains
-    if request.time_range or request.tbs:
-        features["time_range"] = request.time_range or request.tbs
+    if request.time_range:
+        features["time_range"] = request.time_range
+    if request.tbs:
+        features["tbs"] = request.tbs
     if request.country:
         features["country"] = request.country
     if request.location:
@@ -2864,9 +2867,10 @@ def chunk_documents(documents: list[dict]):
     chunks = []
     for document in documents:
         raw = document["content"]
-        # Image results carry their title/snippet as the passage; the menu-stub
-        # filter would drop those short lines entirely.
-        text = (raw if document.get("source") == "images" else strip_boilerplate_lines(raw))[:MAX_PAGE_CHARS]
+        # Image and extras-only results can carry a title/snippet as the passage;
+        # the menu-stub filter would drop those short lines entirely.
+        keep_short = document.get("source") == "images" or bool(document.get("extras"))
+        text = (raw if keep_short else strip_boilerplate_lines(raw))[:MAX_PAGE_CHARS]
         if not text:
             continue
 

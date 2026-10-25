@@ -81,8 +81,17 @@ def test_image_results_survive_the_menu_stub_filter():
     }
     chunks = app.chunk_documents([image])
     assert chunks and chunks[0]["content"] == "Photo", chunks
-    # The same short line is still treated as a menu stub for page results.
+    # The same short line is still treated as a menu stub for plain page results.
     assert app.chunk_documents([{**image, "source": "web"}]) == []
+    extras_only = {
+        "url": "https://a.example/",
+        "title": "Docs",
+        "snippet": "",
+        "content": "Docs",
+        "source": "web",
+        "extras": {"links": ["https://a.example/next"]},
+    }
+    assert app.chunk_documents([extras_only]), "extras-only results must survive"
 
 
 def demo():
