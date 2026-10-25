@@ -114,6 +114,9 @@ def check_free_surface_contract(client):
     for payload in (
         {"query": "q", "scrape_options": {"formats": 3}},
         {"query": "q", "scrape_options": {"formats": ["not-a-format"]}},
+        {"query": "q", "scrape_options": {"formats": [{"type": "attributes"}]}},
+        {"query": "q", "scrape_options": {"formats": [{"type": "question"}]}},
+        {"query": "q", "scrape_options": {"formats": [{"type": "highlights"}]}},
         {"query": "q", "categories": ["gov"], "safe": True},
     ):
         response = client.post("/search", json=payload, headers=headers)
@@ -135,14 +138,34 @@ def check_free_surface_contract(client):
     capped = app.cap_inline_extras(
         {
             "links": ["https://a.example/"],
-            "rawBase64": "x" * (app.MAX_EXTRAS_CHARS + 1),
-            "summary": "y" * (app.MAX_EXTRAS_CHARS + 1),
+            "rawBase64": "x" * (app.MAX_EXTRAS_BYTES + 1),
+            "summary": "y" * (app.MAX_EXTRAS_BYTES + 1),
         }
     )
     assert "rawBase64" not in capped, capped
     assert capped["omitted"] == ["rawBase64"], capped
     assert capped["links"] == ["https://a.example/"], capped
     assert capped["summary"].endswith("[truncated]"), capped["summary"][-20:]
+
+    results = [
+        app.SearchResult(
+            title="a",
+            url="https://a.example/",
+            content="c",
+            extras={"links": ["https://a.example/"], "rawBase64": "y" * 200},
+        ),
+        app.SearchResult(
+            title="b",
+            url="https://b.example/",
+            content="c",
+            extras={"summary": "z" * 200},
+        ),
+    ]
+    bounded, truncated = app.cap_result_extras(results, per_field=100, total=250)
+    assert truncated is True
+    assert bounded[0].extras["links"] == ["https://a.example/"], bounded[0].extras
+    assert bounded[0].extras["rawBase64"].endswith("[truncated]"), bounded[0].extras
+    assert bounded[1].extras["summary"].endswith("[truncated]"), bounded[1].extras
 
 
 def demo():

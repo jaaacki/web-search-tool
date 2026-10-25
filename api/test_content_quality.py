@@ -70,6 +70,21 @@ def test_search_crawl_request_asks_for_pruned_markdown():
     assert generator["params"]["options"]["ignore_links"] is True
 
 
+def test_image_results_survive_the_menu_stub_filter():
+    image = {
+        "url": "https://img.example/photo.png",
+        "title": "Photo",
+        "snippet": "",
+        "content": "Photo",
+        "source": "images",
+        "imageUrl": "https://img.example/photo.png",
+    }
+    chunks = app.chunk_documents([image])
+    assert chunks and chunks[0]["content"] == "Photo", chunks
+    # The same short line is still treated as a menu stub for page results.
+    assert app.chunk_documents([{**image, "source": "web"}]) == []
+
+
 def demo():
     for name, check in sorted(globals().items()):
         if name.startswith("test_"):

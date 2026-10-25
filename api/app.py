@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import ipaddress
+import json
 import logging
 import math
 import os
@@ -68,8 +69,16 @@ ALLOW_FIRECRAWL_ACTIONS = os.getenv("ALLOW_FIRECRAWL_ACTIONS", "").lower() in {"
 ALLOW_FIRECRAWL_HEADERS = os.getenv("ALLOW_FIRECRAWL_HEADERS", "").lower() in {"1", "true", "yes"}
 ALLOW_FIRECRAWL_PROFILE = os.getenv("ALLOW_FIRECRAWL_PROFILE", "").lower() in {"1", "true", "yes"}
 FIRECRAWL_FORMAT_TYPES = frozenset(FORMAT_RESPONSE_KEYS)
-# Keep inline extras bounded; rawBase64 above this is omitted rather than corrupted.
-MAX_EXTRAS_CHARS = int(os.getenv("SEARCH_MAX_EXTRAS_CHARS", "200000"))
+# Format objects that Firecrawl requires a companion field for.
+FIRECRAWL_FORMAT_REQUIREMENTS = {
+    "attributes": "selectors",
+    "question": "question",
+    "highlights": "query",
+}
+# Keep inline extras bounded in bytes; rawBase64 above this is omitted rather than corrupted.
+MAX_EXTRAS_BYTES = int(os.getenv("SEARCH_MAX_EXTRAS_BYTES", "200000"))
+# Keep the whole inline-extras payload below the MCP client's 2 MB response cap.
+MAX_TOTAL_EXTRAS_BYTES = int(os.getenv("SEARCH_MAX_TOTAL_EXTRAS_BYTES", "1000000"))
 # Optional Brave Search API keys (comma-separated) for primary discovery.
 # Empty = SearXNG-only discovery, exactly today's behavior.
 BRAVE_API_KEYS = tuple(key.strip() for key in os.getenv("BRAVE_API_KEYS", "").split(",") if key.strip())
@@ -380,7 +389,7 @@ class SearchRequest(BaseModel):
         description=(
             "Inline Firecrawl scrape options for every search result: `formats` plus the normal scrape options. Markdown is used as the "
             "reranked content; every other returned field is exposed as `extras`. `storeInCache` defaults to false; set true to opt into "
-            "Firecrawl caching. `rawBase64` above SEARCH_MAX_EXTRAS_CHARS is omitted. Enterprise-only controls (`zeroDataRetention`, "
+            "Firecrawl caching. `rawBase64` above SEARCH_MAX_EXTRAS_BYTES is omitted. Enterprise-only controls (`zeroDataRetention`, "
             "`threatProtection`, `alexandria`, `domainTools`) are rejected."
         ),
         examples=[{"formats": ["markdown", "links"], "onlyMainContent": True}],
@@ -391,7 +400,7 @@ class SearchRequest(BaseModel):
         le=200_000,
         description=(
             "Truncate each returned `content` after ranking. Snippets are unchanged; inline extras are bounded separately by "
-            "SEARCH_MAX_EXTRAS_CHARS."
+            "SEARCH_MAX_EXTRAS_BYTES."
         ),
         examples=[4000],
     )
@@ -451,6 +460,14 @@ class SearchRequest(BaseModel):
                     fmt = item if isinstance(item, str) else item.get("type") if isinstance(item, dict) else None
                     if fmt not in FIRECRAWL_FORMAT_TYPES:
                         raise ValueError(f"unsupported scrape format: {fmt!r}")
+                    required = FIRECRAWL_FORMAT_REQUIREMENTS.get(fmt)
+                    if required:
+                        value = item.get(required) if isinstance(item, dict) else None
+                        if required == "selectors":
+                            if not isinstance(value, list) or not value:
+                                raise ValueError(f"{fmt} requires a non-empty selectors array")
+                        elif not isinstance(value, str) or not value.strip():
+                            raise ValueError(f"{fmt} requires a non-empty {required} string")
             unavailable = {
                 "zeroDataRetention",
                 "threatProtection",
@@ -1069,13 +1086,19 @@ async def search(request: SearchRequest):
             result.model_copy(update={"content": truncate_content(result.content, request.max_content_chars)})
             for result in ranked
         ]
+    ranked, extras_truncated = cap_result_extras(ranked)
     logger.info(
         "search q_id=%s depth=%s candidates=%d pages=%d chunks=%d results=%d discovery=%.0fms crawl=%.0fms rerank=%.0fms elapsed=%.0fms rerank_path=%s",
         query_id, request.depth, len(candidates), len(pages), len(chunks), len(ranked),
         _ms(started, discovered), _ms(discovered, crawled), _ms(crawled), _ms(started), rerank_path,
     )
 
-    return search_response(request.query, ranked, degraded or None)
+    return search_response(
+        request.query,
+        ranked,
+        degraded or None,
+        ["inline extras were truncated to the response budget"] if extras_truncated else None,
+    )
 
 
 @app.get(
@@ -1673,17 +1696,61 @@ async def firecrawl_metadata_url_is_public(response: httpx.Response, deadline: f
     return await asyncio.wait_for(is_allowed_public_url(url), timeout=remaining)
 
 
+def truncate_bytes(text: str, limit: int) -> str:
+    encoded = text.encode("utf-8")
+    if len(encoded) <= limit:
+        return text
+    return encoded[: max(limit, 0)].decode("utf-8", "ignore") + "\n\n[truncated]"
+
+
+def cap_result_extras(
+    results: list[SearchResult],
+    per_field: int = MAX_EXTRAS_BYTES,
+    total: int = MAX_TOTAL_EXTRAS_BYTES,
+) -> tuple[list[SearchResult], bool]:
+    """Bound extras in UTF-8 bytes across the whole response, not just per field."""
+    budget = max(total, 0)
+    truncated = False
+    capped_results = []
+    for result in results:
+        extras = result.extras
+        if not isinstance(extras, dict) or not extras:
+            capped_results.append(result)
+            continue
+        capped: dict[str, Any] = {}
+        for key, value in extras.items():
+            if isinstance(value, str):
+                limit = min(per_field, budget)
+                if limit <= 0:
+                    truncated = True
+                    continue
+                if len(value.encode("utf-8")) > limit:
+                    value = truncate_bytes(value, limit)
+                    truncated = True
+                capped[key] = value
+                budget -= len(value.encode("utf-8"))
+            else:
+                encoded = json.dumps(value, ensure_ascii=False, default=str).encode("utf-8")
+                if len(encoded) > budget:
+                    truncated = True
+                    continue
+                capped[key] = value
+                budget -= len(encoded)
+        capped_results.append(result.model_copy(update={"extras": capped or None}))
+    return capped_results, truncated
+
+
 def cap_inline_extras(extras: Any) -> Any:
     if not isinstance(extras, dict):
         return extras
     capped: dict[str, Any] = {}
     omitted = []
     for key, value in extras.items():
-        if isinstance(value, str) and len(value) > MAX_EXTRAS_CHARS:
+        if isinstance(value, str) and len(value.encode("utf-8")) > MAX_EXTRAS_BYTES:
             if key == "rawBase64":
                 omitted.append(key)
                 continue
-            capped[key] = value[:MAX_EXTRAS_CHARS] + "\n\n[truncated]"
+            capped[key] = truncate_bytes(value, MAX_EXTRAS_BYTES)
         else:
             capped[key] = value
     if omitted:
@@ -2796,7 +2863,10 @@ def chunk_documents(documents: list[dict]):
     """
     chunks = []
     for document in documents:
-        text = strip_boilerplate_lines(document["content"])[:MAX_PAGE_CHARS]
+        raw = document["content"]
+        # Image results carry their title/snippet as the passage; the menu-stub
+        # filter would drop those short lines entirely.
+        text = (raw if document.get("source") == "images" else strip_boilerplate_lines(raw))[:MAX_PAGE_CHARS]
         if not text:
             continue
 
@@ -3100,8 +3170,9 @@ def search_response(
     query: str,
     results: list[SearchResult],
     degraded: dict[str, Any] | None = None,
+    extra_warnings: list[str] | None = None,
 ):
-    warnings = []
+    warnings = list(extra_warnings or [])
     if degraded:
         for item in degraded.get("providers", []):
             unsupported = item.get("unsupported") or []

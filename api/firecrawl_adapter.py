@@ -30,13 +30,21 @@ INLINE_FIELDS = (
     "markdown",
     "html",
     "rawHtml",
+    "rawBase64",
     "links",
     "images",
     "screenshot",
     "summary",
     "json",
+    "changeTracking",
+    "branding",
+    "product",
+    "menu",
+    "audio",
+    "video",
     "answer",
     "highlights",
+    "attributes",
     "metadata",
 )
 
@@ -172,7 +180,7 @@ def inline_scrape_result(item: dict[str, Any], requested_url: str) -> dict[str, 
     Accepts extras-only results (for example `formats: ["links"]`); the caller
     supplies snippet/title as the passage when Markdown is absent.
     """
-    if not isinstance(item, dict) or item.get("rawBase64"):
+    if not isinstance(item, dict):
         return None
     metadata = item.get("metadata")
     reported_url = None

@@ -163,7 +163,21 @@ def test_inline_scrape_result_uses_search_markdown_and_extras():
     ) is None
     assert adapter.inline_scrape_result(
         {"markdown": "# Raw", "rawBase64": "AAAA"}, "https://a.example/"
-    ) is None
+    ) == {
+        "url": "https://a.example/",
+        "content": "# Raw",
+        "extras": {"rawBase64": "AAAA"},
+    }
+    assert adapter.inline_scrape_result(
+        {
+            "attributes": [{"selector": "h1", "attribute": "text", "values": ["A"]}],
+            "branding": {"colorScheme": "light"},
+        },
+        "https://a.example/",
+    )["extras"] == {
+        "attributes": [{"selector": "h1", "attribute": "text", "values": ["A"]}],
+        "branding": {"colorScheme": "light"},
+    }
     assert adapter.inline_scrape_result({"markdown": "   "}, "https://a.example/") is None
 
 
