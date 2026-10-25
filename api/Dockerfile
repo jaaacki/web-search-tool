@@ -10,10 +10,13 @@ COPY requirements.txt .
 RUN pip install -r requirements.txt \
     && pip check \
     && addgroup --system app \
-    && adduser --system --ingroup app app
+    && adduser --system --ingroup app app \
+    && mkdir -p /data \
+    && chown app:app /data
 
 COPY --chown=app:app app.py .
 COPY --chown=app:app firecrawl_adapter.py .
+COPY --chown=app:app observability.py .
 USER app
 COPY --chown=app:app firecrawl_controls.py .
 

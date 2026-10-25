@@ -144,6 +144,44 @@ def test_bulk_reordered_redirects_keep_original_candidate_identity():
     run(check())
 
 
+def test_pdf_candidates_use_the_pdf_scraping_strategy():
+    pdf = {
+        "url": "https://a.example/report.pdf",
+        "title": "PDF",
+        "snippet": "",
+        "_firecrawl_category": "pdf",
+    }
+    html = candidate("https://b.example/", "HTML")
+    calls = []
+
+    async def fake_call(_client, payload):
+        calls.append(payload)
+        return {
+            "success": True,
+            "results": [crawl_item(url, f"content {url}") for url in payload["urls"]],
+        }
+
+    async def check():
+        saved_call, saved_allow = app.call_crawl4ai, app.is_allowed_public_url
+        app.call_crawl4ai, app.is_allowed_public_url = fake_call, allow_public
+        try:
+            pages, retry = await app._bulk_crawl(None, [pdf, html])
+        finally:
+            app.call_crawl4ai, app.is_allowed_public_url = saved_call, saved_allow
+        assert not retry, retry
+        assert len(pages) == 2, pages
+        assert len(calls) == 2, calls
+        by_url = {call["urls"][0]: call for call in calls}
+        assert (
+            by_url["https://a.example/report.pdf"]["crawler_config"]["scraping_strategy"]["type"]
+            == "PDFContentScrapingStrategy"
+        ), by_url
+        assert "scraping_strategy" not in by_url["https://b.example/"]["crawler_config"], by_url
+        assert "pdf" not in by_url["https://a.example/report.pdf"]["crawler_config"], by_url
+
+    run(check())
+
+
 def test_ambiguous_bulk_rows_are_not_guessed_and_missing_targets_recover():
     candidates = [candidate("https://a.example/", "A"), candidate("https://b.example/", "B")]
     calls = []

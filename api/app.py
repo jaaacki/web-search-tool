@@ -1,5 +1,7 @@
 import asyncio
+import hashlib
 import ipaddress
+import json
 import logging
 import math
 import os
@@ -7,6 +9,7 @@ import re
 import secrets
 import socket
 import time
+import uuid
 from collections import Counter
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -22,10 +25,14 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import JSONResponse
 from fastapi.security import APIKeyHeader
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from firecrawl_adapter import (
+    FORMAT_RESPONSE_KEYS,
+    inline_scrape_result as firecrawl_inline_result,
     is_pdf_target,
+    missing_inline_formats,
+    normalize_formats,
     scrape_payload as firecrawl_scrape_payload,
     scrape_target_url as firecrawl_scrape_target_url,
     scrape_result as firecrawl_scrape_result,
@@ -35,6 +42,7 @@ from firecrawl_adapter import (
     supports_markdown_crawl,
 )
 from firecrawl_controls import FirecrawlUnavailable, firecrawl_request, firecrawl_url_allowed
+from observability import ContextFormatter, JsonFormatter, RequestIdFilter, request_id_var
 
 SEARXNG_URL = os.getenv("SEARXNG_URL", "http://searxng:8080").rstrip("/")
 CRAWL4AI_URL = os.getenv("CRAWL4AI_URL", "http://crawl4ai:11235").rstrip("/")
@@ -55,6 +63,183 @@ CRAWL_CONCURRENCY = int(os.getenv("CRAWL_CONCURRENCY", "8"))
 # The UA we send has to match the engine that renders the page, so bump this with the image.
 CRAWL4AI_CHROMIUM_VERSION = os.getenv("CRAWL4AI_CHROMIUM_VERSION", "156.0.8078.4")
 WEBSEARCH_API_KEY = os.getenv("WEBSEARCH_API_KEY", "")
+# Firecrawl inline scrape can run browser actions, send caller headers, or reuse a
+# persistent profile. Keep those off unless the operator opts in explicitly.
+ALLOW_FIRECRAWL_ACTIONS = os.getenv("ALLOW_FIRECRAWL_ACTIONS", "").lower() in {"1", "true", "yes"}
+ALLOW_FIRECRAWL_HEADERS = os.getenv("ALLOW_FIRECRAWL_HEADERS", "").lower() in {"1", "true", "yes"}
+ALLOW_FIRECRAWL_PROFILE = os.getenv("ALLOW_FIRECRAWL_PROFILE", "").lower() in {"1", "true", "yes"}
+LOG_QUERIES = os.getenv("LOG_QUERIES", "").lower() in {"1", "true", "yes"}
+FIRECRAWL_FORMAT_TYPES = frozenset(FORMAT_RESPONSE_KEYS)
+# Format objects that Firecrawl requires a companion field for.
+FIRECRAWL_FORMAT_REQUIREMENTS = {
+    "attributes": "selectors",
+    "question": "question",
+    "highlights": "query",
+}
+FIRECRAWL_SCRAPE_OPTION_KEYS = frozenset(
+    {
+        "formats",
+        "onlyMainContent",
+        "onlyCleanContent",
+        "includeTags",
+        "excludeTags",
+        "maxAge",
+        "minAge",
+        "headers",
+        "waitFor",
+        "mobile",
+        "skipTlsVerification",
+        "timeout",
+        "parsers",
+        "actions",
+        "location",
+        "removeBase64Images",
+        "blockAds",
+        "proxy",
+        "storeInCache",
+        "lockdown",
+        "checkPromptInjection",
+        "redactPII",
+        "profile",
+        "auditMetadata",
+    }
+)
+FIRECRAWL_ACTION_TYPES = frozenset(
+    {
+        "wait",
+        "screenshot",
+        "click",
+        "write",
+        "press",
+        "scroll",
+        "scrape",
+        "executeJavascript",
+        "pdf",
+    }
+)
+
+
+def validate_scrape_options(options: dict[str, Any]) -> None:
+    unknown = set(options) - FIRECRAWL_SCRAPE_OPTION_KEYS
+    if unknown:
+        raise ValueError(f"unsupported scrape_options keys: {sorted(unknown)}")
+    formats = options.get("formats")
+    if formats is not None:
+        if not isinstance(formats, list) or not formats:
+            raise ValueError("scrape_options.formats must be a non-empty array")
+        for item in formats:
+            fmt = item if isinstance(item, str) else item.get("type") if isinstance(item, dict) else None
+            if fmt not in FIRECRAWL_FORMAT_TYPES:
+                raise ValueError(f"unsupported scrape format: {fmt!r}")
+            if fmt in ("json", "changeTracking", "attributes", "question", "highlights") and not isinstance(
+                item, dict
+            ):
+                raise ValueError(f"{fmt} requires a format object")
+            required = FIRECRAWL_FORMAT_REQUIREMENTS.get(fmt)
+            if required:
+                value = item.get(required)
+                if required == "selectors":
+                    if not isinstance(value, list) or not value:
+                        raise ValueError(f"{fmt} requires a non-empty selectors array")
+                    for selector in value:
+                        if (
+                            not isinstance(selector, dict)
+                            or not isinstance(selector.get("selector"), str)
+                            or not selector["selector"].strip()
+                            or not isinstance(selector.get("attribute"), str)
+                            or not selector["attribute"].strip()
+                        ):
+                            raise ValueError(
+                                "attributes.selectors entries require selector and attribute strings"
+                            )
+                elif not isinstance(value, str) or not value.strip():
+                    raise ValueError(f"{fmt} requires a non-empty {required} string")
+            if fmt == "json":
+                schema = item.get("schema")
+                prompt = item.get("prompt")
+                if not isinstance(schema, dict) and not (
+                    isinstance(prompt, str) and prompt.strip()
+                ):
+                    raise ValueError("json requires a schema object or a prompt string")
+            if fmt == "changeTracking":
+                modes = item.get("modes")
+                if (
+                    not isinstance(modes, list)
+                    or not modes
+                    or any(mode not in ("git-diff", "json") for mode in modes)
+                ):
+                    raise ValueError("changeTracking requires modes from git-diff or json")
+            if fmt == "screenshot" and isinstance(item, dict):
+                quality = item.get("quality")
+                if quality is not None and (
+                    not isinstance(quality, int)
+                    or isinstance(quality, bool)
+                    or not 1 <= quality <= 100
+                ):
+                    raise ValueError("screenshot quality must be an integer from 1 to 100")
+                full_page = item.get("fullPage")
+                if full_page is not None and not isinstance(full_page, bool):
+                    raise ValueError("screenshot fullPage must be boolean")
+    actions = options.get("actions")
+    if actions is not None:
+        if not isinstance(actions, list) or not actions:
+            raise ValueError("actions must be a non-empty array")
+        if any(
+            not isinstance(action, dict) or action.get("type") not in FIRECRAWL_ACTION_TYPES
+            for action in actions
+        ):
+            raise ValueError("actions entries require a supported type")
+    headers = options.get("headers")
+    if headers is not None:
+        if not isinstance(headers, dict) or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in headers.items()
+        ):
+            raise ValueError("headers must be an object of string values")
+    profile = options.get("profile")
+    if profile is not None:
+        if (
+            not isinstance(profile, dict)
+            or not isinstance(profile.get("name"), str)
+            or not profile["name"].strip()
+        ):
+            raise ValueError("profile requires a non-empty name")
+    parsers = options.get("parsers")
+    if parsers is not None:
+        if not isinstance(parsers, list):
+            raise ValueError("parsers must be an array")
+        for parser in parsers:
+            parser_type = (
+                parser
+                if isinstance(parser, str)
+                else parser.get("type")
+                if isinstance(parser, dict)
+                else None
+            )
+            if parser_type not in ("pdf", "image"):
+                raise ValueError("parsers entries must be pdf or image")
+    proxy = options.get("proxy")
+    if proxy is not None and proxy not in ("basic", "enhanced", "auto"):
+        raise ValueError("proxy must be basic, enhanced, or auto")
+    wait_for = options.get("waitFor")
+    if wait_for is not None and (
+        not isinstance(wait_for, int)
+        or isinstance(wait_for, bool)
+        or not 0 <= wait_for <= 60_000
+    ):
+        raise ValueError("waitFor must be an integer from 0 to 60000")
+    timeout = options.get("timeout")
+    if timeout is not None and (
+        not isinstance(timeout, int)
+        or isinstance(timeout, bool)
+        or not 1_000 <= timeout <= 300_000
+    ):
+        raise ValueError("timeout must be an integer from 1000 to 300000")
+# Keep inline extras bounded in bytes; rawBase64 above this is omitted rather than corrupted.
+MAX_EXTRAS_BYTES = int(os.getenv("SEARCH_MAX_EXTRAS_BYTES", "200000"))
+# Keep the whole inline-extras payload below the MCP client's 2 MB response cap.
+MAX_TOTAL_EXTRAS_BYTES = int(os.getenv("SEARCH_MAX_TOTAL_EXTRAS_BYTES", "1000000"))
+MAX_METADATA_BYTES = int(os.getenv("SEARCH_MAX_METADATA_BYTES", "20000"))
 # Optional Brave Search API keys (comma-separated) for primary discovery.
 # Empty = SearXNG-only discovery, exactly today's behavior.
 BRAVE_API_KEYS = tuple(key.strip() for key in os.getenv("BRAVE_API_KEYS", "").split(",") if key.strip())
@@ -104,7 +289,12 @@ TOKEN_RE = re.compile(r"[\w-]+", re.UNICODE)
 logger = logging.getLogger("websearch")
 if not logger.handlers:  # uvicorn only configures its own loggers; without this our INFO is swallowed
     _handler = logging.StreamHandler()
-    _handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+    _handler.setFormatter(
+        JsonFormatter()
+        if os.getenv("LOG_FORMAT", "text").lower() == "json"
+        else ContextFormatter("%(levelname)s: %(message)s")
+    )
+    _handler.addFilter(RequestIdFilter())
     logger.addHandler(_handler)
 logger.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
 
@@ -143,7 +333,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="SparkFN Web Search and Crawl API",
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
     description=(
         "Authenticated APIs for AI agents and MCP/CLI tools. "
@@ -153,6 +343,22 @@ app = FastAPI(
     docs_url=None,
     openapi_url=None,
 )
+_REQUEST_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+
+
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    incoming = request.headers.get("x-request-id", "")
+    request_id = incoming if _REQUEST_ID_RE.fullmatch(incoming) else uuid.uuid4().hex
+    token = request_id_var.set(request_id)
+    try:
+        response = await call_next(request)
+    finally:
+        request_id_var.reset(token)
+    response.headers["X-Request-ID"] = request_id
+    return response
+
+
 api_key_header = APIKeyHeader(
     name="X-API-Key",
     auto_error=False,
@@ -196,6 +402,11 @@ class ErrorDetail(BaseModel):
         default=None,
         description="The next action to take, when one is knowable: a command to run, or the setting to change.",
         examples=["Set SEARXNG_ENGINES to a comma-separated engine list and restart the API."],
+    )
+    request_id: str | None = Field(
+        default=None,
+        description="Correlation id also returned in the X-Request-ID response header and written to the usage ledger.",
+        examples=["9f2c1d4e5a6b7c8d"],
     )
 
 
@@ -244,10 +455,10 @@ class SearchRequest(BaseModel):
     candidates: int = Field(
         default=SEARCH_CANDIDATES,
         ge=1,
-        le=50,
+        le=100,
         description=(
             "Number of search candidates to fetch before crawling and reranking. Higher values may improve recall but increase latency "
-            "because more pages may be crawled."
+            "because more pages may be crawled; very high values can exhaust the discovery validation budget on slow DNS."
         ),
         examples=[10],
     )
@@ -260,6 +471,169 @@ class SearchRequest(BaseModel):
         ),
         examples=["basic"],
     )
+    sources: list[Literal["web", "news", "images"]] = Field(
+        default_factory=lambda: ["web"],
+        min_length=1,
+        max_length=3,
+        description=(
+            "Firecrawl result sources. `web` is the default; `news` and `images` add their result arrays. `images` results are "
+            "returned as image metadata (`image_url`, `position`) without page extraction. Non-web sources are Firecrawl-only: "
+            "strict mode returns `unsupported_feature` or `fallback_feature_unavailable` when a fallback would have to drop them, "
+            "and `allow_degraded` returns the web subset with a warning."
+        ),
+        examples=[["web"], ["web", "news"]],
+    )
+    categories: list[Literal["developer", "gov", "research", "pdf"]] = Field(
+        default_factory=list,
+        max_length=4,
+        description=(
+            "Firecrawl category filters. `developer` targets repositories/docs, `gov` government material, `research` academic "
+            "sites, `pdf` PDF results. `gov` cannot be combined with other categories or filters. Firecrawl-only."
+        ),
+        examples=[["developer"], ["pdf"]],
+    )
+    include_domains: list[str] = Field(
+        default_factory=list,
+        max_length=20,
+        description=(
+            "Hostnames to include. Cannot be combined with `exclude_domains`. Firecrawl uses `includeDomains`; Brave and "
+            "SearXNG use `site:` operators. When set, the automatic LinkedIn/X/shortener exclusions are not applied."
+        ),
+        examples=[["docs.python.org"]],
+    )
+    exclude_domains: list[str] = Field(
+        default_factory=list,
+        max_length=20,
+        description="Hostnames to exclude. Cannot be combined with `include_domains`. Brave and SearXNG use `-site:` operators.",
+        examples=[["pinterest.com"]],
+    )
+    time_range: Literal["day", "week", "month", "year"] | None = Field(
+        default=None,
+        description="Recency filter. Firecrawl maps it to `tbs`; Brave to `freshness`; SearXNG to `time_range`.",
+        examples=["week"],
+    )
+    tbs: str | None = Field(
+        default=None,
+        max_length=100,
+        description="Raw Firecrawl `tbs` filter (for example `qdr:w` or a custom `cdr:` range). Cannot be combined with `time_range`.",
+        examples=["qdr:w"],
+    )
+    country: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z]{2}$",
+        description="ISO alpha-2 country for Firecrawl/Brave geo targeting. SearXNG has no country parameter, so strict mode reports the loss.",
+        examples=["US"],
+    )
+    location: str | None = Field(
+        default=None,
+        max_length=200,
+        description="Firecrawl location string such as `city,state,country`. Firecrawl-only; strict mode reports the loss on fallback.",
+        examples=["San Francisco,California,United States"],
+    )
+    safe: bool | None = Field(
+        default=None,
+        description="Filter explicit results. Supported by Firecrawl, Brave, and SearXNG.",
+        examples=[True],
+    )
+    highlights: bool | None = Field(
+        default=None,
+        description="Ask Firecrawl for query-relevant highlights instead of provider snippets. Firecrawl-only.",
+        examples=[True],
+    )
+    ignore_invalid_urls: bool = Field(
+        default=False,
+        description="Ask Firecrawl to drop URLs unsuitable for its other endpoints. Firecrawl-only; local validation still checks every returned URL.",
+        examples=[True],
+    )
+    scrape_options: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Inline Firecrawl scrape options for every search result: `formats` plus the normal scrape options. Markdown is used as the "
+            "reranked content; every other returned field is exposed as `extras`. `storeInCache` defaults to false; set true to opt into "
+            "Firecrawl caching. `rawBase64` above SEARCH_MAX_EXTRAS_BYTES is omitted. Enterprise-only controls (`zeroDataRetention`, "
+            "`threatProtection`, `alexandria`, `domainTools`) are rejected."
+        ),
+        examples=[{"formats": ["markdown", "links"], "onlyMainContent": True}],
+    )
+    max_content_chars: int | None = Field(
+        default=None,
+        ge=200,
+        le=200_000,
+        description=(
+            "Truncate each returned `content` after ranking. Snippets are unchanged; inline extras are bounded separately by "
+            "SEARCH_MAX_EXTRAS_BYTES."
+        ),
+        examples=[4000],
+    )
+    allow_degraded: bool = Field(
+        default=False,
+        description=(
+            "Strict mode by default. When a fallback provider cannot honor a requested feature, the request fails with "
+            "`fallback_feature_unavailable`. Set this true to accept the subset, with `data.degraded` naming every unsupported feature."
+        ),
+        examples=[True],
+    )
+
+    @field_validator("include_domains", "exclude_domains")
+    @classmethod
+    def _validate_domains(cls, values: list[str]) -> list[str]:
+        cleaned = []
+        for value in values:
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError("domains must be non-empty hostnames")
+            host = value.strip().lower().rstrip(".")
+            if any(token in host for token in ("/", ":", " ", "@")):
+                raise ValueError("domains must be hostnames without scheme, port, path, or credentials")
+            cleaned.append(host)
+        return cleaned
+
+    @model_validator(mode="after")
+    def _validate_combinations(self) -> "SearchRequest":
+        if self.include_domains and self.exclude_domains:
+            raise ValueError("include_domains and exclude_domains cannot be combined")
+        if self.time_range and self.tbs:
+            raise ValueError("time_range and tbs cannot be combined")
+        if len(self.sources) != len(set(self.sources)):
+            raise ValueError("sources must be unique")
+        if "gov" in self.categories and (
+            len(self.categories) > 1
+            or self.sources != ["web"]
+            or self.include_domains
+            or self.exclude_domains
+            or self.time_range
+            or self.tbs
+            or self.country
+            or self.location
+            or self.safe is not None
+            or self.highlights is not None
+        ):
+            raise ValueError("gov cannot be combined with other categories or filters")
+        if self.scrape_options is not None:
+            if not isinstance(self.scrape_options, dict):
+                raise ValueError("scrape_options must be an object")
+            if self.depth != "advanced":
+                raise ValueError("scrape_options requires depth=advanced")
+            unavailable = {
+                "zeroDataRetention",
+                "threatProtection",
+                "alexandria",
+                "domainTools",
+            } & set(self.scrape_options)
+            if unavailable:
+                raise ValueError(f"unavailable on the free plan: {sorted(unavailable)}")
+            validate_scrape_options(self.scrape_options)
+            gated = {
+                "actions": ALLOW_FIRECRAWL_ACTIONS,
+                "headers": ALLOW_FIRECRAWL_HEADERS,
+                "profile": ALLOW_FIRECRAWL_PROFILE,
+            }
+            disabled = [key for key, allowed in gated.items() if key in self.scrape_options and not allowed]
+            if disabled:
+                raise ValueError(
+                    f"disabled by operator: {', '.join(disabled)} "
+                    "(set ALLOW_FIRECRAWL_ACTIONS/HEADERS/PROFILE to enable)"
+                )
+        return self
 
 
 class SearchResult(BaseModel):
@@ -277,12 +651,54 @@ class SearchResult(BaseModel):
         description="Normalized relevance score from the reranker when available. Higher is better; null means no numeric score was produced.",
         examples=[0.87],
     )
+    source: Literal["web", "news", "images"] | None = Field(
+        default=None,
+        description="Discovery source that produced this result. Null when the fallback provider does not label it.",
+        examples=["web"],
+    )
+    published_date: str | None = Field(
+        default=None,
+        description="Provider-published date for news results, when Firecrawl returns one.",
+        examples=["2026-10-24T12:00:00.000Z"],
+    )
+    image_url: str | None = Field(
+        default=None,
+        description="Associated image URL for news or image results.",
+        examples=["https://example.com/cover.png"],
+    )
+    position: int | None = Field(
+        default=None,
+        description="Provider result position for news or image sources.",
+        examples=[1],
+    )
+    metadata: dict[str, Any] | None = Field(
+        default=None,
+        description="Inline scrape metadata returned with `scrape_options` (title, description, language, status, final URL).",
+    )
+    extras: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Inline Firecrawl fields returned by `scrape_options` that are not the reranked markdown: html, rawHtml, links, images, "
+            "screenshot, summary, json, answer, highlights, and similar format payloads."
+        ),
+    )
 
 
 class SearchData(BaseModel):
     query: str = Field(description="Original query string that was searched.", examples=["open source web search engines"])
     results: list[SearchResult] = Field(
         description="Reranked extracted results. Empty list is a successful no-results response, not an error.",
+    )
+    degraded: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Present only when `allow_degraded` accepted a provider that could not honor every requested feature. "
+            "Names the provider and the unsupported features."
+        ),
+    )
+    warnings: list[str] = Field(
+        default_factory=list,
+        description="Human-readable notices mirroring `degraded`, suitable for surfacing to the caller.",
     )
 
 
@@ -549,7 +965,10 @@ async def app_error_handler(_: Request, exc: AppError):
 
 @app.exception_handler(RequestValidationError)
 async def validation_error_handler(_: Request, exc: RequestValidationError):
-    return error_response(422, "validation_error", "Request validation failed", exc.errors())
+    # Model-validator errors carry the original ValueError in ctx; encode it as text
+    # instead of letting jsonable_encoder fail on an unknown type.
+    details = jsonable_encoder(exc.errors(), custom_encoder={ValueError: str})
+    return error_response(422, "validation_error", "Request validation failed", details)
 
 
 @app.exception_handler(HTTPException)
@@ -703,10 +1122,13 @@ def openapi(request: Request):
     summary="Search the web and return extracted, reranked page content",
     description=(
         "Use this endpoint when the caller has a question or topic and needs current web evidence. Firecrawl is the primary discovery "
-        "provider when configured, with Brave and SearXNG as fallbacks/top-up. Advanced search uses Firecrawl Markdown for eligible "
-        "Firecrawl results and Crawl4AI for remaining pages, then chunks and reranks the content. Basic search returns discovery snippets "
-        "without scraping. Prefer this POST endpoint for MCP/CLI tools because the request body is explicit and easy to validate. "
-        "If `data.results` is empty, the request succeeded but no usable pages were found."
+        "provider when configured, with Brave and SearXNG as fallbacks/top-up. Accepts the free Firecrawl v2 search surface: sources, "
+        "categories, domain/time/geo filters, safe/highlights, and inline `scrape_options`. Advanced search uses Firecrawl Markdown for "
+        "eligible Firecrawl results and Crawl4AI for remaining pages, then chunks and reranks the content. Basic search returns discovery "
+        "snippets without scraping. Requested features that a fallback cannot honor fail loudly by default (`unsupported_feature` / "
+        "`fallback_feature_unavailable`); `allow_degraded` accepts the subset with `data.degraded` and warnings. Prefer this POST endpoint "
+        "for MCP/CLI tools because the request body is explicit and easy to validate. If `data.results` is empty, the request succeeded "
+        "but no usable pages were found."
     ),
     operation_id="search_web",
     tags=["Search"],
@@ -734,10 +1156,16 @@ def openapi(request: Request):
 async def search(request: SearchRequest):
     client = await get_client()
     started = time.perf_counter()
-    candidates = await discover_candidates(client, request.query, request.candidates)
+    query_id = hashlib.sha256(request.query.encode("utf-8")).hexdigest()[:12]
+    if LOG_QUERIES:
+        logger.debug("search query=%r", request.query)
+    degraded: dict[str, Any] = {}
+    candidates = await discover_candidates(
+        client, request.query, request.candidates, request, degraded
+    )
     if not candidates:
-        logger.info("search q=%r results=0 elapsed=%.0fms stage=discovery", request.query, _ms(started))
-        return search_response(request.query, [])
+        logger.info("search q_id=%s results=0 elapsed=%.0fms stage=discovery", query_id, _ms(started))
+        return search_response(request.query, [], degraded or None)
 
     discovered = time.perf_counter()
     if request.depth == "basic":
@@ -746,9 +1174,31 @@ async def search(request: SearchRequest):
         crawl_started = asyncio.get_running_loop().time()
         crawl_deadline = crawl_started + CRAWL_TIMEOUT
         firecrawl_deadline = crawl_started + CRAWL_TIMEOUT / 2
+        extraction_loss: set[str] = set()
         firecrawl_pages, crawl_candidates, policy_denied = await scrape_firecrawl_candidates(
-            client, candidates, firecrawl_deadline
+            client, candidates, firecrawl_deadline, request, extraction_loss
         )
+        if extraction_loss and not request.allow_degraded:
+            raise AppError(
+                503,
+                "fallback_feature_unavailable",
+                "Firecrawl could not return the requested scrape features and the fallback cannot honor them",
+                {
+                    "provider": "firecrawl",
+                    "fallback_provider": "crawl4ai",
+                    "unsupported": sorted(extraction_loss),
+                },
+                retryable=True,
+                retry_after=OUTAGE_RETRY_AFTER,
+                hint=(
+                    "Retry when Firecrawl recovers, or set allow_degraded=true "
+                    "to accept the formats the fallback can return."
+                ),
+            )
+        if extraction_loss:
+            degraded.setdefault("providers", []).append(
+                {"provider": "crawl4ai", "unsupported": sorted(extraction_loss)}
+            )
         pages = firecrawl_pages
         if crawl_candidates:
             try:
@@ -767,10 +1217,10 @@ async def search(request: SearchRequest):
             )
     if not pages:
         logger.info(
-            "search q=%r depth=%s candidates=%d results=0 discovery=%.0fms crawl=%.0fms elapsed=%.0fms",
-            request.query, request.depth, len(candidates), _ms(started, discovered), _ms(discovered), _ms(started),
+            "search q_id=%s depth=%s candidates=%d results=0 discovery=%.0fms crawl=%.0fms elapsed=%.0fms",
+            query_id, request.depth, len(candidates), _ms(started, discovered), _ms(discovered), _ms(started),
         )
-        return search_response(request.query, [])
+        return search_response(request.query, [], degraded or None)
 
     crawled = time.perf_counter()
     # Basic pages are already the passages: a snippet is a clean summary, and the
@@ -778,13 +1228,38 @@ async def search(request: SearchRequest):
     # most snippets), so they go to the reranker as-is.
     chunks = pages if request.depth == "basic" else chunk_documents(pages)
     ranked, rerank_path = await rerank(client, request.query, chunks, request.max_results)
+    if request.max_content_chars:
+        ranked = [
+            result.model_copy(update={"content": truncate_content(result.content, request.max_content_chars)})
+            for result in ranked
+        ]
+    ranked, extras_truncated = cap_result_extras(ranked)
+    omitted_extras = sorted(
+        {
+            str(key)
+            for result in ranked
+            if isinstance(result.extras, dict)
+            for key in (result.extras.get("omitted") or [])
+        }
+    )
     logger.info(
-        "search q=%r depth=%s candidates=%d pages=%d chunks=%d results=%d discovery=%.0fms crawl=%.0fms rerank=%.0fms elapsed=%.0fms rerank_path=%s",
-        request.query, request.depth, len(candidates), len(pages), len(chunks), len(ranked),
+        "search q_id=%s depth=%s candidates=%d pages=%d chunks=%d results=%d discovery=%.0fms crawl=%.0fms rerank=%.0fms elapsed=%.0fms rerank_path=%s",
+        query_id, request.depth, len(candidates), len(pages), len(chunks), len(ranked),
         _ms(started, discovered), _ms(discovered, crawled), _ms(crawled), _ms(started), rerank_path,
     )
 
-    return search_response(request.query, ranked)
+    warnings = []
+    if extras_truncated or omitted_extras:
+        message = "inline extras were truncated to the response budget"
+        if omitted_extras:
+            message += f"; omitted: {', '.join(omitted_extras)}"
+        warnings.append(message)
+    return search_response(
+        request.query,
+        ranked,
+        degraded or None,
+        warnings or None,
+    )
 
 
 @app.get(
@@ -905,7 +1380,12 @@ class BraveKeyPool:
         return bool(self._keys)
 
     async def search(
-        self, client: httpx.AsyncClient, query: str, limit: int, deadline: float
+        self,
+        client: httpx.AsyncClient,
+        query: str,
+        limit: int,
+        deadline: float,
+        extra_params: dict[str, Any] | None = None,
     ) -> tuple[list[dict] | None, float | None]:
         """Candidates and this request's Retry-After, or None when no key can answer."""
         retry_after: float | None = None
@@ -921,7 +1401,7 @@ class BraveKeyPool:
                 return None, retry_after
             tried += 1
             try:
-                results = await self._search_with_key(client, key_idx, query, limit, deadline)
+                results = await self._search_with_key(client, key_idx, query, limit, deadline, extra_params)
             except _BraveKeyError as exc:
                 if exc.cooldown > 0:
                     self._cool(key_idx, exc.cooldown)
@@ -956,7 +1436,15 @@ class BraveKeyPool:
         until = asyncio.get_running_loop().time() + max(cooldown, 0.0)
         self._cooled_until[key_idx] = max(self._cooled_until[key_idx], until)
 
-    async def _search_with_key(self, client: httpx.AsyncClient, key_idx: int, query: str, limit: int, deadline: float):
+    async def _search_with_key(
+        self,
+        client: httpx.AsyncClient,
+        key_idx: int,
+        query: str,
+        limit: int,
+        deadline: float,
+        extra_params: dict[str, Any] | None = None,
+    ):
         items: list[dict] = []
         seen: set[str] = set()
         try:
@@ -974,6 +1462,7 @@ class BraveKeyPool:
                             "count": BRAVE_PAGE_SIZE,
                             "offset": page_index,
                             "text_decorations": False,
+                            **(extra_params or {}),
                         },
                         headers={"X-Subscription-Token": self._keys[key_idx], "Accept": "application/json"},
                         timeout=min(BRAVE_TIMEOUT, remaining),
@@ -1045,8 +1534,137 @@ def _retry_after(response: httpx.Response, default: float) -> float:
 
 BRAVE_POOL = BraveKeyPool(BRAVE_API_KEYS)
 
+TBS_BY_TIME_RANGE = {"day": "qdr:d", "week": "qdr:w", "month": "qdr:m", "year": "qdr:y"}
+BRAVE_FRESHNESS = {"day": "pd", "week": "pw", "month": "pm", "year": "py"}
+SEARCH_FEATURE_NAMES = (
+    "sources",
+    "categories",
+    "include_domains",
+    "exclude_domains",
+    "time_range",
+    "tbs",
+    "country",
+    "location",
+    "safe",
+    "highlights",
+    "ignore_invalid_urls",
+    "scrape_options",
+)
+# What each discovery provider can actually honor. Anything else is a feature
+# loss, not a silent downgrade: strict callers get fallback_feature_unavailable.
+BACKEND_SEARCH_FEATURES = {
+    "firecrawl": set(SEARCH_FEATURE_NAMES),
+    "brave": {"include_domains", "exclude_domains", "time_range", "country", "safe"},
+    "searxng": {"include_domains", "exclude_domains", "time_range", "safe"},
+}
 
-async def discover_candidates(client: httpx.AsyncClient, query: str, limit: int):
+
+def requested_search_features(request: SearchRequest | None) -> dict[str, Any]:
+    if request is None:
+        return {}
+    features: dict[str, Any] = {}
+    if request.sources != ["web"]:
+        features["sources"] = request.sources
+    if request.categories:
+        features["categories"] = request.categories
+    if request.include_domains:
+        features["include_domains"] = request.include_domains
+    if request.exclude_domains:
+        features["exclude_domains"] = request.exclude_domains
+    if request.time_range:
+        features["time_range"] = request.time_range
+    if request.tbs:
+        features["tbs"] = request.tbs
+    if request.country:
+        features["country"] = request.country
+    if request.location:
+        features["location"] = request.location
+    if request.safe is not None:
+        features["safe"] = request.safe
+    if request.highlights is not None:
+        features["highlights"] = request.highlights
+    if request.ignore_invalid_urls:
+        features["ignore_invalid_urls"] = True
+    if request.scrape_options:
+        features["scrape_options"] = request.scrape_options
+    return features
+
+
+def unsupported_search_features(request: SearchRequest | None, provider: str) -> list[str]:
+    unsupported = set(requested_search_features(request)) - BACKEND_SEARCH_FEATURES[provider]
+    # SearXNG accepts day/month/year, not week.
+    if provider == "searxng" and request is not None and request.time_range == "week":
+        unsupported.add("time_range")
+    return sorted(unsupported)
+
+
+def search_filters(request: SearchRequest | None) -> dict[str, Any]:
+    """Firecrawl v2 search body fields for the filters the caller actually set."""
+    if request is None:
+        return {}
+    filters: dict[str, Any] = {}
+    if request.sources != ["web"]:
+        filters["sources"] = request.sources
+    if request.categories:
+        filters["categories"] = request.categories
+    if request.include_domains:
+        filters["includeDomains"] = request.include_domains
+    elif request.exclude_domains:
+        filters["excludeDomains"] = request.exclude_domains
+    tbs = request.tbs or TBS_BY_TIME_RANGE.get(request.time_range or "")
+    if tbs:
+        filters["tbs"] = tbs
+    if request.country:
+        filters["country"] = request.country.upper()
+    if request.location:
+        filters["location"] = request.location
+    if request.safe is not None:
+        filters["safe"] = request.safe
+    if request.highlights is not None:
+        filters["highlights"] = request.highlights
+    if request.ignore_invalid_urls:
+        filters["ignoreInvalidURLs"] = True
+    if request.scrape_options:
+        # Match the direct /crawl privacy default; callers can opt in explicitly.
+        scrape = dict(request.scrape_options)
+        scrape.setdefault("storeInCache", False)
+        filters["scrapeOptions"] = scrape
+    return filters
+
+
+def fallback_query_and_params(
+    query: str, request: SearchRequest | None, provider: str
+) -> tuple[str, dict[str, Any]]:
+    """Translate the free filters into Brave/SearXNG terms; the rest is feature loss."""
+    params: dict[str, Any] = {}
+    if request is not None:
+        if request.include_domains:
+            query = " ".join([query, *(f"site:{domain}" for domain in request.include_domains)])
+        if request.exclude_domains:
+            query = " ".join([query, *(f"-site:{domain}" for domain in request.exclude_domains)])
+        if request.time_range:
+            if provider == "brave":
+                params["freshness"] = BRAVE_FRESHNESS[request.time_range]
+            else:
+                # SearXNG has day/month/year; week degrades to month only when allow_degraded.
+                params["time_range"] = "month" if request.time_range == "week" else request.time_range
+        if request.safe is not None:
+            if provider == "brave":
+                params["safesearch"] = "strict" if request.safe else "off"
+            else:
+                params["safesearch"] = 2 if request.safe else 0
+        if request.country and provider == "brave":
+            params["country"] = request.country.upper()
+    return query, params
+
+
+async def discover_candidates(
+    client: httpx.AsyncClient,
+    query: str,
+    limit: int,
+    search_request: SearchRequest | None = None,
+    degraded_out: dict[str, Any] | None = None,
+):
     loop = asyncio.get_running_loop()
     started = loop.time()
     deadline = started + max(DISCOVERY_TIMEOUT, 0.0)
@@ -1057,7 +1675,7 @@ async def discover_candidates(client: httpx.AsyncClient, query: str, limit: int)
     candidates: list[dict] = []
     answered = False
 
-    payload = firecrawl_search_payload(query, limit)
+    payload = firecrawl_search_payload(query, limit, search_filters(search_request))
     if payload is None:
         failures["firecrawl"] = "query_too_long"
     else:
@@ -1065,17 +1683,25 @@ async def discover_candidates(client: httpx.AsyncClient, query: str, limit: int)
         if remaining > 0:
             try:
                 response = await firecrawl_request(client, "/v2/search", payload, timeout=remaining)
-                rows = firecrawl_search_results(response)
-                if rows is None:
+                if response.status_code in (400, 404, 422):
+                    failures["firecrawl"] = "invalid_request"
+                    _record_provider_health("firecrawl", "unavailable")
+                    rows = None
+                else:
+                    rows = firecrawl_search_results(response)
+                if rows is None and failures.get("firecrawl") != "invalid_request":
                     failures["firecrawl"] = "invalid_response"
                     _record_provider_health("firecrawl", "unavailable")
-                else:
+                elif rows is not None:
                     firecrawl_candidates, complete = await shape_candidates(
                         rows, limit, "description", deadline=firecrawl_deadline
                     )
                     if complete or firecrawl_candidates:
                         pdf_urls = {
-                            row["url"] for row in rows if row.get("category", "").lower() == "pdf"
+                            row["url"]
+                            for row in rows
+                            if isinstance(row.get("category"), str)
+                            and row["category"].lower() == "pdf"
                         }
                         for candidate in firecrawl_candidates:
                             candidate["_firecrawl_source"] = True
@@ -1107,57 +1733,115 @@ async def discover_candidates(client: httpx.AsyncClient, query: str, limit: int)
             failures["firecrawl"] = "deadline_exceeded"
             _record_provider_health("firecrawl", "unavailable")
 
+    blocked_features: dict[str, list[str]] = {}
+
     if len(candidates) < limit and BRAVE_POOL:
-        brave_retry_after: float | None = None
-        remaining = deadline - loop.time()
-        if remaining > 0:
-            try:
-                brave, brave_retry_after = await BRAVE_POOL.search(
-                    client, query, limit - len(candidates), deadline
-                )
-                if brave is None:
-                    failures["brave"] = "unavailable"
-                else:
-                    seen_urls = {item["url"] for item in candidates}
-                    candidates.extend(item for item in brave if item["url"] not in seen_urls)
-                    answered = True
-            except asyncio.TimeoutError:
-                failures["brave"] = "timeout"
-                _record_provider_health("brave", "unavailable")
-            except Exception as exc:
-                failures["brave"] = type(exc).__name__
-                _record_provider_health("brave", "unavailable")
-                logger.warning("brave discovery failed (%s); continuing with SearXNG", type(exc).__name__)
+        brave_loss = unsupported_search_features(search_request, "brave")
+        if brave_loss and not (search_request and search_request.allow_degraded):
+            failures["brave"] = "unsupported_features"
+            blocked_features["brave"] = brave_loss
         else:
-            failures["brave"] = "deadline_exceeded"
-            _record_provider_health("brave", "unavailable")
-        if brave_retry_after is not None:
-            retry_afters.append(brave_retry_after)
+            if brave_loss and degraded_out is not None:
+                degraded_out.setdefault("providers", []).append(
+                    {"provider": "brave", "unsupported": brave_loss}
+                )
+            brave_retry_after: float | None = None
+            remaining = deadline - loop.time()
+            if remaining > 0:
+                try:
+                    brave_query, brave_params = fallback_query_and_params(query, search_request, "brave")
+                    brave, brave_retry_after = await BRAVE_POOL.search(
+                        client, brave_query, limit - len(candidates), deadline, brave_params
+                    )
+                    if brave is None:
+                        failures["brave"] = "unavailable"
+                    else:
+                        seen_urls = {item["url"] for item in candidates}
+                        candidates.extend(item for item in brave if item["url"] not in seen_urls)
+                        answered = True
+                except asyncio.TimeoutError:
+                    failures["brave"] = "timeout"
+                    _record_provider_health("brave", "unavailable")
+                except Exception as exc:
+                    failures["brave"] = type(exc).__name__
+                    _record_provider_health("brave", "unavailable")
+                    logger.warning("brave discovery failed (%s); continuing with SearXNG", type(exc).__name__)
+            else:
+                failures["brave"] = "deadline_exceeded"
+                _record_provider_health("brave", "unavailable")
+            if brave_retry_after is not None:
+                retry_afters.append(brave_retry_after)
 
     if len(candidates) < limit:
-        remaining = deadline - loop.time()
-        if remaining > 0:
-            try:
-                extra = await search_searxng(
-                    client, query, limit - len(candidates), timeout=remaining, deadline=deadline
-                )
-                answered = True
-                seen_urls = {item["url"] for item in candidates}
-                candidates.extend(item for item in extra if item["url"] not in seen_urls)
-            except asyncio.TimeoutError:
-                failures["searxng"] = "timeout"
-                _record_provider_health("searxng", "unavailable")
-            except AppError as exc:
-                failures["searxng"] = exc.code
-                if exc.retry_after is not None:
-                    retry_afters.append(exc.retry_after)
-                logger.warning("searxng discovery failed (%s)", exc.code)
+        searxng_loss = unsupported_search_features(search_request, "searxng")
+        if searxng_loss and not (search_request and search_request.allow_degraded):
+            failures["searxng"] = "unsupported_features"
+            blocked_features["searxng"] = searxng_loss
         else:
-            failures["searxng"] = "deadline_exceeded"
-            _record_provider_health("searxng", "unavailable")
+            if searxng_loss and degraded_out is not None:
+                degraded_out.setdefault("providers", []).append(
+                    {"provider": "searxng", "unsupported": searxng_loss}
+                )
+            remaining = deadline - loop.time()
+            if remaining > 0:
+                try:
+                    searxng_query, searxng_params = fallback_query_and_params(query, search_request, "searxng")
+                    extra = await search_searxng(
+                        client,
+                        searxng_query,
+                        limit - len(candidates),
+                        timeout=remaining,
+                        deadline=deadline,
+                        params=searxng_params,
+                    )
+                    answered = True
+                    seen_urls = {item["url"] for item in candidates}
+                    candidates.extend(item for item in extra if item["url"] not in seen_urls)
+                except asyncio.TimeoutError:
+                    failures["searxng"] = "timeout"
+                    _record_provider_health("searxng", "unavailable")
+                except AppError as exc:
+                    failures["searxng"] = exc.code
+                    if exc.retry_after is not None:
+                        retry_afters.append(exc.retry_after)
+                    logger.warning("searxng discovery failed (%s)", exc.code)
+            else:
+                failures["searxng"] = "deadline_exceeded"
+                _record_provider_health("searxng", "unavailable")
 
     if answered:
         return candidates[:limit]
+    if blocked_features:
+        first_provider = sorted(blocked_features)[0]
+        details = {
+            "providers": failures,
+            "provider": first_provider,
+            "unsupported": blocked_features[first_provider],
+            "unsupported_by_provider": blocked_features,
+        }
+        if failures.get("firecrawl") in (
+            "not_configured",
+            "invalid_configuration",
+            "unsupported_enterprise_option",
+            "invalid_request",
+        ):
+            raise AppError(
+                422,
+                "unsupported_feature",
+                "No configured provider can honor the requested search features",
+                details,
+                retryable=False,
+                hint="Remove the unsupported features or configure Firecrawl and retry.",
+            )
+        raise AppError(
+            503,
+            "fallback_feature_unavailable",
+            "Firecrawl is unavailable and the fallback cannot honor the requested search features",
+            details,
+            retryable=True,
+            retry_after=max(retry_afters, default=OUTAGE_RETRY_AFTER),
+            hint="Retry when Firecrawl recovers, or set allow_degraded=true to accept the reduced result set.",
+        )
     if not BRAVE_POOL and not _engine_names() and failures.get("firecrawl") == "not_configured":
         raise _NoEnginesError()
     raise AppError(
@@ -1182,8 +1866,90 @@ async def firecrawl_metadata_url_is_public(response: httpx.Response, deadline: f
     return await asyncio.wait_for(is_allowed_public_url(url), timeout=remaining)
 
 
+def truncate_bytes(text: str, limit: int) -> str:
+    encoded = text.encode("utf-8")
+    if len(encoded) <= limit:
+        return text
+    return encoded[: max(limit, 0)].decode("utf-8", "ignore") + "\n\n[truncated]"
+
+
+def cap_metadata(metadata: Any) -> Any:
+    if not isinstance(metadata, dict):
+        return metadata
+    return {
+        key: truncate_bytes(value, MAX_METADATA_BYTES)
+        if isinstance(value, str) and len(value.encode("utf-8")) > MAX_METADATA_BYTES
+        else value
+        for key, value in metadata.items()
+    }
+
+
+def cap_result_extras(
+    results: list[SearchResult],
+    per_field: int = MAX_EXTRAS_BYTES,
+    total: int = MAX_TOTAL_EXTRAS_BYTES,
+) -> tuple[list[SearchResult], bool]:
+    """Bound extras in UTF-8 bytes across the whole response, not just per field."""
+    budget = max(total, 0)
+    truncated = False
+    capped_results = []
+    for result in results:
+        extras = result.extras
+        if not isinstance(extras, dict) or not extras:
+            capped_results.append(result)
+            continue
+        capped: dict[str, Any] = {}
+        omitted: list[str] = []
+        for key, value in extras.items():
+            if isinstance(value, str):
+                limit = min(per_field, budget)
+                if limit <= 0:
+                    omitted.append(key)
+                    truncated = True
+                    continue
+                if len(value.encode("utf-8")) > limit:
+                    value = truncate_bytes(value, limit)
+                    truncated = True
+                capped[key] = value
+                budget -= len(value.encode("utf-8"))
+            else:
+                encoded = json.dumps(value, ensure_ascii=False, default=str).encode("utf-8")
+                if len(encoded) > budget:
+                    omitted.append(key)
+                    truncated = True
+                    continue
+                capped[key] = value
+                budget -= len(encoded)
+        if omitted:
+            capped["omitted"] = omitted
+        capped_results.append(result.model_copy(update={"extras": capped or None}))
+    return capped_results, truncated
+
+
+def cap_inline_extras(extras: Any) -> Any:
+    if not isinstance(extras, dict):
+        return extras
+    capped: dict[str, Any] = {}
+    omitted = []
+    for key, value in extras.items():
+        if isinstance(value, str) and len(value.encode("utf-8")) > MAX_EXTRAS_BYTES:
+            if key == "rawBase64":
+                omitted.append(key)
+                continue
+            capped[key] = truncate_bytes(value, MAX_EXTRAS_BYTES)
+        else:
+            capped[key] = value
+    if omitted:
+        capped["omitted"] = omitted
+    return capped
+
+
 async def scrape_firecrawl_candidates(
-    client: httpx.AsyncClient, candidates: list[dict], deadline: float
+    client: httpx.AsyncClient,
+    candidates: list[dict],
+    deadline: float,
+    search_request: SearchRequest | None = None,
+    extraction_loss: set[str] | None = None,
 ) -> tuple[list[dict], list[dict], set[str]]:
     loop = asyncio.get_running_loop()
     pages = []
@@ -1191,34 +1957,135 @@ async def scrape_firecrawl_candidates(
     policy_denied: set[str] = set()
     rejected_metadata_urls: set[str] = set()
     seen_candidates: list[str] = []
+    scrape_options = (search_request.scrape_options if search_request else None) or {}
+    requested_formats = normalize_formats(scrape_options.get("formats"))
+    # The separate Firecrawl scrape already uses these defaults; only options that
+    # actually differ from them are lost when that path is used.
+    fallback_defaults = {
+        "storeInCache": False,
+        "onlyMainContent": True,
+        "maxAge": 0,
+        "skipTlsVerification": False,
+        "parsers": [],
+    }
+    requested_option_keys = {
+        key
+        for key in set(scrape_options) - {"formats"}
+        if scrape_options.get(key) != fallback_defaults.get(key)
+    }
+
+    def mark_missing(formats: list[str]) -> None:
+        if extraction_loss is not None:
+            extraction_loss.update(f"format:{fmt}" for fmt in formats)
+
+    def mark_option_loss() -> None:
+        if requested_option_keys and extraction_loss is not None:
+            extraction_loss.add("options")
+
+    def defer(candidate: dict) -> None:
+        local_candidates.append(candidate)
+        # Crawl4AI returns Markdown; every other requested format is lost.
+        mark_missing([fmt for fmt in requested_formats if fmt != "markdown"])
+        mark_option_loss()
+
     for candidate in candidates:
         url = candidate["url"]
         if any(same_url_identity(url, seen) for seen in seen_candidates):
             continue
         seen_candidates.append(url)
+        inline = candidate.get("_inline")
+        if isinstance(inline, dict):
+            page = firecrawl_inline_result(inline, url)
+            if page is not None:
+                reported = page.get("reported_url")
+                if isinstance(reported, str):
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        defer(candidate)
+                        continue
+                    try:
+                        allowed = await asyncio.wait_for(is_allowed_public_url(reported), timeout=remaining)
+                    except asyncio.TimeoutError:
+                        defer(candidate)
+                        continue
+                    if not allowed:
+                        defer(candidate)
+                        continue
+                mark_missing(missing_inline_formats(requested_formats, inline))
+                extras = cap_inline_extras(page.get("extras") or {})
+                metadata = cap_metadata(page.get("metadata"))
+                pages.append(
+                    {
+                        "url": page["url"],
+                        "title": candidate["title"],
+                        "snippet": candidate.get("snippet", ""),
+                        "content": page["content"] or candidate.get("snippet") or candidate["title"],
+                        **{
+                            key: candidate[key]
+                            for key in ("source", "date", "imageUrl", "position")
+                            if candidate.get(key) is not None
+                        },
+                        **({"metadata": metadata} if isinstance(metadata, dict) else {}),
+                        **({"extras": extras} if extras else {}),
+                    }
+                )
+                continue
+            mark_missing(missing_inline_formats(requested_formats, inline))
+            if candidate.get("source") != "images":
+                defer(candidate)
+                continue
+            # Image results still have their own metadata path below.
+
+        if candidate.get("source") == "images":
+            image_fields = {"images": [candidate["imageUrl"]]} if candidate.get("imageUrl") else {}
+            image_extras = (
+                cap_inline_extras(image_fields)
+                if "images" in requested_formats and image_fields
+                else {}
+            )
+            mark_missing(missing_inline_formats(requested_formats, image_fields))
+            pages.append(
+                {
+                    "url": url,
+                    "title": candidate["title"],
+                    "snippet": candidate.get("snippet", ""),
+                    "content": candidate.get("snippet") or candidate["title"],
+                    **{
+                        key: candidate[key]
+                        for key in ("source", "date", "imageUrl", "position")
+                        if candidate.get(key) is not None
+                    },
+                    **({"extras": image_extras} if image_extras else {}),
+                }
+            )
+            continue
+
         if not candidate.get("_firecrawl_source"):
-            local_candidates.append(candidate)
+            defer(candidate)
             continue
         url = candidate["url"]
         if is_pdf_target(url, candidate.get("_firecrawl_category", "")) or not firecrawl_url_allowed(url):
-            local_candidates.append(candidate)
+            defer(candidate)
             continue
         remaining = deadline - loop.time()
         if remaining <= 0:
-            local_candidates.append(candidate)
+            defer(candidate)
             continue
         try:
             allowed = await asyncio.wait_for(is_allowed_public_url(url), timeout=remaining)
         except asyncio.TimeoutError:
-            local_candidates.append(candidate)
+            defer(candidate)
             continue
         if not allowed:
-            local_candidates.append(candidate)
+            defer(candidate)
             continue
         remaining = deadline - loop.time()
         if remaining <= 0:
-            local_candidates.append(candidate)
+            defer(candidate)
             continue
+        # The separate scrape is Markdown-only and does not carry scrapeOptions.
+        mark_missing([fmt for fmt in requested_formats if fmt != "markdown"])
+        mark_option_loss()
         try:
             response = await firecrawl_request(
                 client, "/v2/scrape", firecrawl_scrape_payload(url), timeout=remaining
@@ -1229,18 +2096,18 @@ async def scrape_firecrawl_candidates(
                 _record_provider_health("firecrawl", "ok")
                 continue
             if exc.category == "provider_routed_domain":
-                local_candidates.append(candidate)
+                defer(candidate)
                 continue
             _record_provider_health(
                 "firecrawl", "not_configured" if exc.category == "not_configured" else "unavailable"
             )
             if exc.category != "not_configured":
                 logger.warning("firecrawl scrape failed (%s)", exc.category)
-            local_candidates.append(candidate)
+            defer(candidate)
             continue
         except asyncio.TimeoutError:
             _record_provider_health("firecrawl", "unavailable")
-            local_candidates.append(candidate)
+            defer(candidate)
             continue
 
         if response.status_code < 500:
@@ -1255,7 +2122,7 @@ async def scrape_firecrawl_candidates(
             continue
         page = firecrawl_scrape_result(response, url)
         if page is None:
-            local_candidates.append(candidate)
+            defer(candidate)
         else:
             pages.append(
                 {
@@ -1263,6 +2130,11 @@ async def scrape_firecrawl_candidates(
                     "title": candidate["title"],
                     "snippet": candidate.get("snippet", ""),
                     "content": page["content"],
+                    **{
+                        key: candidate[key]
+                        for key in ("source", "date", "imageUrl", "position")
+                        if candidate.get(key) is not None
+                    },
                 }
             )
 
@@ -1308,13 +2180,17 @@ async def shape_candidates(
             return results, False
         if not allowed:
             continue
-        results.append(
-            {
-                "title": item.get("title") or urlparse(url).netloc or url,
-                "url": url,
-                "snippet": item.get(snippet_key) or "",
-            }
-        )
+        candidate = {
+            "title": item.get("title") or urlparse(url).netloc or url,
+            "url": url,
+            "snippet": item.get(snippet_key) or "",
+        }
+        for key in ("source", "category", "date", "imageUrl", "imageWidth", "imageHeight", "position"):
+            if item.get(key) is not None:
+                candidate[key] = item[key]
+        if isinstance(item.get("inline"), dict):
+            candidate["_inline"] = item["inline"]
+        results.append(candidate)
         if len(results) >= limit:
             return results, True
     return results, True
@@ -1349,6 +2225,7 @@ async def search_searxng(
     timeout: float = SEARCH_TIMEOUT,
     *,
     deadline: float | None = None,
+    params: dict[str, Any] | None = None,
 ):
     loop = asyncio.get_running_loop()
     if deadline is None:
@@ -1381,7 +2258,13 @@ async def search_searxng(
                 # timeout_limit makes searxng answer with whatever engines finish inside the
                 # remaining discovery budget; without it one hung engine can stall the fallback
                 # even after other engines answered (#36).
-                params={"q": query, "format": "json", "engines": SEARXNG_ENGINES, "timeout_limit": max(request_timeout - 1, 1)},
+                params={
+                    "q": query,
+                    "format": "json",
+                    "engines": SEARXNG_ENGINES,
+                    "timeout_limit": max(request_timeout - 1, 1),
+                    **(params or {}),
+                },
                 timeout=request_timeout,
             ),
             timeout=remaining,
@@ -1459,6 +2342,11 @@ def snippet_pages(candidates: list[dict]) -> list[dict]:
             "title": item["title"],
             "snippet": item["snippet"],
             "content": item["snippet"] or item["title"],
+            **{
+                key: item[key]
+                for key in ("source", "date", "imageUrl", "position", "metadata", "extras")
+                if item.get(key) is not None
+            },
         }
         for item in candidates
     ]
@@ -1548,21 +2436,30 @@ SEARCH_CRAWLER_CONFIG = {
     },
 }
 
+# Crawl4AI's `pdf` run option generates a PDF of the page; PDF *input* needs the
+# typed scraping strategy. Verified against the pinned 0.9.5 image.
+PDF_CRAWLER_CONFIG = {
+    **SEARCH_CRAWLER_CONFIG,
+    "scraping_strategy": {"type": "PDFContentScrapingStrategy", "params": {}},
+}
 
-async def _bulk_crawl(
-    client: httpx.AsyncClient, candidates: list[dict], *, deadline: float | None = None
+
+async def _bulk_crawl_group(
+    client: httpx.AsyncClient,
+    candidates: list[dict],
+    crawler_config: dict,
+    *,
+    deadline: float,
 ):
-    """Return mapped pages and candidates needing recovery; None means provider failure."""
     loop = asyncio.get_running_loop()
-    if deadline is None:
-        deadline = loop.time() + CRAWL_TIMEOUT
     remaining = deadline - loop.time()
     if remaining <= 0:
         return None
     try:
         payload = await asyncio.wait_for(
             call_crawl4ai(
-                client, {"urls": [item["url"] for item in candidates], "crawler_config": SEARCH_CRAWLER_CONFIG}
+                client,
+                {"urls": [item["url"] for item in candidates], "crawler_config": crawler_config},
             ),
             timeout=remaining,
         )
@@ -1618,6 +2515,46 @@ async def _bulk_crawl(
     return pages, retry_candidates
 
 
+async def _bulk_crawl(
+    client: httpx.AsyncClient, candidates: list[dict], *, deadline: float | None = None
+):
+    """Return mapped pages and candidates needing recovery; None means provider failure."""
+    loop = asyncio.get_running_loop()
+    if deadline is None:
+        deadline = loop.time() + CRAWL_TIMEOUT
+    if deadline - loop.time() <= 0:
+        return None
+
+    pdf_urls = {
+        candidate["url"]
+        for candidate in candidates
+        if is_pdf_target(candidate["url"], candidate.get("_firecrawl_category", ""))
+    }
+    groups = []
+    other_candidates = [item for item in candidates if item["url"] not in pdf_urls]
+    pdf_candidates = [item for item in candidates if item["url"] in pdf_urls]
+    if other_candidates:
+        groups.append((other_candidates, SEARCH_CRAWLER_CONFIG))
+    if pdf_candidates:
+        groups.append((pdf_candidates, PDF_CRAWLER_CONFIG))
+
+    pages = []
+    retry_candidates = []
+    for group, crawler_config in groups:
+        result = await _bulk_crawl_group(
+            client, group, crawler_config, deadline=deadline
+        )
+        if result is None:
+            retry_candidates.extend(group)
+            continue
+        group_pages, group_retry = result
+        pages.extend(group_pages)
+        retry_candidates.extend(group_retry)
+    if not pages and retry_candidates:
+        return None
+    return pages, retry_candidates
+
+
 async def crawl_with_limit(semaphore: asyncio.Semaphore, client: httpx.AsyncClient, result: dict):
     async with semaphore:
         return await crawl_url(client, result)
@@ -1627,8 +2564,13 @@ async def crawl_url(client: httpx.AsyncClient, result: dict):
     if not await is_allowed_public_url(result["url"]):
         return None
 
+    crawler_config = (
+        PDF_CRAWLER_CONFIG
+        if is_pdf_target(result["url"], result.get("_firecrawl_category", ""))
+        else SEARCH_CRAWLER_CONFIG
+    )
     payload = await call_crawl4ai(
-        client, {"urls": [result["url"]], "crawler_config": SEARCH_CRAWLER_CONFIG}
+        client, {"urls": [result["url"]], "crawler_config": crawler_config}
     )
     crawled_url = extract_crawled_url(payload) or result["url"]
     if crawled_url != result["url"] and not await is_allowed_public_url(crawled_url):
@@ -2164,7 +3106,11 @@ def chunk_documents(documents: list[dict]):
     """
     chunks = []
     for document in documents:
-        text = strip_boilerplate_lines(document["content"])[:MAX_PAGE_CHARS]
+        raw = document["content"]
+        # Image and extras-only results can carry a title/snippet as the passage;
+        # the menu-stub filter would drop those short lines entirely.
+        keep_short = document.get("source") == "images" or bool(document.get("extras"))
+        text = (raw if keep_short else strip_boilerplate_lines(raw))[:MAX_PAGE_CHARS]
         if not text:
             continue
 
@@ -2384,6 +3330,12 @@ async def rerank(client: httpx.AsyncClient, query: str, chunks: list[dict], top_
                 snippet=chunk.get("snippet", ""),
                 content=chunk["content"],
                 score=score,
+                source=chunk.get("source"),
+                published_date=chunk.get("date"),
+                image_url=chunk.get("imageUrl"),
+                position=chunk.get("position"),
+                metadata=chunk.get("metadata"),
+                extras=chunk.get("extras"),
             )
         )
         if len(results) >= top_k:
@@ -2452,8 +3404,28 @@ def is_public_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address):
     )
 
 
-def search_response(query: str, results: list[SearchResult]):
-    return SearchEnvelope(data=SearchData(query=query, results=results))
+def truncate_content(content: str, limit: int | None) -> str:
+    if limit is None or len(content) <= limit:
+        return content
+    return content[:limit].rstrip() + "\n\n[content truncated]"
+
+
+def search_response(
+    query: str,
+    results: list[SearchResult],
+    degraded: dict[str, Any] | None = None,
+    extra_warnings: list[str] | None = None,
+):
+    warnings = list(extra_warnings or [])
+    if degraded:
+        for item in degraded.get("providers", []):
+            unsupported = item.get("unsupported") or []
+            warnings.append(
+                f"{item.get('provider', 'fallback')} could not honor: {', '.join(map(str, unsupported))}"
+            )
+    return SearchEnvelope(
+        data=SearchData(query=query, results=results, degraded=degraded, warnings=warnings)
+    )
 
 
 def error_response(
@@ -2473,6 +3445,7 @@ def error_response(
     # transient, everything else needs the caller (or an operator) to change something.
     if retryable is None:
         retryable = status_code >= 500 or status_code == 429
+    correlation_id = request_id_var.get()
     return JSONResponse(
         status_code=status_code,
         content=jsonable_encoder(
@@ -2484,6 +3457,7 @@ def error_response(
                     retryable=retryable,
                     retry_after=retry_after,
                     hint=hint,
+                    request_id=None if correlation_id == "-" else correlation_id,
                 )
             )
         ),

@@ -10,19 +10,21 @@ from unittest.mock import patch
 import httpx
 
 import firecrawl_controls as fc
+import observability as obs
 
 
 def run(coro):
     return asyncio.run(coro)
 
 
-def controls(root, entries):
+def controls(root, entries, **kwargs):
     budgets = fc._parse_keys(json.dumps([{"label": label, "key": key} for label, key in entries]))
     root = Path(root)
     return fc.FirecrawlControls(
         budgets,
         state_path=root / "state.json",
         lock_path=root / "lock",
+        **kwargs,
     )
 
 
@@ -217,7 +219,7 @@ def test_search_policy_merges_domain_exclusions_without_mutating_payload():
     assert {"linkedin.com", "x.com", "twitter.com", "t.co"}.issubset(body["excludeDomains"]), body
 
 
-def test_search_never_embeds_scraping_and_scrape_stays_markdown_only():
+def test_search_allows_free_inline_scrape_but_scrape_stays_markdown_only():
     seen = []
 
     def handler(request):
@@ -228,17 +230,28 @@ def test_search_never_embeds_scraping_and_scrape_stays_markdown_only():
         with tempfile.TemporaryDirectory() as tmp:
             async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
                 instance = controls(tmp, [("first@example.test", "fc-test")])
+                result = await instance.request(
+                    client,
+                    "/v2/search",
+                    {
+                        "query": "q",
+                        "scrapeOptions": {"formats": ["markdown"], "onlyMainContent": True},
+                    },
+                    timeout=1,
+                )
+                assert result.status_code == 200
+
                 try:
                     await instance.request(
                         client,
                         "/v2/search",
-                        {"query": "q", "scrapeOptions": {"formats": ["markdown"]}},
+                        {"query": "q", "scrapeOptions": {"zeroDataRetention": True}},
                         timeout=1,
                     )
                 except fc.FirecrawlUnavailable as exc:
-                    assert exc.category == "embedded_scrape_forbidden", exc.category
+                    assert exc.category == "unsupported_enterprise_option", exc.category
                 else:
-                    raise AssertionError("search call embedded billable scraping")
+                    raise AssertionError("enterprise scrape option reached the provider")
 
                 result = await instance.request(
                     client, "/v2/scrape", {"url": "https://example.org"}, timeout=1
@@ -246,8 +259,10 @@ def test_search_never_embeds_scraping_and_scrape_stays_markdown_only():
                 assert result.status_code == 200
 
     run(check())
-    assert len(seen) == 1
-    body = json.loads(seen[0].content)
+    assert len(seen) == 2
+    search_body = json.loads(seen[0].content)
+    assert search_body["scrapeOptions"] == {"formats": ["markdown"], "onlyMainContent": True}
+    body = json.loads(seen[1].content)
     assert body == {
         "url": "https://example.org",
         "formats": ["markdown"],
@@ -932,6 +947,47 @@ def test_forbidden_policy_status_does_not_fail_over():
 
     run(check())
     assert seen == ["Bearer primary"], seen
+
+
+def test_gov_category_skips_automatic_cost_exclusions():
+    gov = fc._search_payload({"query": "q", "limit": 10, "categories": ["gov"]})
+    assert "excludeDomains" not in gov, gov
+    developer = fc._search_payload({"query": "q", "limit": 10, "categories": ["developer"]})
+    assert "excludeDomains" in developer, developer
+    assert "linkedin.com" in developer["excludeDomains"], developer
+
+
+def test_usage_ledger_records_endpoint_credits_and_request_id():
+    def handler(request):
+        return response(request, body={"success": True, "creditsUsed": 2, "data": {"web": []}})
+
+    async def check():
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "usage.jsonl"
+            token = obs.request_id_var.set("req-ledger")
+            try:
+                async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                    instance = controls(
+                        tmp, [("first@example.test", "key")], usage_path=ledger
+                    )
+                    result = await instance.request(
+                        client, "/v2/search", {"query": "q"}, timeout=1
+                    )
+                    assert result.status_code == 200
+            finally:
+                obs.request_id_var.reset(token)
+            lines = ledger.read_text().splitlines()
+            assert len(lines) == 1, lines
+            entry = json.loads(lines[0])
+            assert entry["endpoint"] == "/v2/search", entry
+            assert entry["label"] == "first@example.test", entry
+            assert entry["status"] == 200, entry
+            assert entry["credits"] == 2.0, entry
+            assert entry["request_id"] == "req-ledger", entry
+            assert entry["category"] is None, entry
+            assert entry["elapsed_ms"] >= 0, entry
+
+    run(check())
 
 
 def demo():
