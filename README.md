@@ -131,7 +131,7 @@ curl 'https://websearch.sparkfn.io/search?q=open%20source%20web%20search%20engin
 - `categories`: `developer`, `gov`, `research`, `pdf`. `gov` cannot be combined with other categories or filters.
 - `include_domains` / `exclude_domains`: hostnames only; the two cannot be combined. Brave/SearXNG use `site:` / `-site:`.
 - `time_range` (`day`, `week`, `month`, `year`) or raw `tbs`; `country`, `location`, `safe`, `highlights`, `ignore_invalid_urls`.
-- `scrape_options`: inline Firecrawl extraction. Markdown becomes `content`; every other returned field lands in `extras`. Requires `depth=advanced`.
+- `scrape_options`: inline Firecrawl extraction. Markdown becomes `content`; every other returned field lands in `extras`. Requires `depth=advanced`. `actions`, `headers`, and `profile` are rejected unless `ALLOW_FIRECRAWL_ACTIONS`, `ALLOW_FIRECRAWL_HEADERS`, or `ALLOW_FIRECRAWL_PROFILE` is enabled.
 - `max_content_chars`: truncate returned `content` after ranking.
 - `candidates` is 1..100; `max_results` is 1..20.
 

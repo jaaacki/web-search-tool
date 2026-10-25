@@ -89,6 +89,15 @@ def check_request_id_and_search_filter_contract(client):
         headers=headers,
     )
     assert response.status_code == 422, response.text
+    response = client.post(
+        "/search",
+        json={
+            "query": "q",
+            "scrape_options": {"actions": [{"type": "wait", "milliseconds": 1}]},
+        },
+        headers=headers,
+    )
+    assert response.status_code == 422, response.text
 
 
 def demo():

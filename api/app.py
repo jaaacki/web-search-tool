@@ -58,6 +58,11 @@ CRAWL_CONCURRENCY = int(os.getenv("CRAWL_CONCURRENCY", "8"))
 # The UA we send has to match the engine that renders the page, so bump this with the image.
 CRAWL4AI_CHROMIUM_VERSION = os.getenv("CRAWL4AI_CHROMIUM_VERSION", "156.0.8078.4")
 WEBSEARCH_API_KEY = os.getenv("WEBSEARCH_API_KEY", "")
+# Firecrawl inline scrape can run browser actions, send caller headers, or reuse a
+# persistent profile. Keep those off unless the operator opts in explicitly.
+ALLOW_FIRECRAWL_ACTIONS = os.getenv("ALLOW_FIRECRAWL_ACTIONS", "").lower() in {"1", "true", "yes"}
+ALLOW_FIRECRAWL_HEADERS = os.getenv("ALLOW_FIRECRAWL_HEADERS", "").lower() in {"1", "true", "yes"}
+ALLOW_FIRECRAWL_PROFILE = os.getenv("ALLOW_FIRECRAWL_PROFILE", "").lower() in {"1", "true", "yes"}
 # Optional Brave Search API keys (comma-separated) for primary discovery.
 # Empty = SearXNG-only discovery, exactly today's behavior.
 BRAVE_API_KEYS = tuple(key.strip() for key in os.getenv("BRAVE_API_KEYS", "").split(",") if key.strip())
@@ -424,6 +429,17 @@ class SearchRequest(BaseModel):
             } & set(self.scrape_options)
             if unavailable:
                 raise ValueError(f"unavailable on the free plan: {sorted(unavailable)}")
+            gated = {
+                "actions": ALLOW_FIRECRAWL_ACTIONS,
+                "headers": ALLOW_FIRECRAWL_HEADERS,
+                "profile": ALLOW_FIRECRAWL_PROFILE,
+            }
+            disabled = [key for key, allowed in gated.items() if key in self.scrape_options and not allowed]
+            if disabled:
+                raise ValueError(
+                    f"disabled by operator: {', '.join(disabled)} "
+                    "(set ALLOW_FIRECRAWL_ACTIONS/HEADERS/PROFILE to enable)"
+                )
         return self
 
 

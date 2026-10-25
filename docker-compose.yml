@@ -106,6 +106,9 @@ services:
       - FIRECRAWL_BUDGETS_JSON=${FIRECRAWL_BUDGETS_JSON:-}
       - FIRECRAWL_USAGE_LOG=${FIRECRAWL_USAGE_LOG:-/data/firecrawl-usage.jsonl}
       - LOG_FORMAT=${LOG_FORMAT:-text}
+      - ALLOW_FIRECRAWL_ACTIONS=${ALLOW_FIRECRAWL_ACTIONS:-false}
+      - ALLOW_FIRECRAWL_HEADERS=${ALLOW_FIRECRAWL_HEADERS:-false}
+      - ALLOW_FIRECRAWL_PROFILE=${ALLOW_FIRECRAWL_PROFILE:-false}
     depends_on:
       # Local discovery/extraction are fallbacks; cloud/basic search can work without them.
       searxng:
