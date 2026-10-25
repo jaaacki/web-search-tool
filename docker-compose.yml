@@ -86,6 +86,10 @@ services:
     # Share monotonic cooldowns across workers, never across container/host restarts.
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=16m,mode=1777
+    volumes:
+      # Append-only Firecrawl usage ledger. The image runs as `app`; create the
+      # host directory writable by it (README "Deploy": install -d -m 0777 data/api).
+      - ./data/api:/data:rw
     environment:
       - SEARXNG_URL=http://searxng:8080
       - CRAWL4AI_URL=http://crawl4ai:11235
@@ -100,6 +104,8 @@ services:
       - WEBSEARCH_API_KEY=${WEBSEARCH_API_KEY:?set WEBSEARCH_API_KEY in .env}
       - BRAVE_API_KEYS=${BRAVE_API_KEYS:-}
       - FIRECRAWL_BUDGETS_JSON=${FIRECRAWL_BUDGETS_JSON:-}
+      - FIRECRAWL_USAGE_LOG=${FIRECRAWL_USAGE_LOG:-/data/firecrawl-usage.jsonl}
+      - LOG_FORMAT=${LOG_FORMAT:-text}
     depends_on:
       # Local discovery/extraction are fallbacks; cloud/basic search can work without them.
       searxng:

@@ -1374,6 +1374,164 @@ def test_brave_error_logs_do_not_expose_key_or_response_body():
     assert secret_body not in output, output
 
 
+def test_strict_search_features_fail_when_no_provider_can_honor_them():
+    saved_pool = app.BRAVE_POOL
+    saved_request = app.firecrawl_request
+    saved_searxng = app.search_searxng
+    app.BRAVE_POOL = app.BraveKeyPool(())
+    calls = []
+
+    async def firecrawl(*_args, **_kwargs):
+        raise app.FirecrawlUnavailable(503, "provider_unavailable", 1.0, True)
+
+    async def searxng(*_args, **_kwargs):
+        calls.append("searxng")
+        return [{"url": "https://fallback.example/", "title": "F", "snippet": "s"}]
+
+    app.firecrawl_request = firecrawl
+    app.search_searxng = searxng
+    try:
+        request = app.SearchRequest(query="q", categories=["developer"])
+        try:
+            run(app.discover_candidates(object(), "q", 1, request))
+        except app.AppError as exc:
+            assert exc.status_code == 503, vars(exc)
+            assert exc.code == "fallback_feature_unavailable", exc.code
+            assert exc.details["unsupported"]["searxng"] == ["categories"], exc.details
+            assert exc.retryable is True, vars(exc)
+        else:
+            raise AssertionError("strict feature loss did not raise")
+        assert calls == [], calls
+    finally:
+        app.BRAVE_POOL = saved_pool
+        app.firecrawl_request = saved_request
+        app.search_searxng = saved_searxng
+        app.health_cache_reset()
+
+
+def test_allow_degraded_returns_fallback_results_with_named_feature_loss():
+    saved_pool = app.BRAVE_POOL
+    saved_request = app.firecrawl_request
+    saved_searxng = app.search_searxng
+    saved_check = app.is_allowed_public_url
+    app.BRAVE_POOL = app.BraveKeyPool(())
+
+    async def firecrawl(*_args, **_kwargs):
+        raise app.FirecrawlUnavailable(503, "provider_unavailable", 1.0, True)
+
+    async def searxng(*_args, **_kwargs):
+        return [{"url": "https://fallback.example/", "title": "F", "snippet": "s"}]
+
+    async def allow(_url):
+        return True
+
+    app.firecrawl_request = firecrawl
+    app.search_searxng = searxng
+    app.is_allowed_public_url = allow
+    degraded = {}
+    try:
+        request = app.SearchRequest(
+            query="q", categories=["developer"], allow_degraded=True
+        )
+        candidates = run(app.discover_candidates(object(), "q", 1, request, degraded))
+        assert [item["url"] for item in candidates] == ["https://fallback.example/"], candidates
+        assert degraded == {
+            "providers": [{"provider": "searxng", "unsupported": ["categories"]}]
+        }, degraded
+    finally:
+        app.BRAVE_POOL = saved_pool
+        app.firecrawl_request = saved_request
+        app.search_searxng = saved_searxng
+        app.is_allowed_public_url = saved_check
+        app.health_cache_reset()
+
+
+def test_inline_search_scrape_is_used_without_a_second_firecrawl_request():
+    saved_request = app.firecrawl_request
+    saved_check = app.is_allowed_public_url
+    calls = []
+
+    async def firecrawl(_client, endpoint, payload, *, timeout):
+        calls.append((endpoint, payload))
+        return httpx.Response(
+            200,
+            json={
+                "success": True,
+                "creditsUsed": 2,
+                "data": {
+                    "web": [
+                        {
+                            "url": "https://inline.example/",
+                            "title": "Inline",
+                            "description": "snippet",
+                            "markdown": "# Inline page",
+                            "links": ["https://inline.example/next"],
+                            "metadata": {
+                                "statusCode": 200,
+                                "sourceURL": "https://inline.example/",
+                            },
+                        }
+                    ]
+                },
+            },
+        )
+
+    async def allow(_url):
+        return True
+
+    app.firecrawl_request = firecrawl
+    app.is_allowed_public_url = allow
+    try:
+        request = app.SearchRequest(
+            query="q", scrape_options={"formats": ["markdown", "links"]}
+        )
+        candidates = run(app.discover_candidates(object(), "q", 1, request))
+        assert candidates[0]["_inline"]["markdown"] == "# Inline page", candidates
+        assert candidates[0]["_inline"]["links"] == ["https://inline.example/next"], candidates
+        loss = set()
+        pages, local, _ = run(
+            app.scrape_firecrawl_candidates(
+                object(), candidates, time.monotonic() + 5, request, loss
+            )
+        )
+        assert [page["content"] for page in pages] == ["# Inline page"], pages
+        assert pages[0]["extras"]["links"] == ["https://inline.example/next"], pages
+        assert local == [], local
+        assert loss == set(), loss
+        assert [endpoint for endpoint, _ in calls] == ["/v2/search"], calls
+    finally:
+        app.firecrawl_request = saved_request
+        app.is_allowed_public_url = saved_check
+
+
+def test_inline_feature_loss_only_accepts_plain_markdown():
+    assert app.inline_feature_loss({"formats": ["markdown"]}) == []
+    assert app.inline_feature_loss({"formats": ["markdown", "links"]}) == ["formats"]
+    assert app.inline_feature_loss(
+        {"formats": ["markdown"], "onlyMainContent": True}
+    ) == ["options"]
+
+
+def test_fallback_query_and_params_translate_free_filters():
+    request = app.SearchRequest(
+        query="q",
+        include_domains=["a.example"],
+        time_range="week",
+        safe=True,
+        country="us",
+    )
+    query, params = app.fallback_query_and_params("q", request, "brave")
+    assert query == "q site:a.example", query
+    assert params == {
+        "freshness": "pw",
+        "safesearch": "strict",
+        "country": "US",
+    }, params
+    query, params = app.fallback_query_and_params("q", request, "searxng")
+    assert query == "q site:a.example", query
+    assert params == {"time_range": "month", "safesearch": 2}, params
+
+
 def demo():
     for name, check in sorted(globals().items()):
         if name.startswith("test_"):

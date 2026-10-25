@@ -12,11 +12,34 @@ import firecrawl_adapter as adapter
 
 
 def test_search_payload_is_web_only_fresh_and_bounded():
-    payload = adapter.search_payload("q" * 500, 50)
-    assert payload == {"query": "q" * 500, "limit": 50, "sources": ["web"]}
+    payload = adapter.search_payload("q" * 500, 100)
+    assert payload == {"query": "q" * 500, "limit": 100, "sources": ["web"]}
     assert "scrapeOptions" not in payload
     assert adapter.search_payload("q" * 501, 50) is None
-    assert adapter.search_payload("q", 51) is None
+    assert adapter.search_payload("q", 101) is None
+
+
+def test_search_payload_passes_free_plan_filters_and_inline_scrape():
+    payload = adapter.search_payload(
+        "q",
+        10,
+        {
+            "sources": ["web", "news"],
+            "categories": ["developer"],
+            "includeDomains": ["docs.python.org"],
+            "tbs": "qdr:w",
+            "country": "US",
+            "safe": True,
+            "scrapeOptions": {"formats": ["markdown", "links"]},
+        },
+    )
+    assert payload["sources"] == ["web", "news"]
+    assert payload["categories"] == ["developer"]
+    assert payload["includeDomains"] == ["docs.python.org"]
+    assert payload["tbs"] == "qdr:w"
+    assert payload["country"] == "US"
+    assert payload["safe"] is True
+    assert payload["scrapeOptions"] == {"formats": ["markdown", "links"]}
 
 
 def test_search_uses_grouped_web_results_without_embedded_scraping():
@@ -57,23 +80,49 @@ def test_search_uses_grouped_web_results_without_embedded_scraping():
     results = adapter.search_results(response)
 
     assert results == [
-        {"url": "https://a.example/", "title": "A", "description": "A snippet"},
+        {
+            "url": "https://a.example/",
+            "title": "A",
+            "description": "A snippet",
+            "source": "web",
+            "inline": {
+                "markdown": "# Full A",
+                "metadata": {
+                    "sourceURL": "https://a.example",
+                    "url": "https://redirected.example/",
+                    "statusCode": 200,
+                },
+            },
+        },
         {
             "url": "https://b.example/",
             "title": "B",
             "description": "B snippet",
+            "source": "web",
+            "inline": {
+                "markdown": "# Failed B",
+                "metadata": {"sourceURL": "https://b.example/", "statusCode": 404},
+            },
         },
         {
             "url": "https://c.example/",
             "title": "C",
             "description": "No scrape data",
+            "source": "web",
         },
-        {"url": "not a url", "title": "D", "description": "D"},
+        {"url": "not a url", "title": "D", "description": "D", "source": "web"},
         {
             "url": "https://reports.example/report.pdf",
             "title": "PDF",
             "description": "PDF result",
+            "source": "web",
             "category": "pdf",
+        },
+        {
+            "url": "https://news.example/",
+            "title": "Not web",
+            "description": "",
+            "source": "news",
         },
     ]
     assert adapter.is_pdf_target("https://reports.example/report.pdf")
@@ -81,10 +130,31 @@ def test_search_uses_grouped_web_results_without_embedded_scraping():
     assert not adapter.is_pdf_target("https://reports.example/article")
 
 
+def test_inline_scrape_result_uses_search_markdown_and_extras():
+    item = {
+        "markdown": "# Page",
+        "links": ["https://a.example/"],
+        "metadata": {"statusCode": 200, "sourceURL": "https://a.example/"},
+    }
+    assert adapter.inline_scrape_result(item, "https://a.example/") == {
+        "url": "https://a.example/",
+        "content": "# Page",
+        "extras": {
+            "links": ["https://a.example/"],
+            "metadata": {"statusCode": 200, "sourceURL": "https://a.example/"},
+        },
+    }
+    assert adapter.inline_scrape_result(
+        {"markdown": "# Gone", "metadata": {"statusCode": 404}}, "https://a.example/"
+    ) is None
+    assert adapter.inline_scrape_result({"markdown": "   "}, "https://a.example/") is None
+
+
 def test_search_rejects_provider_and_response_failures_but_keeps_empty_success():
     assert adapter.search_results(httpx.Response(503, json={"success": False})) is None
     assert adapter.search_results(httpx.Response(200, json={"success": False})) is None
-    assert adapter.search_results(httpx.Response(200, json={"success": True, "data": {"news": []}})) is None
+    assert adapter.search_results(httpx.Response(200, json={"success": True, "data": {"news": []}})) == []
+    assert adapter.search_results(httpx.Response(200, json={"success": True, "data": {}})) is None
     assert adapter.search_results(httpx.Response(200, json={"success": True, "data": {"web": []}})) == []
 
 

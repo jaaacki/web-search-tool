@@ -60,11 +60,43 @@ def check_get_defaults_and_openapi_surfaces(client):
         assert schema["info"]["title"] == title, schema["info"]
 
 
+def check_request_id_and_search_filter_contract(client):
+    response = client.get("/openapi.json", headers={"X-Request-ID": "req-contract-1"})
+    assert response.headers["X-Request-ID"] == "req-contract-1", response.headers
+    response = client.get("/openapi.json", headers={"X-Request-ID": "bad id"})
+    assert response.headers["X-Request-ID"] != "bad id", response.headers
+
+    headers = {"X-API-Key": app.WEBSEARCH_API_KEY}
+    response = client.post(
+        "/search",
+        json={
+            "query": "q",
+            "include_domains": ["a.example"],
+            "exclude_domains": ["b.example"],
+        },
+        headers=headers,
+    )
+    assert response.status_code == 422, response.text
+    response = client.post(
+        "/search",
+        json={"query": "q", "categories": ["gov"], "time_range": "week"},
+        headers=headers,
+    )
+    assert response.status_code == 422, response.text
+    response = client.post(
+        "/search",
+        json={"query": "q", "scrape_options": {"zeroDataRetention": True}},
+        headers=headers,
+    )
+    assert response.status_code == 422, response.text
+
+
 def demo():
     app.WEBSEARCH_API_KEY = "dependency-contract-test-key"
     with TestClient(app.app) as client:
         check_auth_and_validation_envelopes(client)
         check_get_defaults_and_openapi_surfaces(client)
+        check_request_id_and_search_filter_contract(client)
     print("API dependency contracts: ok")
 
 

@@ -19,6 +19,8 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from observability import current_request_id
+
 logger = logging.getLogger("websearch.firecrawl")
 
 API_ROOT = "https://api.firecrawl.dev"
@@ -129,9 +131,20 @@ def firecrawl_url_allowed(url: str) -> bool:
 
 
 def _search_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    if "scrapeOptions" in payload:
-        raise FirecrawlUnavailable(None, "embedded_scrape_forbidden", None, False)
     result = dict(payload)
+    scrape = result.get("scrapeOptions")
+    if scrape is not None:
+        if not isinstance(scrape, dict):
+            raise FirecrawlUnavailable(None, "invalid_request", None, False)
+        # Enterprise/team-gated controls are unavailable on the free plan.
+        if any(scrape.get(option) for option in ("zeroDataRetention", "threatProtection")):
+            raise FirecrawlUnavailable(None, "unsupported_enterprise_option", None, False)
+    included = result.get("includeDomains")
+    if isinstance(included, list) and included:
+        # Firecrawl rejects include+exclude together; the caller's allowlist wins.
+        if any(result.get("excludeDomains") or ()):
+            raise FirecrawlUnavailable(None, "invalid_request", None, False)
+        return result
     excluded = result.get("excludeDomains", [])
     if not isinstance(excluded, list) or any(not isinstance(item, str) for item in excluded):
         raise FirecrawlUnavailable(None, "invalid_request", None, False)
@@ -156,6 +169,20 @@ def _scrape_payload(payload: dict[str, Any]) -> dict[str, Any]:
     result["parsers"] = []
     result["storeInCache"] = False
     return result
+
+
+def _response_credits(endpoint: str, response: httpx.Response) -> float:
+    """Credits for the ledger. Search reports a count; scrape bills one page."""
+    if endpoint == "/v2/scrape":
+        return 1.0
+    try:
+        payload = response.json()
+    except ValueError:
+        return 2.0
+    value = payload.get("creditsUsed") if isinstance(payload, dict) else None
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0:
+        return float(value)
+    return 2.0
 
 
 def _retry_after(response: httpx.Response) -> float:
@@ -196,23 +223,27 @@ class FirecrawlControls:
         config_error: bool = False,
         state_path: Path = STATE_PATH,
         lock_path: Path = LOCK_PATH,
+        usage_path: Path | None = None,
     ):
         self._budgets = budgets
         self._config_error = config_error
         self._state_path = Path(state_path)
         self._lock_path = Path(lock_path)
+        self._usage_path = Path(usage_path) if usage_path else None
 
     @classmethod
     def from_env(cls) -> "FirecrawlControls":
         raw = os.getenv("FIRECRAWL_KEYS_JSON")
+        usage_raw = os.getenv("FIRECRAWL_USAGE_LOG", "").strip()
+        usage_path = Path(usage_raw) if usage_raw else None
         try:
             if raw is not None:
-                return cls(_parse_keys(raw))
+                return cls(_parse_keys(raw), usage_path=usage_path)
             legacy = os.getenv("FIRECRAWL_BUDGETS_JSON", "").strip()
-            return cls(_parse_budgets(legacy) if legacy else ())
+            return cls(_parse_budgets(legacy) if legacy else (), usage_path=usage_path)
         except (TypeError, ValueError):
             logger.warning("Firecrawl key configuration is invalid; Firecrawl is disabled")
-            return cls((), config_error=True)
+            return cls((), config_error=True, usage_path=usage_path)
 
     async def request(
         self,
@@ -240,6 +271,18 @@ class FirecrawlControls:
 
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
+        started = time.perf_counter()
+        outcome: dict[str, Any] = {
+            "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "request_id": current_request_id(),
+            "endpoint": endpoint,
+            "label": None,
+            "status": None,
+            "credits": 0.0,
+            "category": None,
+            "elapsed_ms": None,
+        }
+        attempted = False
         fd = await self._acquire_lock(deadline)
         try:
             state = self._read_state()
@@ -258,6 +301,8 @@ class FirecrawlControls:
                 if remaining <= 0:
                     raise FirecrawlUnavailable(None, "request_timeout", 1.0, True)
                 key = budget.keys[0]
+                outcome.update(label=budget.label, status=None, credits=0.0, category=None)
+                attempted = True
                 try:
                     request = client.post(
                         f"{API_ROOT}{endpoint}",
@@ -267,11 +312,16 @@ class FirecrawlControls:
                     )
                     response = await asyncio.wait_for(request, timeout=max(0.0, deadline - loop.time()))
                 except (asyncio.TimeoutError, httpx.TimeoutException) as exc:
+                    outcome["category"] = "transport_timeout"
                     raise FirecrawlUnavailable(None, "transport_timeout", 1.0, True) from exc
                 except httpx.HTTPError as exc:
+                    outcome["category"] = "transport_error"
                     raise FirecrawlUnavailable(None, "transport_error", 1.0, True) from exc
 
+                outcome["status"] = response.status_code
+
                 if 200 <= response.status_code < 300:
+                    outcome["credits"] = _response_credits(endpoint, response)
                     group.clear()
                     try:
                         self._write_state(state)
@@ -279,10 +329,11 @@ class FirecrawlControls:
                         # The provider response is already billable; do not discard it.
                         logger.warning("firecrawl control state not persisted label=%s", budget.label)
                     logger.info(
-                        "firecrawl request ok label=%s endpoint=%s elapsed_ms=%d",
+                        "firecrawl request ok label=%s endpoint=%s elapsed_ms=%d credits=%.1f",
                         budget.label,
                         endpoint,
                         int((timeout - max(0, deadline - loop.time())) * 1000),
+                        outcome["credits"],
                     )
                     return response
 
@@ -320,10 +371,20 @@ class FirecrawlControls:
 
                 # The adapter owns target-level errors (invalid URLs, unsupported
                 # content, no record, and page status); do not rotate a key for them.
+                if endpoint == "/v2/scrape":
+                    outcome["credits"] = 1.0
                 return response
 
             raise last_error
+        except FirecrawlUnavailable as exc:
+            if outcome["status"] is None:
+                outcome["status"] = exc.status
+            outcome["category"] = exc.category
+            raise
         finally:
+            if attempted:
+                outcome["elapsed_ms"] = int((time.perf_counter() - started) * 1000)
+                self._append_usage(outcome)
             self._release_lock(fd)
 
     async def _refresh_block(
@@ -480,6 +541,24 @@ class FirecrawlControls:
             raise FirecrawlUnavailable(None, "control_state_error", None, False)
         # Discard removed credentials and pre-pool operator labels, never reuse their guards.
         return {"budgets": {budget.id: groups[budget.id] for budget in self._budgets if budget.id in groups}}
+
+    def _append_usage(self, entry: dict[str, Any]) -> None:
+        """Best-effort append-only ledger; a write failure never fails the request."""
+        if self._usage_path is None:
+            return
+        try:
+            self._usage_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            fd = os.open(
+                self._usage_path,
+                os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            try:
+                os.write(fd, (json.dumps(entry, separators=(",", ":")) + "\n").encode("utf-8"))
+            finally:
+                os.close(fd)
+        except OSError as exc:
+            logger.warning("firecrawl usage log not written error=%s", type(exc).__name__)
 
     def _write_state(self, state: dict[str, Any]) -> None:
         path = self._state_path

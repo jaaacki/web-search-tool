@@ -24,7 +24,9 @@ Edit `SEARXNG_SECRET` and `WEBSEARCH_API_KEY` to long random values.
 Create runtime data/config directories:
 
 ```bash
-mkdir -p data/searxng data/crawl4ai
+mkdir -p data/searxng data/crawl4ai data/api
+# The API image runs as the unprivileged `app` user; let it append the usage ledger.
+chmod 0777 data/api
 cp data.crawl4ai.llm.env.example data/crawl4ai/.llm.env
 ```
 
@@ -123,6 +125,23 @@ curl 'https://websearch.sparkfn.io/search?q=open%20source%20web%20search%20engin
   -H 'X-API-Key: <WEBSEARCH_API_KEY>'
 ```
 
+`POST /search` exposes the free Firecrawl v2 surface; the GET shortcut remains the simple subset.
+
+- `sources`: `web` (default), `news`, `images`. Non-web sources are Firecrawl-only.
+- `categories`: `developer`, `gov`, `research`, `pdf`. `gov` cannot be combined with other categories or filters.
+- `include_domains` / `exclude_domains`: hostnames only; the two cannot be combined. Brave/SearXNG use `site:` / `-site:`.
+- `time_range` (`day`, `week`, `month`, `year`) or raw `tbs`; `country`, `location`, `safe`, `highlights`, `ignore_invalid_urls`.
+- `scrape_options`: inline Firecrawl extraction. Markdown becomes `content`; every other returned field lands in `extras`. Requires `depth=advanced`.
+- `max_content_chars`: truncate returned `content` after ranking.
+- `candidates` is 1..100; `max_results` is 1..20.
+
+**Fallback contract.** Strict by default. If Firecrawl is unavailable and Brave/SearXNG/Crawl4AI
+cannot honor a requested filter or inline format, the request returns `422 unsupported_feature`
+(nothing can honor it) or `503 fallback_feature_unavailable` (Firecrawl is down and the fallback is a
+subset). Both carry `details.provider` and `details.unsupported`. Set `allow_degraded: true` to accept
+the subset; the response then carries `data.degraded` and human-readable `warnings`. Nothing is
+silently dropped.
+
 Headless crawl:
 
 ```bash
@@ -189,17 +208,35 @@ HTTP and URL validation: 10 of 20 seconds for discovery and 22.5 of 45 seconds f
 Custom totals scale the same way; Brave/SearXNG and Crawl4AI keep the original absolute stage deadlines.
 Accepted partial results survive the Firecrawl cutoff; a timeout does not rotate credentials.
 
-Firecrawl search is discovery-only; page extraction uses a separate policy-checked scrape. LinkedIn,
+Firecrawl search performs discovery and, when `scrape_options` is set, inline page extraction in the
+same call. Without inline options, page extraction uses a separate policy-checked scrape. LinkedIn,
 X/Twitter and known shortener domains are excluded from Firecrawl and may use the local Crawl4AI
-path instead. An explicit Firecrawl policy denial is not retried through another scraper. Scrapes
-are Markdown-only with PDF/image parsers disabled and Firecrawl cache storage disabled; obvious PDF
-URLs stay local, and any unexpected base64/binary result is discarded. `storeInCache: false` is not a
-zero-data-retention guarantee. Firecrawl document parsing can incur per-page charges, so do not add
-PDF/LLM formats without an explicit budget decision. The shared limiter allows one in-flight request
-per API container across both Uvicorn workers. State and locks share the API's `/tmp` tmpfs: worker
-restarts preserve sharing, but container/host restarts discard monotonic-clock deadlines before a
-new clock epoch can reuse them. Outside this Compose configuration, use equivalent ephemeral `/tmp`
-storage. It does not coordinate multiple API containers.
+path instead. An explicit Firecrawl policy denial is not retried through another scraper. Direct
+`/crawl` Firecrawl extraction is Markdown-only with PDF/image parsers disabled and Firecrawl cache
+storage disabled; obvious PDF URLs stay local, and any unexpected base64/binary result is discarded.
+`storeInCache: false` is not a zero-data-retention guarantee. Firecrawl document parsing can incur
+per-page charges, so do not add PDF/LLM formats without an explicit budget decision. The shared
+limiter allows one in-flight request per API container across both Uvicorn workers. State and locks
+share the API's `/tmp` tmpfs: worker restarts preserve sharing, but container/host restarts discard
+monotonic-clock deadlines before a new clock epoch can reuse them. Outside this Compose
+configuration, use equivalent ephemeral `/tmp` storage. It does not coordinate multiple API
+containers.
+
+## Usage log and request IDs
+
+Every HTTP response carries `X-Request-ID` (an incoming valid `X-Request-ID` is echoed; otherwise a
+UUID is generated). The same id appears in log lines and in the Firecrawl usage ledger.
+
+Each Firecrawl search/scrape attempt appends one JSON line to `FIRECRAWL_USAGE_LOG`
+(default `/data/firecrawl-usage.jsonl`, bind-mounted from `./data/api`):
+
+```json
+{"ts":"2026-10-25T12:00:00.000+00:00","request_id":"…","endpoint":"/v2/search","label":"primary@example.test","status":200,"credits":2.0,"category":null,"elapsed_ms":612}
+```
+
+Search credits come from Firecrawl's `creditsUsed`; scrapes count one page. A write failure never
+fails the request. Set `LOG_FORMAT=json` to make stdout one JSON object per line. There is no hard
+credit or RPM cap: the existing reactive 429/402 guards still apply.
 
 ## Crawl stealth defaults
 

@@ -25,10 +25,33 @@ def same_url_identity(first: str, second: str) -> bool:
     return identity is not None and identity == _url_identity(second)
 
 
-def search_payload(query: str, limit: int) -> dict[str, Any] | None:
-    if len(query) > 500 or not 1 <= limit <= 50:
+SEARCH_SOURCES = ("web", "news", "images")
+INLINE_FIELDS = (
+    "markdown",
+    "html",
+    "rawHtml",
+    "links",
+    "images",
+    "screenshot",
+    "summary",
+    "json",
+    "answer",
+    "highlights",
+    "metadata",
+)
+
+
+def search_payload(
+    query: str, limit: int, filters: dict[str, Any] | None = None
+) -> dict[str, Any] | None:
+    if len(query) > 500 or not 1 <= limit <= 100:
         return None
-    return {"query": query, "limit": limit, "sources": ["web"]}
+    payload: dict[str, Any] = {"query": query, "limit": limit, "sources": ["web"]}
+    if isinstance(filters, dict):
+        for key, value in filters.items():
+            if value is not None:
+                payload[key] = value
+    return payload
 
 
 def search_results(response: Any) -> list[dict[str, Any]] | None:
@@ -41,22 +64,58 @@ def search_results(response: Any) -> list[dict[str, Any]] | None:
     if not isinstance(payload, dict) or payload.get("success") is not True:
         return None
     data = payload.get("data")
-    if not isinstance(data, dict) or not isinstance(data.get("web"), list):
+    if not isinstance(data, dict):
+        return None
+    if not any(isinstance(data.get(source), list) for source in SEARCH_SOURCES):
         return None
 
     results = []
-    for item in data["web"]:
-        if not isinstance(item, dict) or not isinstance(item.get("url"), str):
+    for source in SEARCH_SOURCES:
+        rows = data.get(source)
+        if not isinstance(rows, list):
             continue
-        result = {
-            "url": item["url"],
-            "title": item.get("title") if isinstance(item.get("title"), str) else "",
-            "description": item.get("description") if isinstance(item.get("description"), str) else "",
-        }
-        if isinstance(item.get("category"), str):
-            result["category"] = item["category"]
-        results.append(result)
+        for item in rows:
+            if not isinstance(item, dict) or not isinstance(item.get("url"), str):
+                continue
+            result = {
+                "url": item["url"],
+                "title": item.get("title") if isinstance(item.get("title"), str) else "",
+                "description": (
+                    item.get("description")
+                    if isinstance(item.get("description"), str)
+                    else item.get("snippet")
+                    if isinstance(item.get("snippet"), str)
+                    else ""
+                ),
+                "source": source,
+            }
+            for key in ("category", "date", "imageUrl", "imageWidth", "imageHeight", "position"):
+                if item.get(key) is not None:
+                    result[key] = item[key]
+            inline = {key: item[key] for key in INLINE_FIELDS if item.get(key) is not None}
+            if inline:
+                result["inline"] = inline
+            results.append(result)
     return results
+
+
+def inline_scrape_result(item: dict[str, Any], requested_url: str) -> dict[str, Any] | None:
+    """Page content returned by search `scrapeOptions`, without a second request."""
+    markdown = item.get("markdown")
+    if not isinstance(markdown, str) or not markdown.strip():
+        return None
+    metadata = item.get("metadata")
+    if isinstance(metadata, dict):
+        status = metadata.get("statusCode")
+        if isinstance(status, int) and not isinstance(status, bool) and not (200 <= status < 300 or status == 304):
+            return None
+        if metadata.get("error"):
+            return None
+    result: dict[str, Any] = {"url": requested_url, "content": markdown}
+    extras = {key: item[key] for key in INLINE_FIELDS if key != "markdown" and item.get(key) is not None}
+    if extras:
+        result["extras"] = extras
+    return result
 
 
 def supports_markdown_crawl(request: Any) -> bool:
