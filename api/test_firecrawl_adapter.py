@@ -433,7 +433,12 @@ def test_direct_firecrawl_accepts_public_canonical_metadata_url():
     try:
         response = asyncio.run(request())
         assert response.status_code == 200, response.text
-        assert response.json()["data"] == {"url": requested, "content": "# Python"}, response.text
+        assert response.json()["data"] == {
+            "url": requested,
+            "content": "# Python",
+            "provider": "firecrawl",
+            "warnings": [],
+        }, response.text
         assert checked == [requested, canonical], checked
     finally:
         app.WEBSEARCH_API_KEY = saved_key
@@ -466,7 +471,7 @@ def test_provider_routed_direct_crawl_uses_local_crawl4ai():
     app.call_crawl4ai = local_crawl
     try:
         result = asyncio.run(app.crawl_direct_url(object(), app.CrawlRequest(url="https://linkedin.com/in/x")))
-        assert result == {"url": "https://linkedin.com/in/x", "content": "# Local page"}, result
+        assert result == {"url": "https://linkedin.com/in/x", "content": "# Local page", "provider": "crawl4ai", "degraded": None, "warnings": []}, result
         assert calls == ["crawl4ai"], calls
     finally:
         app.is_allowed_public_url = saved_public_check
@@ -549,7 +554,7 @@ def test_provider_routed_direct_crawl_uses_local_extractor():
         result = asyncio.run(
             app.crawl_direct_url(object(), app.CrawlRequest(url="https://linkedin.com/in/x"))
         )
-        assert result == {"url": "https://linkedin.com/in/x", "content": "# Local page"}, result
+        assert result == {"url": "https://linkedin.com/in/x", "content": "# Local page", "provider": "crawl4ai", "degraded": None, "warnings": []}, result
         assert calls == ["crawl4ai"], calls
     finally:
         app.is_allowed_public_url = saved_public_check
@@ -585,7 +590,7 @@ def test_explicit_crawl4ai_options_keep_the_crawl4ai_route():
                 object(), app.CrawlRequest(url="https://example.com", crawler_config={"wait_for": "css:main"})
             )
         )
-        assert result == {"url": "https://example.com", "content": "# Local page"}, result
+        assert result == {"url": "https://example.com", "content": "# Local page", "provider": "crawl4ai", "degraded": None, "warnings": []}, result
         assert calls == ["crawl4ai"], calls
     finally:
         app.is_allowed_public_url = saved_public_check

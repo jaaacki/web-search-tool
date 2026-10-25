@@ -4,6 +4,7 @@ import asyncio
 import json
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -271,35 +272,47 @@ def test_search_allows_free_inline_scrape_but_scrape_stays_markdown_only():
     }, body
 
 
-def test_expensive_scrape_options_fail_before_network():
+def test_free_scrape_options_reach_provider_and_enterprise_options_fail_before_network():
     calls = []
 
     def handler(request):
-        calls.append(request)
+        calls.append(json.loads(request.content))
         return response(request)
 
     async def check():
         with tempfile.TemporaryDirectory() as tmp:
             async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
                 instance = controls(tmp, [("first@example.test", "fc-test")])
-                for extra in (
+                allowed = (
                     {"formats": ["json"]},
                     {"parsers": ["pdf"]},
-                    {"zeroDataRetention": True},
                     {"lockdown": True},
                     {"storeInCache": True},
-                ):
+                    {"redactPII": True},
+                    {"checkPromptInjection": True},
+                )
+                for extra in allowed:
+                    await instance.request(
+                        client, "/v2/scrape", {"url": "https://example.org", **extra}, timeout=1
+                    )
+                for extra in ({"zeroDataRetention": True}, {"threatProtection": {"mode": "normal"}}):
                     try:
                         await instance.request(
                             client, "/v2/scrape", {"url": "https://example.org", **extra}, timeout=1
                         )
                     except fc.FirecrawlUnavailable as exc:
-                        assert exc.category in {"unsupported_cost_options", "unsupported_privacy_option"}, exc.category
+                        assert exc.category == "unsupported_enterprise_option", exc.category
                     else:
-                        raise AssertionError(f"cost option was not rejected: {extra}")
+                        raise AssertionError(f"enterprise option was not rejected: {extra}")
 
     run(check())
-    assert calls == [], calls
+    assert len(calls) == 6, calls
+    assert calls[0]["formats"] == ["json"], calls
+    assert calls[1]["parsers"] == ["pdf"], calls
+    assert calls[2]["lockdown"] is True, calls
+    assert calls[3]["storeInCache"] is True, calls
+    assert calls[4]["redactPII"] is True, calls
+    assert calls[5]["checkPromptInjection"] is True, calls
 
 
 def test_provider_routed_hosts_and_obvious_pdfs_are_blocked_before_scrape():
@@ -988,6 +1001,39 @@ def test_usage_ledger_records_endpoint_credits_and_request_id():
             assert entry["elapsed_ms"] >= 0, entry
 
     run(check())
+
+
+def test_usage_summary_totals_today_and_maps_endpoints():
+    today = datetime.now(timezone.utc).date().isoformat()
+    with tempfile.TemporaryDirectory() as tmp:
+        ledger = Path(tmp) / "usage.jsonl"
+        ledger.write_text(
+            "\n".join(
+                [
+                    json.dumps({"ts": f"{today}T01:00:00Z", "endpoint": "/v2/search", "status": 200, "credits": 2}),
+                    json.dumps({"ts": f"{today}T02:00:00Z", "endpoint": "/v2/scrape", "status": 200, "credits": 1}),
+                    json.dumps({"ts": f"{today}T03:00:00Z", "endpoint": "/v2/map", "status": 503, "credits": 0}),
+                    json.dumps({"ts": "2020-01-01T00:00:00Z", "endpoint": "/v2/crawl", "status": 200, "credits": 5}),
+                    "not json",
+                ]
+            )
+            + "\n"
+        )
+        instance = controls(tmp, [("a@example.test", "key")], usage_path=ledger)
+        summary = instance.usage_summary()
+        assert summary == {
+            "date": today,
+            "requests": 3,
+            "credits": 3.0,
+            "errors": 1,
+            "by_endpoint": {
+                "/v2/search": {"requests": 1, "credits": 2.0},
+                "/v2/scrape": {"requests": 1, "credits": 1.0},
+                "/v2/map": {"requests": 1, "credits": 0.0},
+            },
+            "last_request_at": f"{today}T03:00:00Z",
+        }, summary
+        assert controls(tmp, []).usage_summary() is None
 
 
 def demo():

@@ -9,7 +9,7 @@ Self-hosted stack for `websearch.sparkfn.io` and controlled headless crawling at
 - `reranker`: internal cross-encoder reranking service (Hugging Face TEI). The API's lexical
   prefilter lives in `api/app.py`; this container only scores query/document pairs.
 
-`api` is routed by the lab-001 Traefik through [`sparkfn/lab-001-cluster:traefik/dynamic/websearch.sparkfn.io.yml`](https://github.com/sparkfn/lab-001-cluster/blob/main/traefik/dynamic/websearch.sparkfn.io.yml); route changes go to that repo. `webcrawl.sparkfn.io` only routes `POST /crawl` to the API; Crawl4AI itself remains internal-only. Internal services use Docker `expose` only and are not host-published.
+`api` is routed by the lab-001 Traefik through [`sparkfn/lab-001-cluster:traefik/dynamic/websearch.sparkfn.io.yml`](https://github.com/sparkfn/lab-001-cluster/blob/main/traefik/dynamic/websearch.sparkfn.io.yml); route changes go to that repo. `webcrawl.sparkfn.io` routes the crawl API paths (`/crawl`, `/map`, `/crawl-site*`, `/batch-crawl*`) to the API; Crawl4AI itself remains internal-only. Internal services use Docker `expose` only and are not host-published.
 
 ## Required files
 
@@ -176,6 +176,47 @@ curl -X POST 'https://webcrawl.sparkfn.io/crawl' \
   settings, so any value returns 422.
 - `extraction_config` is deprecated and ignored. It is accepted only when empty (`{}` or omitted);
   a non-empty value returns 422. Put extraction settings in `crawler_config`.
+- `scrape_options`: opt into the free Firecrawl v2 scrape surface (`formats` and scrape settings).
+  Markdown becomes `content`; other formats land in `extras`; `metadata` is returned separately.
+  Cannot be combined with the Crawl4AI options above. Crawl extras share the `SEARCH_MAX_*` byte
+  caps (`SEARCH_MAX_EXTRAS_BYTES`, `SEARCH_MAX_TOTAL_EXTRAS_BYTES`, `SEARCH_MAX_METADATA_BYTES`).
+  `storeInCache` defaults to false.
+- `allow_degraded`: strict by default. When Firecrawl cannot honor a requested format/option, the
+  call returns `503 fallback_feature_unavailable` (or `422 unsupported_feature` if no provider can)
+  instead of silently returning a subset. Set true to accept Crawl4AI content; `data.degraded`
+  names every unsupported feature and `warnings` explains it.
+- `max_content_chars`: 200..200000, truncates the returned `content` only.
+
+Site-level crawl endpoints use Firecrawl jobs. All seeds/URLs pass the same public-URL check.
+
+```bash
+curl -X POST 'https://webcrawl.sparkfn.io/map' \
+  -H 'X-API-Key: <WEBSEARCH_API_KEY>' -H 'content-type: application/json' \
+  -d '{"url":"https://example.com","search":"docs","limit":100}'
+
+curl -X POST 'https://webcrawl.sparkfn.io/crawl-site' \
+  -H 'X-API-Key: <WEBSEARCH_API_KEY>' -H 'content-type: application/json' \
+  -d '{"url":"https://example.com","limit":20,"scrape_options":{"formats":["markdown"]}}'
+
+curl 'https://webcrawl.sparkfn.io/crawl-site/<job_id>?offset=0&limit=20' \
+  -H 'X-API-Key: <WEBSEARCH_API_KEY>'
+
+curl -X POST 'https://webcrawl.sparkfn.io/batch-crawl' \
+  -H 'X-API-Key: <WEBSEARCH_API_KEY>' -H 'content-type: application/json' \
+  -d '{"urls":["https://example.com/a","https://example.com/b"]}'
+```
+
+- `POST /map`: Firecrawl `/v2/map` URL discovery (`search`, `sitemap`, `include_subdomains`,
+  `ignore_query_parameters`, `limit`, `timeout_ms`). Returns `data.urls`.
+- `POST /crawl-site`: Firecrawl `/v2/crawl` (`limit`, paths, depth, sitemap, domain/subdomain/
+  external-link controls, `delay`, `max_concurrency`, `scrape_options`, `timeout_ms`).
+- `POST /batch-crawl`: Firecrawl `/v2/batch/scrape`, up to 100 URLs. `ignore_invalid_urls`
+  defaults true; with false, any non-public URL returns 422 `invalid_url`.
+- `GET /crawl-site/{job_id}` and `GET /batch-crawl/{job_id}`: poll with `offset`/`limit`
+  (`limit` 1..100). Items carry `url`, `content`, `metadata`, `extras`, and per-item `error`.
+  Unknown/expired ids return 404 `job_not_found`. Per-item content is capped by
+  `JOB_MAX_ITEM_BYTES` (20000) and the whole page by `JOB_MAX_ITEMS_BYTES` (1000000);
+  `data.truncated` reports either cap.
 
 ## Firecrawl controls
 
@@ -248,7 +289,10 @@ Each Firecrawl search/scrape attempt appends one JSON line to `FIRECRAWL_USAGE_L
 ```
 
 Search credits come from Firecrawl's `creditsUsed`; if the provider omits it the ledger records an
-estimate of 2. Scrapes count one page. A write failure never fails the request. Set
+estimate of 2. Scrapes and maps count 1; crawl/batch job starts record 0 because their credit cost
+is only known after the job runs. A write failure never fails the request. `/health` returns
+`data.usage` with today's UTC totals (`requests`, `credits`, `errors`, `by_endpoint`,
+`last_request_at`), read from the ledger tail; `null` when no ledger is configured. Set
 `LOG_FORMAT=json` to make stdout one JSON object per line. There is no hard credit or RPM cap: the
 existing reactive 429/402 guards still apply.
 

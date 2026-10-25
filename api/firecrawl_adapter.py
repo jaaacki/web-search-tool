@@ -265,6 +265,77 @@ def scrape_payload(url: str) -> dict[str, Any]:
     }
 
 
+def scrape_full_payload(url: str, options: dict[str, Any]) -> dict[str, Any]:
+    """Firecrawl v2 scrape body for the free-plan surface."""
+    payload: dict[str, Any] = {
+        "url": url,
+        "formats": options.get("formats", ["markdown"]),
+        "onlyMainContent": options.get("onlyMainContent", True),
+        "maxAge": options.get("maxAge", 0),
+        "skipTlsVerification": options.get("skipTlsVerification", False),
+        "parsers": options.get("parsers", []),
+        "storeInCache": options.get("storeInCache", False),
+    }
+    for key, value in options.items():
+        if key not in ("url", "formats", "onlyMainContent", "maxAge", "skipTlsVerification", "parsers", "storeInCache"):
+            payload[key] = value
+    return payload
+
+
+def scrape_full_result(
+    response: Any, requested_url: str, content_format: str = "markdown"
+) -> dict[str, Any] | None:
+    if not 200 <= response.status_code < 300:
+        return None
+    try:
+        payload = response.json()
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or payload.get("success") is not True:
+        return None
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return None
+    metadata = data.get("metadata")
+    target_status = metadata.get("statusCode") if isinstance(metadata, dict) else None
+    if (
+        not isinstance(metadata, dict)
+        or not isinstance(target_status, int)
+        or isinstance(target_status, bool)
+        or not (200 <= target_status < 300 or target_status == 304)
+        or not isinstance(metadata.get("sourceURL"), str)
+        or not same_url_identity(metadata["sourceURL"], requested_url)
+        or metadata.get("error")
+    ):
+        return None
+    preferred = {
+        "markdown": "markdown",
+        "cleaned_html": "html",
+        "html": "html",
+        "text": "markdown",
+    }.get(content_format, "markdown")
+    content = data.get(preferred)
+    if not isinstance(content, str) or not content.strip():
+        for key in ("markdown", "summary", "answer", "highlights", "html"):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                content = value
+                break
+    content = content if isinstance(content, str) else ""
+    extras = {
+        key: data[key]
+        for key in (*FORMAT_RESPONSE_KEYS.values(), "warning", "actions", "tools")
+        if key != "markdown" and data.get(key) is not None
+    }
+    if not content and not extras:
+        return None
+    result: dict[str, Any] = {"url": requested_url, "content": content}
+    if extras:
+        result["extras"] = extras
+    result["metadata"] = metadata
+    return result
+
+
 def scrape_target_url(response: Any) -> tuple[bool, Any]:
     try:
         payload = response.json()
