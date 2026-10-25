@@ -3161,6 +3161,25 @@ def _scrape_options_payload(options: dict[str, Any] | None) -> dict[str, Any] | 
     return result
 
 
+def _public_http_url(url: str) -> bool:
+    """Syntax-only public-URL sieve for provider-supplied links.
+
+    Map results are handed to callers as fetch targets, so drop credentialed,
+    non-http(s), and hostless URLs before they leave the API. Full DNS/IP
+    validation still happens when a caller actually crawls one.
+    """
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    return (
+        parsed.scheme in ("http", "https")
+        and bool(parsed.hostname)
+        and parsed.username is None
+        and parsed.password is None
+    )
+
+
 def _normalize_map_payload(payload: Any) -> list[dict[str, Any]] | None:
     if not isinstance(payload, dict) or payload.get("success") is not True:
         return None
@@ -3171,9 +3190,9 @@ def _normalize_map_payload(payload: Any) -> list[dict[str, Any]] | None:
         return None
     urls = []
     for link in links:
-        if isinstance(link, str):
+        if isinstance(link, str) and _public_http_url(link):
             urls.append({"url": link})
-        elif isinstance(link, dict) and isinstance(link.get("url"), str):
+        elif isinstance(link, dict) and isinstance(link.get("url"), str) and _public_http_url(link["url"]):
             item = {"url": link["url"]}
             for key in ("title", "description"):
                 if isinstance(link.get(key), str):

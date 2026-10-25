@@ -194,6 +194,9 @@ def test_map_payload_and_response_normalization():
                     "https://example.com/plain",
                     {"url": "https://example.com/titled", "title": "T", "description": "D"},
                     {"nope": True},
+                    "http://127.0.0.1:80@example.com/",
+                    "javascript:alert(1)",
+                    {"url": "ftp://example.com/file"},
                 ],
             },
         )
