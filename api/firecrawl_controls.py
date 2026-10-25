@@ -587,21 +587,30 @@ class FirecrawlControls:
             raise FirecrawlUnavailable(None, "invalid_configuration", None, False)
         if not self._budgets:
             raise FirecrawlUnavailable(None, "not_configured", None, False)
-        key = self._budgets[0].keys[0]
-        try:
-            response = await asyncio.wait_for(
-                client.get(
-                    f"{API_ROOT}{path}",
-                    headers={"Authorization": "Bearer " + key, "Accept": "application/json"},
+        # A job belongs to the key that created it, and request admission may
+        # have rotated past the first budget. Status reads are free, so probe
+        # each budget's first key until one knows the job.
+        last = None
+        for budget in self._budgets:
+            key = budget.keys[0]
+            try:
+                response = await asyncio.wait_for(
+                    client.get(
+                        f"{API_ROOT}{path}",
+                        headers={"Authorization": "Bearer " + key, "Accept": "application/json"},
+                        timeout=timeout,
+                    ),
                     timeout=timeout,
-                ),
-                timeout=timeout,
-            )
-        except (asyncio.TimeoutError, httpx.TimeoutException) as exc:
-            raise FirecrawlUnavailable(None, "transport_timeout", 1.0, True) from exc
-        except httpx.HTTPError as exc:
-            raise FirecrawlUnavailable(None, "transport_error", 1.0, True) from exc
-        return response
+                )
+            except (asyncio.TimeoutError, httpx.TimeoutException) as exc:
+                raise FirecrawlUnavailable(None, "transport_timeout", 1.0, True) from exc
+            except httpx.HTTPError as exc:
+                raise FirecrawlUnavailable(None, "transport_error", 1.0, True) from exc
+            if response.status_code == 404:
+                last = response
+                continue
+            return response
+        return last
 
     def usage_summary(self) -> dict[str, Any] | None:
         """Today's (UTC) ledger totals, read from the tail only."""
