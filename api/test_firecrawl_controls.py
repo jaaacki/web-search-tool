@@ -1003,6 +1003,48 @@ def test_usage_ledger_records_endpoint_credits_and_request_id():
     run(check())
 
 
+def test_status_probes_each_budget_for_the_key_that_owns_the_job():
+    calls = []
+
+    def handler(request):
+        calls.append(request.headers["authorization"])
+        if request.headers["authorization"] == "Bearer key-one":
+            return response(request, status=404, body={"success": False})
+        return response(request, status=200, body={"success": True, "status": "completed"})
+
+    async def check():
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = controls(
+                tmp, [("first@example.test", "key-one"), ("second@example.test", "key-two")]
+            )
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                result = await instance.status(client, "/v2/crawl/job-1", timeout=1)
+                assert result.status_code == 200
+            assert calls == ["Bearer key-one", "Bearer key-two"], calls
+
+    run(check())
+
+
+def test_status_returns_last_404_when_no_budget_owns_the_job():
+    calls = []
+
+    def handler(request):
+        calls.append(request.headers["authorization"])
+        return response(request, status=404, body={"success": False})
+
+    async def check():
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = controls(
+                tmp, [("first@example.test", "key-one"), ("second@example.test", "key-two")]
+            )
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                result = await instance.status(client, "/v2/crawl/job-1", timeout=1)
+                assert result.status_code == 404
+            assert calls == ["Bearer key-one", "Bearer key-two"], calls
+
+    run(check())
+
+
 def test_usage_summary_totals_today_and_maps_endpoints():
     today = datetime.now(timezone.utc).date().isoformat()
     with tempfile.TemporaryDirectory() as tmp:
