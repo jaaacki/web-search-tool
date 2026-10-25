@@ -283,7 +283,10 @@ def scrape_full_payload(url: str, options: dict[str, Any]) -> dict[str, Any]:
 
 
 def scrape_full_result(
-    response: Any, requested_url: str, content_format: str = "markdown"
+    response: Any,
+    requested_url: str,
+    content_format: str = "markdown",
+    formats: list[str] | None = None,
 ) -> dict[str, Any] | None:
     if not 200 <= response.status_code < 300:
         return None
@@ -333,6 +336,8 @@ def scrape_full_result(
     if extras:
         result["extras"] = extras
     result["metadata"] = metadata
+    if formats is not None:
+        result["missing_formats"] = missing_inline_formats(formats, data)
     return result
 
 

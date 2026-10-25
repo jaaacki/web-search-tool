@@ -45,6 +45,7 @@ from firecrawl_adapter import (
 )
 from firecrawl_controls import (
     FirecrawlUnavailable,
+    firecrawl_record_job_credits,
     firecrawl_request,
     firecrawl_status,
     firecrawl_url_allowed,
@@ -250,6 +251,7 @@ MAX_TOTAL_EXTRAS_BYTES = int(os.getenv("SEARCH_MAX_TOTAL_EXTRAS_BYTES", "1000000
 MAX_METADATA_BYTES = int(os.getenv("SEARCH_MAX_METADATA_BYTES", "20000"))
 MAX_JOB_ITEM_BYTES = int(os.getenv("JOB_MAX_ITEM_BYTES", "20000"))
 MAX_JOB_ITEMS_BYTES = int(os.getenv("JOB_MAX_ITEMS_BYTES", "1000000"))
+MAX_JOB_PAGES = int(os.getenv("JOB_MAX_PAGES", "3"))
 # Optional Brave Search API keys (comma-separated) for primary discovery.
 # Empty = SearXNG-only discovery, exactly today's behavior.
 BRAVE_API_KEYS = tuple(key.strip() for key in os.getenv("BRAVE_API_KEYS", "").split(",") if key.strip())
@@ -443,7 +445,8 @@ class HealthData(BaseModel):
         default=None,
         description=(
             "Today's UTC Firecrawl usage from the local append-only ledger: requests, credits, errors, per-endpoint "
-            "totals and the last request timestamp. Null when no usage log is configured."
+            "totals and the last request timestamp. Only returned when the request carries a valid X-API-Key; "
+            "null otherwise or when no usage log is configured."
         ),
     )
 
@@ -925,8 +928,34 @@ class MapRequest(BaseModel):
     sitemap: Literal["include", "skip", "only"] | None = Field(default=None, description="Firecrawl sitemap mode.")
     include_subdomains: bool = Field(default=True, description="Include subdomains in the map.")
     ignore_query_parameters: bool = Field(default=True, description="Collapse URLs that differ only by query parameters.")
-    limit: int = Field(default=100, ge=1, le=5000, description="Maximum mapped URLs.")
+    ignore_cache: bool = Field(default=False, description="Bypass Firecrawl's sitemap cache (up to 7 days old).")
+    location: dict[str, Any] | None = Field(
+        default=None,
+        description="Firecrawl map location object: optional country (ISO alpha-2) and languages list.",
+    )
+    limit: int = Field(default=100, ge=1, le=5000, description="Maximum mapped URLs (server cap; Firecrawl allows up to 100000).")
     timeout_ms: int | None = Field(default=None, ge=1000, le=300_000, description="Firecrawl map timeout in milliseconds.")
+
+    @field_validator("location")
+    @classmethod
+    def _validate_location(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        if value is None:
+            return value
+        if set(value) - {"country", "languages"}:
+            raise ValueError("location supports only country and languages")
+        country = value.get("country")
+        if country is not None and (
+            not isinstance(country, str) or len(country) != 2 or not country.isalpha()
+        ):
+            raise ValueError("location.country must be a two-letter ISO code")
+        languages = value.get("languages")
+        if languages is not None and (
+            not isinstance(languages, list)
+            or not languages
+            or any(not isinstance(item, str) or not item.strip() for item in languages)
+        ):
+            raise ValueError("location.languages must be a non-empty array of strings")
+        return value
 
 
 class MapData(BaseModel):
@@ -953,15 +982,23 @@ class CrawlSiteRequest(BaseModel):
     crawl_entire_domain: bool = Field(default=False, description="Crawl the whole domain, not just the seed path.")
     allow_external_links: bool = Field(default=False, description="Allow external links.")
     allow_subdomains: bool = Field(default=False, description="Allow subdomains.")
+    regex_on_full_url: bool = Field(default=False, description="Match include/exclude paths against the full URL.")
     delay: float | None = Field(default=None, ge=0, le=60, description="Delay in seconds between requests.")
     max_concurrency: int | None = Field(default=None, ge=1, le=10, description="Maximum concurrent crawl requests.")
     scrape_options: dict[str, Any] | None = Field(default=None, description="Firecrawl scrapeOptions for each page.")
-    timeout_ms: int | None = Field(default=None, ge=1000, le=300_000, description="Firecrawl crawl timeout in milliseconds.")
+    timeout_ms: int | None = Field(
+        default=None,
+        ge=1000,
+        le=300_000,
+        description="Per-page Firecrawl scrape timeout in milliseconds; sent as scrapeOptions.timeout.",
+    )
 
     @model_validator(mode="after")
     def _validate_options(self) -> "CrawlSiteRequest":
         if self.scrape_options is not None:
             validate_embedded_scrape_options(self.scrape_options)
+        if self.timeout_ms is not None and "timeout" in (self.scrape_options or {}):
+            raise ValueError("timeout_ms cannot be combined with scrape_options.timeout")
         return self
 
 
@@ -971,6 +1008,7 @@ class BatchCrawlRequest(BaseModel):
     urls: list[str] = Field(min_length=1, max_length=100, description="Public URLs to scrape in one batch.")
     scrape_options: dict[str, Any] | None = Field(default=None, description="Firecrawl scrapeOptions for each URL.")
     ignore_invalid_urls: bool = Field(default=True, description="Drop invalid/non-public URLs instead of failing the batch.")
+    max_concurrency: int | None = Field(default=None, ge=1, le=10, description="Maximum concurrent batch scrapes.")
     timeout_ms: int | None = Field(default=None, ge=1000, le=300_000, description="Firecrawl batch timeout in milliseconds.")
 
     @model_validator(mode="after")
@@ -1286,8 +1324,14 @@ async def _run_health_checks() -> dict[str, str]:
     operation_id="check_health",
     tags=["Diagnostics"],
 )
-async def health():
-    usage = await asyncio.to_thread(firecrawl_usage_summary)
+async def health(request: Request = None):
+    usage = None
+    if (
+        request is not None
+        and WEBSEARCH_API_KEY
+        and secrets.compare_digest(request.headers.get("X-API-Key", ""), WEBSEARCH_API_KEY)
+    ):
+        usage = await asyncio.to_thread(firecrawl_usage_summary)
     now = time.monotonic()
     cached_at = _HEALTH_CACHE["at"]
     if isinstance(cached_at, float) and now - cached_at < HEALTH_CACHE_TTL:
@@ -1883,7 +1927,9 @@ def fallback_query_and_params(
     return query, params
 
 
-def crawl4ai_feature_loss(scrape_options: dict[str, Any] | None, content_format: str) -> list[str]:
+def crawl4ai_feature_loss(
+    scrape_options: dict[str, Any] | None, content_format: str, url: str = ""
+) -> list[str]:
     """Formats/options Firecrawl supplied that Crawl4AI cannot reproduce."""
     if not scrape_options:
         return []
@@ -1895,6 +1941,10 @@ def crawl4ai_feature_loss(scrape_options: dict[str, Any] | None, content_format:
         for fmt in normalize_formats(scrape_options.get("formats"))
         if fmt not in supported
     ]
+    for parser in scrape_options.get("parsers") or []:
+        name = parser if isinstance(parser, str) else parser.get("type") if isinstance(parser, dict) else None
+        if name == "image" or (name == "pdf" and not is_pdf_target(url)):
+            loss.append(f"parser:{name}")
     defaults = {
         "storeInCache": False,
         "onlyMainContent": True,
@@ -2897,9 +2947,14 @@ async def crawl4ai_fallback(
 
 async def crawl_with_scrape_options(client: httpx.AsyncClient, request: CrawlRequest):
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + CRAWL_TIMEOUT
-    loss = crawl4ai_feature_loss(request.scrape_options, request.content_format)
-    payload = firecrawl_scrape_full_payload(request.url, request.scrape_options or {})
+    options = request.scrape_options or {}
+    requested_ms = max(
+        options.get("timeout") if isinstance(options.get("timeout"), int) else 0,
+        options.get("waitFor") if isinstance(options.get("waitFor"), int) else 0,
+    )
+    deadline = loop.time() + max(CRAWL_TIMEOUT, min(requested_ms / 1000 + 5, 305))
+    loss = crawl4ai_feature_loss(request.scrape_options, request.content_format, request.url)
+    payload = firecrawl_scrape_full_payload(request.url, options)
     try:
         response = await firecrawl_request(
             client, "/v2/scrape", payload, timeout=max(deadline - loop.time(), 0.0)
@@ -2968,7 +3023,12 @@ async def crawl_with_scrape_options(client: httpx.AsyncClient, request: CrawlReq
         ) from exc
     if not reported_url_allowed:
         raise AppError(422, "invalid_crawled_url", "Crawled URL must be a public http(s) URL")
-    result = firecrawl_scrape_full_result(response, request.url, request.content_format)
+    result = firecrawl_scrape_full_result(
+        response,
+        request.url,
+        request.content_format,
+        normalize_formats(options.get("formats")),
+    )
     if result is None:
         if loss and not request.allow_degraded:
             raise AppError(
@@ -2982,6 +3042,18 @@ async def crawl_with_scrape_options(client: httpx.AsyncClient, request: CrawlReq
             )
         return await crawl4ai_fallback(client, request, loss)
 
+    missing = result.get("missing_formats") or []
+    unsupported = [f"format:{fmt}" for fmt in missing]
+    if unsupported and not request.allow_degraded:
+        raise AppError(
+            503,
+            "fallback_feature_unavailable",
+            "Firecrawl did not return every requested format",
+            {"provider": "firecrawl", "fallback_provider": "crawl4ai", "unsupported": unsupported},
+            retryable=True,
+            retry_after=OUTAGE_RETRY_AFTER,
+            hint="Retry, or set allow_degraded=true to accept the returned subset.",
+        )
     extras, extras_truncated, omitted = cap_extras_payload(result.get("extras"))
     warnings = []
     if extras_truncated or omitted:
@@ -2989,7 +3061,9 @@ async def crawl_with_scrape_options(client: httpx.AsyncClient, request: CrawlReq
         if omitted:
             message += f"; omitted: {', '.join(omitted)}"
         warnings.append(message)
-    return {
+    if unsupported:
+        warnings.append(f"Firecrawl did not return: {', '.join(missing)}")
+    response_data = {
         "url": result["url"],
         "content": truncate_content(result["content"], request.max_content_chars),
         "provider": "firecrawl",
@@ -2997,6 +3071,9 @@ async def crawl_with_scrape_options(client: httpx.AsyncClient, request: CrawlReq
         "extras": extras,
         "warnings": warnings,
     }
+    if unsupported:
+        response_data["degraded"] = {"provider": "firecrawl", "unsupported": unsupported}
+    return response_data
 
 
 async def crawl_direct_url(client: httpx.AsyncClient, request: CrawlRequest):
@@ -3172,12 +3249,21 @@ def _public_http_url(url: str) -> bool:
         parsed = urlparse(url)
     except ValueError:
         return False
-    return (
-        parsed.scheme in ("http", "https")
-        and bool(parsed.hostname)
-        and parsed.username is None
-        and parsed.password is None
-    )
+    if (
+        parsed.scheme not in ("http", "https")
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return False
+    host = parsed.hostname.strip("[]").rstrip(".")
+    try:
+        if not ipaddress.ip_address(host).is_global:
+            return False
+    except ValueError:
+        if host.lower() == "localhost" or host.lower().endswith(".localhost"):
+            return False
+    return True
 
 
 def _normalize_map_payload(payload: Any) -> list[dict[str, Any]] | None:
@@ -3201,8 +3287,15 @@ def _normalize_map_payload(payload: Any) -> list[dict[str, Any]] | None:
     return urls
 
 
+def _json_bytes(value: Any) -> int:
+    try:
+        return len(json.dumps(value, ensure_ascii=False, default=str).encode("utf-8"))
+    except (TypeError, ValueError):
+        return MAX_JOB_ITEMS_BYTES + 1
+
+
 def _normalize_job_payload(
-    payload: Any, job_id: str, *, offset: int, limit: int
+    payload: Any, job_id: str, *, offset: int, limit: int, more_available: bool = False
 ) -> JobData | None:
     if not isinstance(payload, dict) or payload.get("success") is not True:
         return None
@@ -3219,75 +3312,208 @@ def _normalize_job_payload(
     selected = items[offset : offset + limit]
     normalized = []
     budget = MAX_JOB_ITEMS_BYTES
+    truncated = more_available
     for item in selected:
+        if budget <= 1024:
+            truncated = True
+            break
         if not isinstance(item, dict):
+            record = {
+                "content": "",
+                "success": False,
+                "error": "provider returned an invalid item",
+            }
+            normalized.append(record)
+            budget -= _json_bytes(record)
             continue
         metadata = item.get("metadata")
         url = item.get("url")
         if not isinstance(url, str) and isinstance(metadata, dict):
             url = metadata.get("sourceURL") or metadata.get("url")
+        url_error = None
+        if isinstance(url, str) and not _public_http_url(url):
+            url = None
+            url_error = "provider returned a non-public URL"
         content = ""
         for key in ("markdown", "summary", "answer", "highlights", "html"):
             value = item.get(key)
             if isinstance(value, str) and value.strip():
                 content = value
                 break
-        content = truncate_bytes(content, MAX_JOB_ITEM_BYTES)
+        remaining = max(budget - 1024, 0)
+        content = truncate_bytes(content, min(MAX_JOB_ITEM_BYTES, remaining))
+        remaining -= len(content.encode("utf-8"))
+        metadata_out = cap_metadata(metadata) if isinstance(metadata, dict) else None
+        if isinstance(metadata_out, dict):
+            source = metadata_out.get("sourceURL")
+            if isinstance(source, str) and not _public_http_url(source):
+                metadata_out.pop("sourceURL", None)
+                url_error = url_error or "provider returned a non-public source URL"
+        if metadata_out is not None:
+            metadata_bytes = _json_bytes(metadata_out)
+            if metadata_bytes > remaining:
+                metadata_out = None
+                remaining = 0
+            else:
+                remaining -= metadata_bytes
         extras = {
             key: item[key]
             for key in (*FORMAT_RESPONSE_KEYS.values(), "warning", "actions", "tools")
             if key not in ("markdown", "metadata") and item.get(key) is not None
         }
-        extras, extras_truncated, omitted = cap_extras_payload(extras)
-        record: dict[str, Any] = {
-            "url": url if isinstance(url, str) else None,
+        extras, _extras_used, omitted, extras_truncated = cap_one_extras(
+            extras, MAX_EXTRAS_BYTES, remaining
+        )
+        record = {
             "content": content,
             "success": item.get("success", True),
         }
-        error = item.get("error_message") or item.get("error")
+        if url is not None:
+            record["url"] = url
+        error = item.get("error_message") or item.get("error") or url_error
         if error:
             record["error"] = str(error)[:500]
-        if isinstance(metadata, dict):
-            record["metadata"] = cap_metadata(metadata)
+        if metadata_out is not None:
+            record["metadata"] = metadata_out
         if extras:
             record["extras"] = extras
         if omitted:
             record["omitted"] = omitted
+        if extras_truncated:
+            truncated = True
+        used = _json_bytes(record)
+        if used > budget:
+            record.pop("extras", None)
+            record.pop("metadata", None)
+            record["omitted"] = sorted(set(record.get("omitted", []) + ["extras", "metadata"]))
+            record["content"] = truncate_bytes(content, max(budget - 1024, 0))
+            used = _json_bytes(record)
+            truncated = True
+        budget -= used
         normalized.append(record)
-        budget -= len(content.encode("utf-8"))
         if budget <= 0:
+            truncated = True
             break
     seed = payload.get("url") if isinstance(payload.get("url"), str) else None
+    if len(items) > offset + len(selected):
+        truncated = True
     return JobData(
         id=job_id,
         url=seed,
         status=status,
         completed=completed,
-        total=max(total, completed),
+        total=max(total, completed, len(items)),
         items=normalized,
         offset=offset,
         limit=limit,
-        truncated=(len(items) > offset + len(normalized)) or budget <= 0,
+        truncated=truncated,
     )
 
 
-async def _validate_batch_urls(urls: list[str], ignore_invalid: bool) -> list[str]:
+async def _collect_job_payload(
+    client: httpx.AsyncClient, path: str, job_id: str, *, offset: int, limit: int
+) -> tuple[Any, bool]:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + CRAWL_TIMEOUT
+    try:
+        response = await firecrawl_status(client, path, timeout=CRAWL_TIMEOUT)
+    except FirecrawlUnavailable as exc:
+        _raise_firecrawl_unavailable(exc)
+    _raise_firecrawl_http(response, job=True)
+    payload = _parse_firecrawl_json(response)
+    if not isinstance(payload, dict):
+        return payload, False
+    items = payload.get("data") if isinstance(payload.get("data"), list) else []
+    pages = 1
+    while isinstance(payload.get("next"), str) and len(items) < offset + limit and pages < MAX_JOB_PAGES:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            break
+        try:
+            following = await firecrawl_status(client, payload["next"], timeout=remaining)
+        except FirecrawlUnavailable as exc:
+            if exc.category == "transport_timeout":
+                break
+            _raise_firecrawl_unavailable(exc)
+        if following.status_code >= 300:
+            if following.status_code >= 500:
+                _raise_firecrawl_http(following, job=True)
+            break
+        next_payload = _parse_firecrawl_json(following)
+        if not isinstance(next_payload, dict) or next_payload.get("success") is not True:
+            break
+        more = next_payload.get("data")
+        if isinstance(more, list):
+            items.extend(more)
+        payload["data"] = items
+        payload["next"] = next_payload.get("next")
+        for key in ("total", "completed", "status", "creditsUsed"):
+            if key in next_payload:
+                payload[key] = next_payload[key]
+        pages += 1
+    payload["data"] = items
+    if payload.get("status") in ("completed", "failed"):
+        await firecrawl_record_job_credits(
+            "/v2/crawl" if path.startswith("/v2/crawl") else "/v2/batch/scrape",
+            job_id,
+            payload.get("creditsUsed"),
+        )
+    return payload, bool(payload.get("next"))
+
+
+def _parse_firecrawl_json(response: httpx.Response) -> Any:
+    try:
+        return response.json()
+    except (TypeError, ValueError) as exc:
+        raise AppError(
+            502,
+            "upstream_error",
+            "Firecrawl returned an invalid response",
+            {"provider": "firecrawl", "status": response.status_code},
+            retryable=True,
+            retry_after=OUTAGE_RETRY_AFTER,
+        ) from exc
+
+
+def _pdf_parser_requested(scrape_options: dict[str, Any] | None) -> bool:
+    for parser in (scrape_options or {}).get("parsers") or []:
+        name = parser if isinstance(parser, str) else parser.get("type") if isinstance(parser, dict) else None
+        if name == "pdf":
+            return True
+    return False
+
+
+async def _validate_batch_urls(
+    urls: list[str], ignore_invalid: bool, *, allow_pdf: bool = False
+) -> list[str]:
     checks = await asyncio.gather(*(is_allowed_public_url(url) for url in urls))
-    allowed = [url for url, ok in zip(urls, checks) if ok]
+    public = [url for url, ok in zip(urls, checks) if ok]
     invalid = [url for url, ok in zip(urls, checks) if not ok]
+    routed = [url for url in public if not firecrawl_url_allowed(url, allow_pdf=allow_pdf)]
+    allowed = [url for url in public if url not in routed]
     if not allowed:
         raise AppError(
             422,
             "invalid_url",
-            "URL must be a public http(s) URL",
-            {"invalid": invalid[:20], "invalid_count": len(invalid)},
+            "URL must be a public http(s) URL Firecrawl can scrape",
+            {
+                "invalid": invalid[:20],
+                "invalid_count": len(invalid),
+                "routed": routed[:20],
+                "routed_count": len(routed),
+            },
         )
-    if invalid and not ignore_invalid:
+    if (invalid or routed) and not ignore_invalid:
         raise AppError(
             422,
             "invalid_url",
-            "URL must be a public http(s) URL",
-            {"invalid": invalid[:20], "invalid_count": len(invalid)},
+            "URL must be a public http(s) URL Firecrawl can scrape",
+            {
+                "invalid": invalid[:20],
+                "invalid_count": len(invalid),
+                "routed": routed[:20],
+                "routed_count": len(routed),
+            },
         )
     return allowed
 
@@ -3311,19 +3537,25 @@ async def map_site(request: MapRequest):
         "limit": request.limit,
         "includeSubdomains": request.include_subdomains,
         "ignoreQueryParameters": request.ignore_query_parameters,
+        "ignoreCache": request.ignore_cache,
     }
     if request.search:
         payload["search"] = request.search
     if request.sitemap:
         payload["sitemap"] = request.sitemap
+    if request.location:
+        payload["location"] = request.location
     if request.timeout_ms is not None:
         payload["timeout"] = request.timeout_ms
+    timeout = CRAWL_TIMEOUT
+    if request.timeout_ms is not None:
+        timeout = max(CRAWL_TIMEOUT, min(request.timeout_ms / 1000 + 5, 305))
     try:
-        response = await firecrawl_request(client, "/v2/map", payload, timeout=CRAWL_TIMEOUT)
+        response = await firecrawl_request(client, "/v2/map", payload, timeout=timeout)
     except FirecrawlUnavailable as exc:
         _raise_firecrawl_unavailable(exc)
     _raise_firecrawl_http(response)
-    urls = _normalize_map_payload(response.json())
+    urls = _normalize_map_payload(_parse_firecrawl_json(response))
     if urls is None:
         raise AppError(502, "upstream_error", "Firecrawl returned an invalid map response", retryable=True)
     _record_provider_health("firecrawl", "ok")
@@ -3338,6 +3570,7 @@ def _crawl_site_payload(request: CrawlSiteRequest) -> dict[str, Any]:
         "crawlEntireDomain": request.crawl_entire_domain,
         "allowExternalLinks": request.allow_external_links,
         "allowSubdomains": request.allow_subdomains,
+        "regexOnFullURL": request.regex_on_full_url,
     }
     if request.max_discovery_depth is not None:
         payload["maxDiscoveryDepth"] = request.max_discovery_depth
@@ -3351,11 +3584,11 @@ def _crawl_site_payload(request: CrawlSiteRequest) -> dict[str, Any]:
         payload["delay"] = request.delay
     if request.max_concurrency is not None:
         payload["maxConcurrency"] = request.max_concurrency
-    scrape_options = _scrape_options_payload(request.scrape_options)
-    if scrape_options:
-        payload["scrapeOptions"] = scrape_options
+    scrape_options = dict(request.scrape_options or {})
     if request.timeout_ms is not None:
-        payload["timeout"] = request.timeout_ms
+        scrape_options["timeout"] = request.timeout_ms
+    if scrape_options:
+        payload["scrapeOptions"] = _scrape_options_payload(scrape_options)
     return payload
 
 
@@ -3373,6 +3606,17 @@ async def start_site_crawl(request: CrawlSiteRequest):
     client = await get_client()
     if not await is_allowed_public_url(request.url):
         raise AppError(422, "invalid_url", "URL must be a public http(s) URL")
+    if not firecrawl_url_allowed(
+        request.url, allow_pdf=_pdf_parser_requested(request.scrape_options)
+    ):
+        raise AppError(
+            422,
+            "unsupported_feature",
+            "Target is routed away from Firecrawl",
+            {"provider": "firecrawl", "reason": "provider_routed_domain"},
+            retryable=False,
+            hint="Use POST /crawl for this target; site crawl is Firecrawl-only.",
+        )
     try:
         response = await firecrawl_request(
             client, "/v2/crawl", _crawl_site_payload(request), timeout=CRAWL_TIMEOUT
@@ -3380,7 +3624,7 @@ async def start_site_crawl(request: CrawlSiteRequest):
     except FirecrawlUnavailable as exc:
         _raise_firecrawl_unavailable(exc)
     _raise_firecrawl_http(response)
-    body = response.json()
+    body = _parse_firecrawl_json(response)
     job_id = body.get("id") if isinstance(body, dict) else None
     if not isinstance(job_id, str) or not job_id:
         raise AppError(502, "upstream_error", "Firecrawl did not return a crawl job id", retryable=True)
@@ -3405,12 +3649,12 @@ async def site_crawl_status(
     limit: int = Query(default=20, ge=1, le=100),
 ):
     client = await get_client()
-    try:
-        response = await firecrawl_status(client, f"/v2/crawl/{job_id}", timeout=CRAWL_TIMEOUT)
-    except FirecrawlUnavailable as exc:
-        _raise_firecrawl_unavailable(exc)
-    _raise_firecrawl_http(response, job=True)
-    data = _normalize_job_payload(response.json(), job_id, offset=offset, limit=limit)
+    payload, more_available = await _collect_job_payload(
+        client, f"/v2/crawl/{job_id}", job_id, offset=offset, limit=limit
+    )
+    data = _normalize_job_payload(
+        payload, job_id, offset=offset, limit=limit, more_available=more_available
+    )
     if data is None:
         raise AppError(502, "upstream_error", "Firecrawl returned an invalid crawl status", retryable=True)
     return JobEnvelope(data=data)
@@ -3428,7 +3672,11 @@ async def site_crawl_status(
 )
 async def start_batch_crawl(request: BatchCrawlRequest):
     client = await get_client()
-    urls = await _validate_batch_urls(request.urls, request.ignore_invalid_urls)
+    urls = await _validate_batch_urls(
+        request.urls,
+        request.ignore_invalid_urls,
+        allow_pdf=_pdf_parser_requested(request.scrape_options),
+    )
     payload: dict[str, Any] = {
         "urls": urls,
         "ignoreInvalidURLs": request.ignore_invalid_urls,
@@ -3438,6 +3686,8 @@ async def start_batch_crawl(request: BatchCrawlRequest):
     scrape_options = _scrape_options_payload(request.scrape_options)
     if scrape_options:
         payload.update(scrape_options)
+    if request.max_concurrency is not None:
+        payload["maxConcurrency"] = request.max_concurrency
     if request.timeout_ms is not None:
         payload["timeout"] = request.timeout_ms
     try:
@@ -3447,7 +3697,7 @@ async def start_batch_crawl(request: BatchCrawlRequest):
     except FirecrawlUnavailable as exc:
         _raise_firecrawl_unavailable(exc)
     _raise_firecrawl_http(response)
-    body = response.json()
+    body = _parse_firecrawl_json(response)
     job_id = body.get("id") if isinstance(body, dict) else None
     if not isinstance(job_id, str) or not job_id:
         raise AppError(502, "upstream_error", "Firecrawl did not return a batch job id", retryable=True)
@@ -3470,14 +3720,12 @@ async def batch_crawl_status(
     limit: int = Query(default=20, ge=1, le=100),
 ):
     client = await get_client()
-    try:
-        response = await firecrawl_status(
-            client, f"/v2/batch/scrape/{job_id}", timeout=CRAWL_TIMEOUT
-        )
-    except FirecrawlUnavailable as exc:
-        _raise_firecrawl_unavailable(exc)
-    _raise_firecrawl_http(response, job=True)
-    data = _normalize_job_payload(response.json(), job_id, offset=offset, limit=limit)
+    payload, more_available = await _collect_job_payload(
+        client, f"/v2/batch/scrape/{job_id}", job_id, offset=offset, limit=limit
+    )
+    data = _normalize_job_payload(
+        payload, job_id, offset=offset, limit=limit, more_available=more_available
+    )
     if data is None:
         raise AppError(502, "upstream_error", "Firecrawl returned an invalid batch status", retryable=True)
     return JobEnvelope(data=data)

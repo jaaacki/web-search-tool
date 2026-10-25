@@ -32,7 +32,7 @@ def _setup(**overrides):
     app.WEBSEARCH_API_KEY = HEADERS["X-API-Key"]
     app.get_client = lambda: asyncio.sleep(0, result=object())
     app.is_allowed_public_url = lambda _url: asyncio.sleep(0, result=True)
-    app.firecrawl_url_allowed = lambda _url: True
+    app.firecrawl_url_allowed = lambda _url, **_kwargs: True
     app.health_cache_reset()
     for name, value in overrides.items():
         setattr(app, name, value)
@@ -211,6 +211,8 @@ def test_map_payload_and_response_normalization():
                     "url": "https://example.com/",
                     "search": "docs",
                     "sitemap": "only",
+                    "ignore_cache": True,
+                    "location": {"country": "US", "languages": ["en"]},
                     "limit": 50,
                     "timeout_ms": 5000,
                 },
@@ -234,6 +236,8 @@ def test_map_payload_and_response_normalization():
                     "limit": 50,
                     "includeSubdomains": True,
                     "ignoreQueryParameters": True,
+                    "ignoreCache": True,
+                    "location": {"country": "US", "languages": ["en"]},
                     "search": "docs",
                     "sitemap": "only",
                     "timeout": 5000,
@@ -294,6 +298,8 @@ def test_site_crawl_start_and_paged_status():
                     "url": "https://example.com/",
                     "limit": 2,
                     "include_paths": ["/docs/*"],
+                    "regex_on_full_url": True,
+                    "timeout_ms": 15000,
                     "scrape_options": {"formats": ["markdown"]},
                 },
             )
@@ -316,8 +322,10 @@ def test_site_crawl_start_and_paged_status():
             assert start_calls[0][0] == "/v2/crawl", start_calls
             assert start_calls[0][1]["scrapeOptions"] == {
                 "formats": ["markdown"],
+                "timeout": 15000,
                 "storeInCache": False,
             }, start_calls
+            assert start_calls[0][1]["regexOnFullURL"] is True, start_calls
 
             polled = client.get(
                 "/crawl-site/job-1?offset=1&limit=1", headers=HEADERS
@@ -381,6 +389,7 @@ def test_batch_crawl_filters_non_public_urls_and_polls_batch_endpoint():
                 json={
                     "urls": ["https://example.com/a", "http://private.internal/b"],
                     "scrape_options": {"formats": ["markdown"]},
+                    "max_concurrency": 2,
                 },
             )
         assert response.status_code == 200, response.text
@@ -393,6 +402,7 @@ def test_batch_crawl_filters_non_public_urls_and_polls_batch_endpoint():
                     "ignoreInvalidURLs": True,
                     "formats": ["markdown"],
                     "storeInCache": False,
+                    "maxConcurrency": 2,
                 },
             )
         ], calls

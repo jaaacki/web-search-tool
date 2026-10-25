@@ -30,6 +30,9 @@ LOCK_PATH = Path("/tmp/websearch-firecrawl-controls.lock")
 USAGE_RECHECK_SECONDS = 900.0
 USAGE_TAIL_BYTES = 512 * 1024
 MAX_RETRY_AFTER = 86_400.0
+# Firecrawl status pages are chunked at ~10 MB and formats such as screenshot
+# or rawBase64 can be large. Refuse anything bigger instead of materialising it.
+MAX_UPSTREAM_BYTES = int(os.getenv("FIRECRAWL_MAX_RESPONSE_BYTES", str(16 * 1024 * 1024)))
 COST_SENSITIVE_DOMAINS = (
     "linkedin.com",
     "lnkd.in",
@@ -38,6 +41,53 @@ COST_SENSITIVE_DOMAINS = (
     "mobile.twitter.com",
     "t.co",
 )
+
+
+async def _send_bounded(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    *,
+    headers: dict[str, str],
+    timeout: float,
+    json_body: dict[str, Any] | None = None,
+) -> httpx.Response:
+    """One Firecrawl exchange with a hard response-body cap.
+
+    Error bodies are not needed by any caller (status codes and Retry-After
+    headers are), so they are left unread and returned empty. Successful bodies
+    are streamed and refused before they can exceed MAX_UPSTREAM_BYTES.
+    """
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise FirecrawlUnavailable(None, "invalid_timeout", None, False)
+    request = client.build_request(method, url, json=json_body, headers=headers, timeout=timeout)
+    response = None
+    try:
+        async with asyncio.timeout(timeout):
+            response = await asyncio.wait_for(
+                client.send(request, stream=True), timeout=timeout
+            )
+            status = response.status_code
+            response_headers = response.headers
+            if status < 300:
+                chunks = []
+                total = 0
+                async for chunk in response.aiter_bytes():
+                    total += len(chunk)
+                    if total > MAX_UPSTREAM_BYTES:
+                        raise FirecrawlUnavailable(status, "response_too_large", None, False)
+                    chunks.append(chunk)
+                body = b"".join(chunks)
+            else:
+                body = b""
+    except (TimeoutError, httpx.TimeoutException) as exc:
+        raise FirecrawlUnavailable(None, "transport_timeout", 1.0, True) from exc
+    except httpx.HTTPError as exc:
+        raise FirecrawlUnavailable(None, "transport_error", 1.0, True) from exc
+    finally:
+        if response is not None:
+            await response.aclose()
+    return httpx.Response(status, headers=response_headers, content=body, request=request)
 
 
 class FirecrawlUnavailable(Exception):
@@ -333,19 +383,20 @@ class FirecrawlControls:
                 outcome.update(label=budget.label, status=None, credits=0.0, category=None)
                 attempted = True
                 try:
-                    request = client.post(
+                    response = await _send_bounded(
+                        client,
+                        "POST",
                         f"{API_ROOT}{endpoint}",
-                        json=request_payload,
+                        json_body=request_payload,
                         headers={"Authorization": "Bearer " + key, "Accept": "application/json"},
                         timeout=remaining,
                     )
-                    response = await asyncio.wait_for(request, timeout=max(0.0, deadline - loop.time()))
-                except (asyncio.TimeoutError, httpx.TimeoutException) as exc:
-                    outcome["category"] = "transport_timeout"
-                    raise FirecrawlUnavailable(None, "transport_timeout", 1.0, True) from exc
-                except httpx.HTTPError as exc:
-                    outcome["category"] = "transport_error"
-                    raise FirecrawlUnavailable(None, "transport_error", 1.0, True) from exc
+                except FirecrawlUnavailable as exc:
+                    if exc.category == "response_too_large":
+                        outcome["category"] = "response_too_large"
+                    else:
+                        outcome["category"] = exc.category
+                    raise
 
                 outcome["status"] = response.status_code
 
@@ -480,18 +531,17 @@ class FirecrawlControls:
         if remaining <= 0:
             return None
         try:
-            request = client.get(
+            response = await _send_bounded(
+                client,
+                "GET",
                 f"{API_ROOT}{CREDIT_USAGE_PATH}",
                 headers={"Authorization": "Bearer " + key, "Accept": "application/json"},
                 timeout=remaining,
             )
-            response = await asyncio.wait_for(
-                request, timeout=max(0.0, deadline - asyncio.get_running_loop().time())
-            )
             if response.status_code != 200:
                 return None
             body = response.json()
-        except (asyncio.TimeoutError, httpx.HTTPError, ValueError):
+        except (FirecrawlUnavailable, ValueError):
             return None
 
         data = body.get("data") if isinstance(body, dict) and body.get("success") is True else None
@@ -569,7 +619,17 @@ class FirecrawlControls:
         if not isinstance(groups, dict):
             raise FirecrawlUnavailable(None, "control_state_error", None, False)
         # Discard removed credentials and pre-pool operator labels, never reuse their guards.
-        return {"budgets": {budget.id: groups[budget.id] for budget in self._budgets if budget.id in groups}}
+        cleaned = {
+            "budgets": {
+                budget.id: groups[budget.id]
+                for budget in self._budgets
+                if budget.id in groups
+            }
+        }
+        jobs = state.get("jobs")
+        if isinstance(jobs, dict):
+            cleaned["jobs"] = jobs
+        return cleaned
 
     async def status(
         self,
@@ -581,36 +641,109 @@ class FirecrawlControls:
         """Poll a Firecrawl job. Status reads are not billable; no key rotation."""
         if not math.isfinite(timeout) or timeout <= 0:
             raise FirecrawlUnavailable(None, "invalid_timeout", None, False)
-        if not path.startswith("/v2/") or ".." in path:
-            raise FirecrawlUnavailable(None, "invalid_request", None, False)
+        if path.startswith("https://") or path.startswith("http://"):
+            parsed = urlsplit(path)
+            if (
+                parsed.scheme != "https"
+                or parsed.hostname != "api.firecrawl.dev"
+                or parsed.username is not None
+                or parsed.password is not None
+                or ".." in parsed.path
+            ):
+                raise FirecrawlUnavailable(None, "invalid_request", None, False)
+            request_url = path
+        else:
+            if not path.startswith("/v2/") or ".." in path:
+                raise FirecrawlUnavailable(None, "invalid_request", None, False)
+            request_url = API_ROOT + path
         if self._config_error:
             raise FirecrawlUnavailable(None, "invalid_configuration", None, False)
         if not self._budgets:
             raise FirecrawlUnavailable(None, "not_configured", None, False)
         # A job belongs to the key that created it, and request admission may
         # have rotated past the first budget. Status reads are free, so probe
-        # each budget's first key until one knows the job.
+        # each budget's first key until one knows the job. Auth/throttle errors
+        # from a key that does not own the job are also skipped, not returned.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
         last = None
-        for budget in self._budgets:
+        for index, budget in enumerate(self._budgets):
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                if last is not None:
+                    return last
+                raise FirecrawlUnavailable(None, "transport_timeout", 1.0, True)
             key = budget.keys[0]
             try:
-                response = await asyncio.wait_for(
-                    client.get(
-                        f"{API_ROOT}{path}",
-                        headers={"Authorization": "Bearer " + key, "Accept": "application/json"},
-                        timeout=timeout,
-                    ),
-                    timeout=timeout,
+                response = await _send_bounded(
+                    client,
+                    "GET",
+                    request_url,
+                    headers={"Authorization": "Bearer " + key, "Accept": "application/json"},
+                    timeout=remaining,
                 )
-            except (asyncio.TimeoutError, httpx.TimeoutException) as exc:
-                raise FirecrawlUnavailable(None, "transport_timeout", 1.0, True) from exc
-            except httpx.HTTPError as exc:
-                raise FirecrawlUnavailable(None, "transport_error", 1.0, True) from exc
-            if response.status_code == 404:
+            except FirecrawlUnavailable as exc:
+                if exc.category == "transport_timeout" and last is not None:
+                    return last
+                raise
+            if response.status_code in (401, 402, 403, 404, 429) and index < len(self._budgets) - 1:
                 last = response
                 continue
             return response
         return last
+
+    async def record_job_credits(self, endpoint: str, job_id: str, credits: Any) -> None:
+        """Record a completed job's credits once, keyed by job id.
+
+        Job starts report 0 because Firecrawl only reveals `creditsUsed` on the
+        status response. Status polling can repeat, so the state file keeps a
+        small completed-job map and the ledger entry is written only on the
+        first terminal observation.
+        """
+        if self._usage_path is None:
+            return
+        if not isinstance(credits, (int, float)) or isinstance(credits, bool):
+            return
+        if not math.isfinite(credits) or credits <= 0:
+            return
+        loop = asyncio.get_running_loop()
+        try:
+            fd = await self._acquire_lock(loop.time() + 2)
+        except FirecrawlUnavailable:
+            return
+        try:
+            try:
+                state = self._read_state()
+                jobs = state.get("jobs")
+                if not isinstance(jobs, dict):
+                    jobs = {}
+                    state["jobs"] = jobs
+                key = f"{endpoint}:{job_id}"
+                if key in jobs:
+                    return
+                jobs[key] = float(credits)
+                if len(jobs) > 2000:
+                    for old in list(jobs)[:-1000]:
+                        jobs.pop(old, None)
+                self._write_state(state)
+            except FirecrawlUnavailable:
+                return
+        finally:
+            self._release_lock(fd)
+        self._append_usage(
+            {
+                "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                "request_id": current_request_id(),
+                "endpoint": endpoint,
+                "label": None,
+                "status": 200,
+                "credits": float(credits),
+                "category": None,
+                "elapsed_ms": 0,
+                "kind": "job_credits",
+                "job_id": job_id,
+            }
+        )
 
     def usage_summary(self) -> dict[str, Any] | None:
         """Today's (UTC) ledger totals, read from the tail only."""
@@ -645,6 +778,11 @@ class FirecrawlControls:
                 continue
             amount = entry.get("credits")
             amount = float(amount) if isinstance(amount, (int, float)) and not isinstance(amount, bool) else 0.0
+            if entry.get("kind") == "job_credits":
+                credits += amount
+                bucket = by_endpoint.setdefault(endpoint, {"requests": 0, "credits": 0.0})
+                bucket["credits"] += amount
+                continue
             requests += 1
             credits += amount
             status = entry.get("status")
@@ -730,3 +868,7 @@ async def firecrawl_status(
 
 def firecrawl_usage_summary() -> dict[str, Any] | None:
     return CONTROLS.usage_summary()
+
+
+async def firecrawl_record_job_credits(endpoint: str, job_id: str, credits: Any) -> None:
+    await CONTROLS.record_job_credits(endpoint, job_id, credits)

@@ -1086,5 +1086,75 @@ def demo():
     print("all checks passed")
 
 
+def test_status_probes_past_auth_and_credit_errors_to_the_owning_key():
+    calls = []
+
+    def handler(request):
+        auth = request.headers["authorization"]
+        calls.append(auth)
+        if auth == "Bearer key-one":
+            return response(request, status=401, body={"success": False})
+        if auth == "Bearer key-two":
+            return response(request, status=402, body={"success": False})
+        return response(request, status=200, body={"success": True, "status": "completed"})
+
+    async def check():
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = controls(
+                tmp,
+                [
+                    ("first@example.test", "key-one"),
+                    ("second@example.test", "key-two"),
+                    ("third@example.test", "key-three"),
+                ],
+            )
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                result = await instance.status(client, "/v2/crawl/job-1", timeout=1)
+                assert result.status_code == 200
+            assert calls == ["Bearer key-one", "Bearer key-two", "Bearer key-three"], calls
+
+    run(check())
+
+
+def test_upstream_response_body_is_capped_before_json():
+    def handler(request):
+        return response(
+            request,
+            body={"success": True, "data": {"web": [{"url": "https://example.com/"}]}},
+        )
+
+    async def check():
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = controls(tmp, [("first@example.test", "key")])
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                with patch.object(fc, "MAX_UPSTREAM_BYTES", 16):
+                    try:
+                        await instance.request(client, "/v2/search", {"query": "q"}, timeout=1)
+                    except fc.FirecrawlUnavailable as exc:
+                        assert exc.category == "response_too_large", exc.category
+                    else:
+                        raise AssertionError("oversized response was accepted")
+
+    run(check())
+
+
+def test_completed_job_credits_are_recorded_once_and_not_counted_as_requests():
+    async def check():
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "usage.jsonl"
+            instance = controls(tmp, [("first@example.test", "key")], usage_path=ledger)
+            await instance.record_job_credits("/v2/crawl", "job-1", 7)
+            await instance.record_job_credits("/v2/crawl", "job-1", 7)
+            summary = instance.usage_summary()
+            assert summary["requests"] == 0, summary
+            assert summary["credits"] == 7.0, summary
+            assert summary["by_endpoint"]["/v2/crawl"] == {
+                "requests": 0,
+                "credits": 7.0,
+            }, summary
+
+    run(check())
+
+
 if __name__ == "__main__":
     demo()

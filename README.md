@@ -187,7 +187,13 @@ curl -X POST 'https://webcrawl.sparkfn.io/crawl' \
   names every unsupported feature and `warnings` explains it.
 - `max_content_chars`: 200..200000, truncates the returned `content` only.
 
-Site-level crawl endpoints use Firecrawl jobs. All seeds/URLs pass the same public-URL check.
+When Firecrawl omits a requested format from an otherwise successful scrape, strict mode returns
+`503 fallback_feature_unavailable` with `details.unsupported`; `allow_degraded=true` returns the
+available content plus `data.degraded` and a warning. The API's local deadline follows
+`scrape_options.timeout`/`waitFor` (up to 305s), not just the 45s default.
+
+Site-level crawl endpoints use Firecrawl jobs. Seeds and batch URLs pass the public-URL check and
+the Firecrawl routing guard (LinkedIn/X and PDFs without `parsers:["pdf"]` are rejected or dropped).
 
 ```bash
 curl -X POST 'https://webcrawl.sparkfn.io/map' \
@@ -207,16 +213,23 @@ curl -X POST 'https://webcrawl.sparkfn.io/batch-crawl' \
 ```
 
 - `POST /map`: Firecrawl `/v2/map` URL discovery (`search`, `sitemap`, `include_subdomains`,
-  `ignore_query_parameters`, `limit`, `timeout_ms`). Returns `data.urls`.
+  `ignore_query_parameters`, `ignore_cache`, `location`, `limit`, `timeout_ms`). Returns
+  `data.urls`; credentialed, non-http(s), and non-global IP links are dropped. The server caps
+  `limit` at 5000 (Firecrawl allows up to 100000).
 - `POST /crawl-site`: Firecrawl `/v2/crawl` (`limit`, paths, depth, sitemap, domain/subdomain/
-  external-link controls, `delay`, `max_concurrency`, `scrape_options`, `timeout_ms`).
+  external-link controls, `regex_on_full_url`, `delay`, `max_concurrency`, `scrape_options`,
+  `timeout_ms`). `timeout_ms` is the per-page scrape timeout and is sent as
+  `scrapeOptions.timeout`; it cannot be combined with `scrape_options.timeout`.
 - `POST /batch-crawl`: Firecrawl `/v2/batch/scrape`, up to 100 URLs. `ignore_invalid_urls`
-  defaults true; with false, any non-public URL returns 422 `invalid_url`.
+  defaults true; with false, any non-public or guarded URL returns 422 `invalid_url` with
+  `details.invalid`/`details.routed`. `max_concurrency` is optional.
 - `GET /crawl-site/{job_id}` and `GET /batch-crawl/{job_id}`: poll with `offset`/`limit`
-  (`limit` 1..100). Items carry `url`, `content`, `metadata`, `extras`, and per-item `error`.
-  Unknown/expired ids return 404 `job_not_found`. Per-item content is capped by
-  `JOB_MAX_ITEM_BYTES` (20000) and the whole page by `JOB_MAX_ITEMS_BYTES` (1000000);
-  `data.truncated` reports either cap.
+  (`limit` 1..100). Follows Firecrawl's `next` continuation pages up to `JOB_MAX_PAGES` (3)
+  so completed results beyond the first provider page are reachable. Items carry `url`,
+  `content`, `metadata`, `extras`, and per-item `error`. Unknown/expired ids return 404
+  `job_not_found`. The whole page, including content, extras, and metadata, is capped by
+  `JOB_MAX_ITEMS_BYTES` (1000000); `data.truncated` reports the page budget or a remaining
+  `next` page.
 
 ## Firecrawl controls
 
@@ -290,11 +303,11 @@ Each Firecrawl search/scrape attempt appends one JSON line to `FIRECRAWL_USAGE_L
 
 Search credits come from Firecrawl's `creditsUsed`; if the provider omits it the ledger records an
 estimate of 2. Scrapes and maps count 1; crawl/batch job starts record 0 because their credit cost
-is only known after the job runs. A write failure never fails the request. `/health` returns
-`data.usage` with today's UTC totals (`requests`, `credits`, `errors`, `by_endpoint`,
-`last_request_at`), read from the ledger tail; `null` when no ledger is configured. Set
-`LOG_FORMAT=json` to make stdout one JSON object per line. There is no hard credit or RPM cap: the
-existing reactive 429/402 guards still apply.
+is only known after the job runs, but a terminal job status records `creditsUsed` once per job.
+A write failure never fails the request. `/health` returns `data.usage` with today's UTC totals
+(`requests`, `credits`, `errors`, `by_endpoint`, `last_request_at`) only when called with a valid
+`X-API-Key`; the public response is `null`. Set `LOG_FORMAT=json` to make stdout one JSON object
+per line. There is no hard credit or RPM cap: the existing reactive 429/402 guards still apply.
 
 ## Crawl stealth defaults
 
