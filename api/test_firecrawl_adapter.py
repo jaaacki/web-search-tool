@@ -181,6 +181,29 @@ def test_inline_scrape_result_uses_search_markdown_and_extras():
     assert adapter.inline_scrape_result({"markdown": "   "}, "https://a.example/") is None
 
 
+def test_inline_scrape_result_accepts_firecrawl_normalized_source_urls():
+    assert adapter.inline_scrape_result(
+        {
+            "markdown": "# Page",
+            "metadata": {
+                "statusCode": 200,
+                "sourceURL": "https://a.example/path/?utm_source=x",
+            },
+        },
+        "https://a.example/path",
+    ) is not None
+    assert adapter.inline_scrape_result(
+        {
+            "markdown": "# Wrong",
+            "metadata": {
+                "statusCode": 200,
+                "sourceURL": "https://a.example/other",
+            },
+        },
+        "https://a.example/path",
+    ) is None
+
+
 def test_search_results_interleaves_sources_and_ignores_mistyped_fields():
     response = httpx.Response(
         200,

@@ -25,6 +25,26 @@ def same_url_identity(first: str, second: str) -> bool:
     return identity is not None and identity == _url_identity(second)
 
 
+def same_url_identity_relaxed(first: str, second: str) -> bool:
+    """Inline content may have Firecrawl-normalized query/trailing slashes.
+
+    Keep the scheme/host/port/path, ignore query and a trailing slash. The
+    caller still validates the final URL for public reachability.
+    """
+    first_identity = _url_identity(first)
+    second_identity = _url_identity(second)
+    if first_identity is None or second_identity is None:
+        return False
+    first_scheme, first_host, first_port, first_path, _ = first_identity
+    second_scheme, second_host, second_port, second_path, _ = second_identity
+    return (
+        first_scheme == second_scheme
+        and first_host == second_host
+        and first_port == second_port
+        and (first_path.rstrip("/") or "/") == (second_path.rstrip("/") or "/")
+    )
+
+
 SEARCH_SOURCES = ("web", "news", "images")
 INLINE_FIELDS = (
     "markdown",
@@ -194,7 +214,7 @@ def inline_scrape_result(item: dict[str, Any], requested_url: str) -> dict[str, 
         if isinstance(content_type, str) and "pdf" in content_type.lower():
             return None
         source_url = metadata.get("sourceURL")
-        if isinstance(source_url, str) and not same_url_identity(source_url, requested_url):
+        if isinstance(source_url, str) and not same_url_identity_relaxed(source_url, requested_url):
             return None
         reported = metadata.get("url")
         if isinstance(reported, str):

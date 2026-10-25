@@ -1773,6 +1773,125 @@ def test_fallback_query_and_params_translate_free_filters():
     assert params == {"time_range": "month", "safesearch": 2}, params
 
 
+def test_strict_firecrawl_invalid_request_is_unsupported_not_retryable():
+    saved_pool = app.BRAVE_POOL
+    saved_request = app.firecrawl_request
+    saved_searxng = app.search_searxng
+    app.BRAVE_POOL = app.BraveKeyPool(())
+
+    async def firecrawl(*_args, **_kwargs):
+        return httpx.Response(422, json={"success": False, "error": "invalid request"})
+
+    async def searxng(*_args, **_kwargs):
+        raise AssertionError("strict mode must not fall back")
+
+    app.firecrawl_request = firecrawl
+    app.search_searxng = searxng
+    try:
+        request = app.SearchRequest(query="q", categories=["developer"])
+        try:
+            run(app.discover_candidates(object(), "q", 1, request))
+        except app.AppError as exc:
+            assert exc.status_code == 422, vars(exc)
+            assert exc.code == "unsupported_feature", exc.code
+            assert exc.retryable is False, vars(exc)
+        else:
+            raise AssertionError("permanent Firecrawl 4xx did not raise unsupported_feature")
+    finally:
+        app.BRAVE_POOL = saved_pool
+        app.firecrawl_request = saved_request
+        app.search_searxng = saved_searxng
+        app.health_cache_reset()
+
+
+def test_search_strict_and_degraded_extraction_loss():
+    saved = (
+        app.get_client,
+        app.discover_candidates,
+        app.scrape_firecrawl_candidates,
+        app.crawl_all,
+        app.rerank,
+    )
+
+    async def fake_discover(*_args, **_kwargs):
+        return [
+            {
+                "url": "https://a.example/",
+                "title": "A",
+                "snippet": "s",
+                "_firecrawl_source": True,
+            }
+        ]
+
+    async def fake_scrape(_client, candidates, _deadline, _request, loss):
+        loss.add("format:links")
+        return [], candidates, set()
+
+    async def fake_crawl(_client, candidates, *, deadline=None):
+        return [
+            {
+                "url": candidate["url"],
+                "title": candidate["title"],
+                "snippet": "",
+                "content": "A sufficiently long page passage for the extraction test.",
+            }
+            for candidate in candidates
+        ]
+
+    async def fake_rerank(_client, _query, chunks, _top_k):
+        return (
+            [
+                app.SearchResult(
+                    title=chunks[0]["title"],
+                    url=chunks[0]["url"],
+                    content=chunks[0]["content"],
+                    score=None,
+                )
+            ],
+            "test",
+        )
+
+    app.get_client = lambda: asyncio.sleep(0, result=object())
+    app.discover_candidates = fake_discover
+    app.scrape_firecrawl_candidates = fake_scrape
+    app.crawl_all = fake_crawl
+    app.rerank = fake_rerank
+    try:
+        request = app.SearchRequest(
+            query="q", scrape_options={"formats": ["markdown", "links"]}
+        )
+        try:
+            run(app.search(request))
+        except app.AppError as exc:
+            assert exc.status_code == 503, vars(exc)
+            assert exc.code == "fallback_feature_unavailable", exc.code
+            assert exc.details["unsupported"] == ["format:links"], exc.details
+        else:
+            raise AssertionError("strict extraction loss did not raise")
+
+        envelope = run(
+            app.search(
+                app.SearchRequest(
+                    query="q",
+                    scrape_options={"formats": ["markdown", "links"]},
+                    allow_degraded=True,
+                )
+            )
+        )
+        assert envelope.data.warnings, envelope
+        assert envelope.data.degraded["providers"][0]["unsupported"] == [
+            "format:links"
+        ], envelope.data.degraded
+    finally:
+        (
+            app.get_client,
+            app.discover_candidates,
+            app.scrape_firecrawl_candidates,
+            app.crawl_all,
+            app.rerank,
+        ) = saved
+
+
 def demo():
     for name, check in sorted(globals().items()):
         if name.startswith("test_"):

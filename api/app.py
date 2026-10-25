@@ -68,6 +68,7 @@ WEBSEARCH_API_KEY = os.getenv("WEBSEARCH_API_KEY", "")
 ALLOW_FIRECRAWL_ACTIONS = os.getenv("ALLOW_FIRECRAWL_ACTIONS", "").lower() in {"1", "true", "yes"}
 ALLOW_FIRECRAWL_HEADERS = os.getenv("ALLOW_FIRECRAWL_HEADERS", "").lower() in {"1", "true", "yes"}
 ALLOW_FIRECRAWL_PROFILE = os.getenv("ALLOW_FIRECRAWL_PROFILE", "").lower() in {"1", "true", "yes"}
+LOG_QUERIES = os.getenv("LOG_QUERIES", "").lower() in {"1", "true", "yes"}
 FIRECRAWL_FORMAT_TYPES = frozenset(FORMAT_RESPONSE_KEYS)
 # Format objects that Firecrawl requires a companion field for.
 FIRECRAWL_FORMAT_REQUIREMENTS = {
@@ -75,6 +76,165 @@ FIRECRAWL_FORMAT_REQUIREMENTS = {
     "question": "question",
     "highlights": "query",
 }
+FIRECRAWL_SCRAPE_OPTION_KEYS = frozenset(
+    {
+        "formats",
+        "onlyMainContent",
+        "onlyCleanContent",
+        "includeTags",
+        "excludeTags",
+        "maxAge",
+        "minAge",
+        "headers",
+        "waitFor",
+        "mobile",
+        "skipTlsVerification",
+        "timeout",
+        "parsers",
+        "actions",
+        "location",
+        "removeBase64Images",
+        "blockAds",
+        "proxy",
+        "storeInCache",
+        "lockdown",
+        "checkPromptInjection",
+        "redactPII",
+        "profile",
+        "auditMetadata",
+    }
+)
+FIRECRAWL_ACTION_TYPES = frozenset(
+    {
+        "wait",
+        "screenshot",
+        "click",
+        "write",
+        "press",
+        "scroll",
+        "scrape",
+        "executeJavascript",
+        "pdf",
+    }
+)
+
+
+def validate_scrape_options(options: dict[str, Any]) -> None:
+    unknown = set(options) - FIRECRAWL_SCRAPE_OPTION_KEYS
+    if unknown:
+        raise ValueError(f"unsupported scrape_options keys: {sorted(unknown)}")
+    formats = options.get("formats")
+    if formats is not None:
+        if not isinstance(formats, list) or not formats:
+            raise ValueError("scrape_options.formats must be a non-empty array")
+        for item in formats:
+            fmt = item if isinstance(item, str) else item.get("type") if isinstance(item, dict) else None
+            if fmt not in FIRECRAWL_FORMAT_TYPES:
+                raise ValueError(f"unsupported scrape format: {fmt!r}")
+            if fmt in ("json", "changeTracking", "attributes", "question", "highlights") and not isinstance(
+                item, dict
+            ):
+                raise ValueError(f"{fmt} requires a format object")
+            required = FIRECRAWL_FORMAT_REQUIREMENTS.get(fmt)
+            if required:
+                value = item.get(required)
+                if required == "selectors":
+                    if not isinstance(value, list) or not value:
+                        raise ValueError(f"{fmt} requires a non-empty selectors array")
+                    for selector in value:
+                        if (
+                            not isinstance(selector, dict)
+                            or not isinstance(selector.get("selector"), str)
+                            or not selector["selector"].strip()
+                            or not isinstance(selector.get("attribute"), str)
+                            or not selector["attribute"].strip()
+                        ):
+                            raise ValueError(
+                                "attributes.selectors entries require selector and attribute strings"
+                            )
+                elif not isinstance(value, str) or not value.strip():
+                    raise ValueError(f"{fmt} requires a non-empty {required} string")
+            if fmt == "json":
+                schema = item.get("schema")
+                prompt = item.get("prompt")
+                if not isinstance(schema, dict) and not (
+                    isinstance(prompt, str) and prompt.strip()
+                ):
+                    raise ValueError("json requires a schema object or a prompt string")
+            if fmt == "changeTracking":
+                modes = item.get("modes")
+                if (
+                    not isinstance(modes, list)
+                    or not modes
+                    or any(mode not in ("git-diff", "json") for mode in modes)
+                ):
+                    raise ValueError("changeTracking requires modes from git-diff or json")
+            if fmt == "screenshot" and isinstance(item, dict):
+                quality = item.get("quality")
+                if quality is not None and (
+                    not isinstance(quality, int)
+                    or isinstance(quality, bool)
+                    or not 1 <= quality <= 100
+                ):
+                    raise ValueError("screenshot quality must be an integer from 1 to 100")
+                full_page = item.get("fullPage")
+                if full_page is not None and not isinstance(full_page, bool):
+                    raise ValueError("screenshot fullPage must be boolean")
+    actions = options.get("actions")
+    if actions is not None:
+        if not isinstance(actions, list) or not actions:
+            raise ValueError("actions must be a non-empty array")
+        if any(
+            not isinstance(action, dict) or action.get("type") not in FIRECRAWL_ACTION_TYPES
+            for action in actions
+        ):
+            raise ValueError("actions entries require a supported type")
+    headers = options.get("headers")
+    if headers is not None:
+        if not isinstance(headers, dict) or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in headers.items()
+        ):
+            raise ValueError("headers must be an object of string values")
+    profile = options.get("profile")
+    if profile is not None:
+        if (
+            not isinstance(profile, dict)
+            or not isinstance(profile.get("name"), str)
+            or not profile["name"].strip()
+        ):
+            raise ValueError("profile requires a non-empty name")
+    parsers = options.get("parsers")
+    if parsers is not None:
+        if not isinstance(parsers, list):
+            raise ValueError("parsers must be an array")
+        for parser in parsers:
+            parser_type = (
+                parser
+                if isinstance(parser, str)
+                else parser.get("type")
+                if isinstance(parser, dict)
+                else None
+            )
+            if parser_type not in ("pdf", "image"):
+                raise ValueError("parsers entries must be pdf or image")
+    proxy = options.get("proxy")
+    if proxy is not None and proxy not in ("basic", "enhanced", "auto"):
+        raise ValueError("proxy must be basic, enhanced, or auto")
+    wait_for = options.get("waitFor")
+    if wait_for is not None and (
+        not isinstance(wait_for, int)
+        or isinstance(wait_for, bool)
+        or not 0 <= wait_for <= 60_000
+    ):
+        raise ValueError("waitFor must be an integer from 0 to 60000")
+    timeout = options.get("timeout")
+    if timeout is not None and (
+        not isinstance(timeout, int)
+        or isinstance(timeout, bool)
+        or not 1_000 <= timeout <= 300_000
+    ):
+        raise ValueError("timeout must be an integer from 1000 to 300000")
 # Keep inline extras bounded in bytes; rawBase64 above this is omitted rather than corrupted.
 MAX_EXTRAS_BYTES = int(os.getenv("SEARCH_MAX_EXTRAS_BYTES", "200000"))
 # Keep the whole inline-extras payload below the MCP client's 2 MB response cap.
@@ -173,7 +333,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="SparkFN Web Search and Crawl API",
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
     description=(
         "Authenticated APIs for AI agents and MCP/CLI tools. "
@@ -298,7 +458,7 @@ class SearchRequest(BaseModel):
         le=100,
         description=(
             "Number of search candidates to fetch before crawling and reranking. Higher values may improve recall but increase latency "
-            "because more pages may be crawled."
+            "because more pages may be crawled; very high values can exhaust the discovery validation budget on slow DNS."
         ),
         examples=[10],
     )
@@ -453,22 +613,6 @@ class SearchRequest(BaseModel):
                 raise ValueError("scrape_options must be an object")
             if self.depth != "advanced":
                 raise ValueError("scrape_options requires depth=advanced")
-            formats = self.scrape_options.get("formats")
-            if formats is not None:
-                if not isinstance(formats, list) or not formats:
-                    raise ValueError("scrape_options.formats must be a non-empty array")
-                for item in formats:
-                    fmt = item if isinstance(item, str) else item.get("type") if isinstance(item, dict) else None
-                    if fmt not in FIRECRAWL_FORMAT_TYPES:
-                        raise ValueError(f"unsupported scrape format: {fmt!r}")
-                    required = FIRECRAWL_FORMAT_REQUIREMENTS.get(fmt)
-                    if required:
-                        value = item.get(required) if isinstance(item, dict) else None
-                        if required == "selectors":
-                            if not isinstance(value, list) or not value:
-                                raise ValueError(f"{fmt} requires a non-empty selectors array")
-                        elif not isinstance(value, str) or not value.strip():
-                            raise ValueError(f"{fmt} requires a non-empty {required} string")
             unavailable = {
                 "zeroDataRetention",
                 "threatProtection",
@@ -477,6 +621,7 @@ class SearchRequest(BaseModel):
             } & set(self.scrape_options)
             if unavailable:
                 raise ValueError(f"unavailable on the free plan: {sorted(unavailable)}")
+            validate_scrape_options(self.scrape_options)
             gated = {
                 "actions": ALLOW_FIRECRAWL_ACTIONS,
                 "headers": ALLOW_FIRECRAWL_HEADERS,
@@ -1012,7 +1157,8 @@ async def search(request: SearchRequest):
     client = await get_client()
     started = time.perf_counter()
     query_id = hashlib.sha256(request.query.encode("utf-8")).hexdigest()[:12]
-    logger.debug("search query=%r", request.query)
+    if LOG_QUERIES:
+        logger.debug("search query=%r", request.query)
     degraded: dict[str, Any] = {}
     candidates = await discover_candidates(
         client, request.query, request.candidates, request, degraded
@@ -1088,17 +1234,31 @@ async def search(request: SearchRequest):
             for result in ranked
         ]
     ranked, extras_truncated = cap_result_extras(ranked)
+    omitted_extras = sorted(
+        {
+            str(key)
+            for result in ranked
+            if isinstance(result.extras, dict)
+            for key in (result.extras.get("omitted") or [])
+        }
+    )
     logger.info(
         "search q_id=%s depth=%s candidates=%d pages=%d chunks=%d results=%d discovery=%.0fms crawl=%.0fms rerank=%.0fms elapsed=%.0fms rerank_path=%s",
         query_id, request.depth, len(candidates), len(pages), len(chunks), len(ranked),
         _ms(started, discovered), _ms(discovered, crawled), _ms(crawled), _ms(started), rerank_path,
     )
 
+    warnings = []
+    if extras_truncated or omitted_extras:
+        message = "inline extras were truncated to the response budget"
+        if omitted_extras:
+            message += f"; omitted: {', '.join(omitted_extras)}"
+        warnings.append(message)
     return search_response(
         request.query,
         ranked,
         degraded or None,
-        ["inline extras were truncated to the response budget"] if extras_truncated else None,
+        warnings or None,
     )
 
 
@@ -1523,11 +1683,16 @@ async def discover_candidates(
         if remaining > 0:
             try:
                 response = await firecrawl_request(client, "/v2/search", payload, timeout=remaining)
-                rows = firecrawl_search_results(response)
-                if rows is None:
+                if response.status_code in (400, 404, 422):
+                    failures["firecrawl"] = "invalid_request"
+                    _record_provider_health("firecrawl", "unavailable")
+                    rows = None
+                else:
+                    rows = firecrawl_search_results(response)
+                if rows is None and failures.get("firecrawl") != "invalid_request":
                     failures["firecrawl"] = "invalid_response"
                     _record_provider_health("firecrawl", "unavailable")
-                else:
+                elif rows is not None:
                     firecrawl_candidates, complete = await shape_candidates(
                         rows, limit, "description", deadline=firecrawl_deadline
                     )
@@ -1658,6 +1823,7 @@ async def discover_candidates(
             "not_configured",
             "invalid_configuration",
             "unsupported_enterprise_option",
+            "invalid_request",
         ):
             raise AppError(
                 422,
@@ -1733,10 +1899,12 @@ def cap_result_extras(
             capped_results.append(result)
             continue
         capped: dict[str, Any] = {}
+        omitted: list[str] = []
         for key, value in extras.items():
             if isinstance(value, str):
                 limit = min(per_field, budget)
                 if limit <= 0:
+                    omitted.append(key)
                     truncated = True
                     continue
                 if len(value.encode("utf-8")) > limit:
@@ -1747,10 +1915,13 @@ def cap_result_extras(
             else:
                 encoded = json.dumps(value, ensure_ascii=False, default=str).encode("utf-8")
                 if len(encoded) > budget:
+                    omitted.append(key)
                     truncated = True
                     continue
                 capped[key] = value
                 budget -= len(encoded)
+        if omitted:
+            capped["omitted"] = omitted
         capped_results.append(result.model_copy(update={"extras": capped or None}))
     return capped_results, truncated
 
@@ -2256,9 +2427,6 @@ async def crawl_all(
 SEARCH_CRAWLER_CONFIG = {
     "excluded_tags": ["nav", "footer", "header", "aside", "form"],
     "remove_overlay_elements": True,
-    # PDF candidates are routed here from Firecrawl; without this Crawl4AI
-    # returns no Markdown for them.
-    "pdf": True,
     "markdown_generator": {
         "type": "DefaultMarkdownGenerator",
         "params": {
@@ -2268,21 +2436,30 @@ SEARCH_CRAWLER_CONFIG = {
     },
 }
 
+# Crawl4AI's `pdf` run option generates a PDF of the page; PDF *input* needs the
+# typed scraping strategy. Verified against the pinned 0.9.5 image.
+PDF_CRAWLER_CONFIG = {
+    **SEARCH_CRAWLER_CONFIG,
+    "scraping_strategy": {"type": "PDFContentScrapingStrategy", "params": {}},
+}
 
-async def _bulk_crawl(
-    client: httpx.AsyncClient, candidates: list[dict], *, deadline: float | None = None
+
+async def _bulk_crawl_group(
+    client: httpx.AsyncClient,
+    candidates: list[dict],
+    crawler_config: dict,
+    *,
+    deadline: float,
 ):
-    """Return mapped pages and candidates needing recovery; None means provider failure."""
     loop = asyncio.get_running_loop()
-    if deadline is None:
-        deadline = loop.time() + CRAWL_TIMEOUT
     remaining = deadline - loop.time()
     if remaining <= 0:
         return None
     try:
         payload = await asyncio.wait_for(
             call_crawl4ai(
-                client, {"urls": [item["url"] for item in candidates], "crawler_config": SEARCH_CRAWLER_CONFIG}
+                client,
+                {"urls": [item["url"] for item in candidates], "crawler_config": crawler_config},
             ),
             timeout=remaining,
         )
@@ -2338,6 +2515,46 @@ async def _bulk_crawl(
     return pages, retry_candidates
 
 
+async def _bulk_crawl(
+    client: httpx.AsyncClient, candidates: list[dict], *, deadline: float | None = None
+):
+    """Return mapped pages and candidates needing recovery; None means provider failure."""
+    loop = asyncio.get_running_loop()
+    if deadline is None:
+        deadline = loop.time() + CRAWL_TIMEOUT
+    if deadline - loop.time() <= 0:
+        return None
+
+    pdf_urls = {
+        candidate["url"]
+        for candidate in candidates
+        if is_pdf_target(candidate["url"], candidate.get("_firecrawl_category", ""))
+    }
+    groups = []
+    other_candidates = [item for item in candidates if item["url"] not in pdf_urls]
+    pdf_candidates = [item for item in candidates if item["url"] in pdf_urls]
+    if other_candidates:
+        groups.append((other_candidates, SEARCH_CRAWLER_CONFIG))
+    if pdf_candidates:
+        groups.append((pdf_candidates, PDF_CRAWLER_CONFIG))
+
+    pages = []
+    retry_candidates = []
+    for group, crawler_config in groups:
+        result = await _bulk_crawl_group(
+            client, group, crawler_config, deadline=deadline
+        )
+        if result is None:
+            retry_candidates.extend(group)
+            continue
+        group_pages, group_retry = result
+        pages.extend(group_pages)
+        retry_candidates.extend(group_retry)
+    if not pages and retry_candidates:
+        return None
+    return pages, retry_candidates
+
+
 async def crawl_with_limit(semaphore: asyncio.Semaphore, client: httpx.AsyncClient, result: dict):
     async with semaphore:
         return await crawl_url(client, result)
@@ -2347,8 +2564,13 @@ async def crawl_url(client: httpx.AsyncClient, result: dict):
     if not await is_allowed_public_url(result["url"]):
         return None
 
+    crawler_config = (
+        PDF_CRAWLER_CONFIG
+        if is_pdf_target(result["url"], result.get("_firecrawl_category", ""))
+        else SEARCH_CRAWLER_CONFIG
+    )
     payload = await call_crawl4ai(
-        client, {"urls": [result["url"]], "crawler_config": SEARCH_CRAWLER_CONFIG}
+        client, {"urls": [result["url"]], "crawler_config": crawler_config}
     )
     crawled_url = extract_crawled_url(payload) or result["url"]
     if crawled_url != result["url"] and not await is_allowed_public_url(crawled_url):

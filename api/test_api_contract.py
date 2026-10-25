@@ -117,6 +117,14 @@ def check_free_surface_contract(client):
         {"query": "q", "scrape_options": {"formats": [{"type": "attributes"}]}},
         {"query": "q", "scrape_options": {"formats": [{"type": "question"}]}},
         {"query": "q", "scrape_options": {"formats": [{"type": "highlights"}]}},
+        {"query": "q", "scrape_options": {"formats": [{"type": "json"}]}},
+        {"query": "q", "scrape_options": {"formats": [{"type": "changeTracking"}]}},
+        {"query": "q", "scrape_options": {"formats": [{"type": "screenshot", "quality": 101}]}},
+        {"query": "q", "scrape_options": {"notAnOption": True}},
+        {"query": "q", "scrape_options": {"parsers": ["docx"]}},
+        {"query": "q", "scrape_options": {"proxy": "turbo"}},
+        {"query": "q", "scrape_options": {"waitFor": 70000}},
+        {"query": "q", "scrape_options": {"timeout": 500}},
         {"query": "q", "categories": ["gov"], "safe": True},
     ):
         response = client.post("/search", json=payload, headers=headers)
@@ -134,7 +142,11 @@ def check_free_surface_contract(client):
     )
     assert filters["scrapeOptions"]["storeInCache"] is True, filters
 
-    assert app.SEARCH_CRAWLER_CONFIG["pdf"] is True
+    assert "pdf" not in app.SEARCH_CRAWLER_CONFIG
+    assert (
+        app.PDF_CRAWLER_CONFIG["scraping_strategy"]["type"]
+        == "PDFContentScrapingStrategy"
+    )
     capped = app.cap_inline_extras(
         {
             "links": ["https://a.example/"],
@@ -172,6 +184,18 @@ def check_free_surface_contract(client):
     )
     assert metadata["description"].endswith("[truncated]"), metadata
     assert metadata["language"] == "en", metadata
+
+    dropped = [
+        app.SearchResult(
+            title="c",
+            url="https://c.example/",
+            content="c",
+            extras={"images": [f"https://img.example/{i}" for i in range(100)]},
+        )
+    ]
+    bounded, truncated = app.cap_result_extras(dropped, per_field=10, total=10)
+    assert truncated is True
+    assert bounded[0].extras["omitted"] == ["images"], bounded[0].extras
 
 
 def demo():
