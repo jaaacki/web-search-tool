@@ -28,6 +28,7 @@ CREDIT_USAGE_PATH = "/v2/team/credit-usage"
 STATE_PATH = Path("/tmp/websearch-firecrawl-controls.json")
 LOCK_PATH = Path("/tmp/websearch-firecrawl-controls.lock")
 USAGE_RECHECK_SECONDS = 900.0
+USAGE_TAIL_BYTES = 512 * 1024
 MAX_RETRY_AFTER = 86_400.0
 COST_SENSITIVE_DOMAINS = (
     "linkedin.com",
@@ -113,8 +114,8 @@ def _parse_budgets(raw: str) -> tuple[_Budget, ...]:
     return _key_slots(entries)
 
 
-def firecrawl_url_allowed(url: str) -> bool:
-    """Whether a target avoids Firecrawl-routed domains and document parsing costs."""
+def firecrawl_url_allowed(url: str, *, allow_pdf: bool = False) -> bool:
+    """Whether a target avoids Firecrawl-routed domains and unexpected document costs."""
     if not isinstance(url, str):
         return False
     try:
@@ -125,7 +126,9 @@ def firecrawl_url_allowed(url: str) -> bool:
     if parsed.scheme not in {"http", "https"} or parsed.username or parsed.password:
         return False
     path = parsed.path.lower()
-    return bool(host) and not path.endswith(".pdf") and not any(
+    if not allow_pdf and path.endswith(".pdf"):
+        return False
+    return bool(host) and not any(
         host == domain or host.endswith(f".{domain}") for domain in COST_SENSITIVE_DOMAINS
     )
 
@@ -160,26 +163,36 @@ def _search_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _parsers_include_pdf(parsers: Any) -> bool:
+    if not isinstance(parsers, list):
+        return False
+    for parser in parsers:
+        if parser == "pdf" or (isinstance(parser, dict) and parser.get("type") == "pdf"):
+            return True
+    return False
+
+
 def _scrape_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    formats = payload.get("formats", ["markdown"])
-    parsers = payload.get("parsers", [])
-    if formats != ["markdown"] or parsers != []:
-        raise FirecrawlUnavailable(None, "unsupported_cost_options", None, False)
-    if any(payload.get(option) for option in ("zeroDataRetention", "lockdown", "redactPII", "checkPromptInjection")):
-        raise FirecrawlUnavailable(None, "unsupported_cost_options", None, False)
-    if payload.get("storeInCache") not in (None, False):
-        raise FirecrawlUnavailable(None, "unsupported_privacy_option", None, False)
+    if not isinstance(payload.get("url"), str) or not payload["url"]:
+        raise FirecrawlUnavailable(None, "invalid_request", None, False)
+    # Enterprise/team-gated controls remain unavailable on the free plan.
+    if any(payload.get(option) for option in ("zeroDataRetention", "threatProtection")):
+        raise FirecrawlUnavailable(None, "unsupported_enterprise_option", None, False)
     result = dict(payload)
-    result["formats"] = ["markdown"]
-    result["parsers"] = []
-    result["storeInCache"] = False
+    result.setdefault("formats", ["markdown"])
+    result.setdefault("parsers", [])
+    result.setdefault("storeInCache", False)
     return result
 
 
 def _response_credits(endpoint: str, response: httpx.Response) -> float:
-    """Credits for the ledger. Search reports a count; scrape bills one page."""
+    """Credits for the ledger. Only search/scrape report a usable count."""
     if endpoint == "/v2/scrape":
         return 1.0
+    if endpoint == "/v2/map":
+        return 1.0
+    if endpoint in ("/v2/crawl", "/v2/batch/scrape"):
+        return 0.0
     try:
         payload = response.json()
     except ValueError:
@@ -253,14 +266,20 @@ class FirecrawlControls:
     async def request(
         self,
         client: httpx.AsyncClient,
-        endpoint: Literal["/v2/search", "/v2/scrape"],
+        endpoint: str,
         payload: dict[str, Any],
         *,
         timeout: float,
     ) -> httpx.Response:
         if not math.isfinite(timeout) or timeout <= 0:
             raise FirecrawlUnavailable(None, "invalid_timeout", None, False)
-        if endpoint not in ("/v2/search", "/v2/scrape") or not isinstance(payload, dict):
+        if endpoint not in (
+            "/v2/search",
+            "/v2/scrape",
+            "/v2/map",
+            "/v2/crawl",
+            "/v2/batch/scrape",
+        ) or not isinstance(payload, dict):
             raise FirecrawlUnavailable(None, "invalid_request", None, False)
         if self._config_error:
             raise FirecrawlUnavailable(None, "invalid_configuration", None, False)
@@ -269,10 +288,15 @@ class FirecrawlControls:
 
         if endpoint == "/v2/search":
             request_payload = _search_payload(payload)
-        else:
-            if not firecrawl_url_allowed(payload.get("url")):
-                raise FirecrawlUnavailable(None, "provider_routed_domain", None, False)
+        elif endpoint == "/v2/scrape":
             request_payload = _scrape_payload(payload)
+            if not firecrawl_url_allowed(
+                request_payload.get("url"),
+                allow_pdf=_parsers_include_pdf(request_payload.get("parsers")),
+            ):
+                raise FirecrawlUnavailable(None, "provider_routed_domain", None, False)
+        else:
+            request_payload = dict(payload)
 
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
@@ -547,6 +571,91 @@ class FirecrawlControls:
         # Discard removed credentials and pre-pool operator labels, never reuse their guards.
         return {"budgets": {budget.id: groups[budget.id] for budget in self._budgets if budget.id in groups}}
 
+    async def status(
+        self,
+        client: httpx.AsyncClient,
+        path: str,
+        *,
+        timeout: float,
+    ) -> httpx.Response:
+        """Poll a Firecrawl job. Status reads are not billable; no key rotation."""
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise FirecrawlUnavailable(None, "invalid_timeout", None, False)
+        if not path.startswith("/v2/") or ".." in path:
+            raise FirecrawlUnavailable(None, "invalid_request", None, False)
+        if self._config_error:
+            raise FirecrawlUnavailable(None, "invalid_configuration", None, False)
+        if not self._budgets:
+            raise FirecrawlUnavailable(None, "not_configured", None, False)
+        key = self._budgets[0].keys[0]
+        try:
+            response = await asyncio.wait_for(
+                client.get(
+                    f"{API_ROOT}{path}",
+                    headers={"Authorization": "Bearer " + key, "Accept": "application/json"},
+                    timeout=timeout,
+                ),
+                timeout=timeout,
+            )
+        except (asyncio.TimeoutError, httpx.TimeoutException) as exc:
+            raise FirecrawlUnavailable(None, "transport_timeout", 1.0, True) from exc
+        except httpx.HTTPError as exc:
+            raise FirecrawlUnavailable(None, "transport_error", 1.0, True) from exc
+        return response
+
+    def usage_summary(self) -> dict[str, Any] | None:
+        """Today's (UTC) ledger totals, read from the tail only."""
+        if self._usage_path is None:
+            return None
+        try:
+            with self._usage_path.open("rb") as ledger:
+                ledger.seek(0, os.SEEK_END)
+                size = ledger.tell()
+                ledger.seek(max(0, size - USAGE_TAIL_BYTES))
+                raw = ledger.read()
+        except OSError:
+            return None
+        lines = raw.splitlines()
+        if size > len(raw):
+            lines = lines[1:]  # the first line may be a partial record.
+        today = datetime.now(timezone.utc).date().isoformat()
+        requests = 0
+        credits = 0.0
+        errors = 0
+        by_endpoint: dict[str, dict[str, float]] = {}
+        last_request_at = None
+        for line in lines:
+            try:
+                entry = json.loads(line)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(entry, dict) or not str(entry.get("ts", "")).startswith(today):
+                continue
+            endpoint = entry.get("endpoint")
+            if not isinstance(endpoint, str):
+                continue
+            amount = entry.get("credits")
+            amount = float(amount) if isinstance(amount, (int, float)) and not isinstance(amount, bool) else 0.0
+            requests += 1
+            credits += amount
+            status = entry.get("status")
+            if not isinstance(status, int) or not 200 <= status < 300:
+                errors += 1
+            bucket = by_endpoint.setdefault(endpoint, {"requests": 0, "credits": 0.0})
+            bucket["requests"] += 1
+            bucket["credits"] += amount
+            ts = entry.get("ts")
+            if isinstance(ts, str):
+                last_request_at = ts
+        return {
+            "date": today,
+            "requests": requests,
+            "credits": round(credits, 1),
+            "errors": errors,
+            "by_endpoint": by_endpoint,
+            "last_request_at": last_request_at,
+        }
+
     def _append_usage(self, entry: dict[str, Any]) -> None:
         """Best-effort append-only ledger; a write failure never fails the request."""
         if self._usage_path is None:
@@ -593,9 +702,22 @@ CONTROLS = _load_controls()
 
 async def firecrawl_request(
     client: httpx.AsyncClient,
-    endpoint: Literal["/v2/search", "/v2/scrape"],
+    endpoint: str,
     payload: dict[str, Any],
     *,
     timeout: float,
 ) -> httpx.Response:
     return await CONTROLS.request(client, endpoint, payload, timeout=timeout)
+
+
+async def firecrawl_status(
+    client: httpx.AsyncClient,
+    path: str,
+    *,
+    timeout: float,
+) -> httpx.Response:
+    return await CONTROLS.status(client, path, timeout=timeout)
+
+
+def firecrawl_usage_summary() -> dict[str, Any] | None:
+    return CONTROLS.usage_summary()

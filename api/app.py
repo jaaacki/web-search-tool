@@ -19,7 +19,7 @@ from typing import Any, Literal
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Security
+from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request, Security
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.openapi.docs import get_swagger_ui_html
@@ -33,6 +33,8 @@ from firecrawl_adapter import (
     is_pdf_target,
     missing_inline_formats,
     normalize_formats,
+    scrape_full_payload as firecrawl_scrape_full_payload,
+    scrape_full_result as firecrawl_scrape_full_result,
     scrape_payload as firecrawl_scrape_payload,
     scrape_target_url as firecrawl_scrape_target_url,
     scrape_result as firecrawl_scrape_result,
@@ -41,7 +43,13 @@ from firecrawl_adapter import (
     same_url_identity,
     supports_markdown_crawl,
 )
-from firecrawl_controls import FirecrawlUnavailable, firecrawl_request, firecrawl_url_allowed
+from firecrawl_controls import (
+    FirecrawlUnavailable,
+    firecrawl_request,
+    firecrawl_status,
+    firecrawl_url_allowed,
+    firecrawl_usage_summary,
+)
 from observability import ContextFormatter, JsonFormatter, RequestIdFilter, request_id_var
 
 SEARXNG_URL = os.getenv("SEARXNG_URL", "http://searxng:8080").rstrip("/")
@@ -240,6 +248,8 @@ MAX_EXTRAS_BYTES = int(os.getenv("SEARCH_MAX_EXTRAS_BYTES", "200000"))
 # Keep the whole inline-extras payload below the MCP client's 2 MB response cap.
 MAX_TOTAL_EXTRAS_BYTES = int(os.getenv("SEARCH_MAX_TOTAL_EXTRAS_BYTES", "1000000"))
 MAX_METADATA_BYTES = int(os.getenv("SEARCH_MAX_METADATA_BYTES", "20000"))
+MAX_JOB_ITEM_BYTES = int(os.getenv("JOB_MAX_ITEM_BYTES", "20000"))
+MAX_JOB_ITEMS_BYTES = int(os.getenv("JOB_MAX_ITEMS_BYTES", "1000000"))
 # Optional Brave Search API keys (comma-separated) for primary discovery.
 # Empty = SearXNG-only discovery, exactly today's behavior.
 BRAVE_API_KEYS = tuple(key.strip() for key in os.getenv("BRAVE_API_KEYS", "").split(",") if key.strip())
@@ -428,6 +438,13 @@ class HealthData(BaseModel):
             "issues paid searches or refreshes provider timestamps; recorded total discovery failure stays unavailable."
         ),
         examples=[{"firecrawl": "unknown", "brave": "unknown", "searxng": "unknown", "searxng_service": "ok", "crawl4ai": "ok", "reranker": "ok"}],
+    )
+    usage: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Today's UTC Firecrawl usage from the local append-only ledger: requests, credits, errors, per-endpoint "
+            "totals and the last request timestamp. Null when no usage log is configured."
+        ),
     )
 
 
@@ -778,16 +795,207 @@ class CrawlRequest(BaseModel):
         ),
         examples=[{"screenshot": False, "word_count_threshold": 10}],
     )
+    scrape_options: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Opt into the free Firecrawl v2 scrape surface: `formats` plus scrape settings (onlyMainContent, tags, cache ages, waitFor, "
+            "mobile, headers, parsers, actions, location, proxy, storeInCache, lockdown, prompt-injection check, PII redaction, profile, "
+            "auditMetadata). The full format list is documented on the search `scrape_options` field. Cannot be combined with Crawl4AI "
+            "options. Enterprise/team-gated controls remain rejected."
+        ),
+        examples=[{"formats": ["markdown", "links"], "onlyMainContent": True}],
+    )
+    allow_degraded: bool = Field(
+        default=False,
+        description=(
+            "Strict by default. When Firecrawl cannot return a requested format/option, fail with "
+            "`fallback_feature_unavailable` (or `unsupported_feature` when Firecrawl is not configured). Set true to accept "
+            "Crawl4AI's Markdown/HTML content, with `data.degraded` naming every unsupported feature."
+        ),
+        examples=[True],
+    )
+    max_content_chars: int | None = Field(
+        default=None,
+        ge=200,
+        le=200_000,
+        description="Truncate the returned `content`. Extras/metadata have their own server caps.",
+        examples=[4000],
+    )
+
+    @model_validator(mode="after")
+    def _validate_firecrawl_scrape_options(self) -> "CrawlRequest":
+        if self.scrape_options is not None:
+            if not isinstance(self.scrape_options, dict):
+                raise ValueError("scrape_options must be an object")
+            unavailable = {
+                "zeroDataRetention",
+                "threatProtection",
+                "alexandria",
+                "domainTools",
+            } & set(self.scrape_options)
+            if unavailable:
+                raise ValueError(f"unavailable on the free plan: {sorted(unavailable)}")
+            validate_scrape_options(self.scrape_options)
+            crawl4ai_options = (
+                self.cache_mode is not None
+                or bool(self.browser_config)
+                or bool(self.crawler_config)
+                or bool(self.extraction_config)
+                or bool(self.crawl_options)
+            )
+            if crawl4ai_options:
+                raise ValueError("scrape_options cannot be combined with Crawl4AI options")
+            gated = {
+                "actions": ALLOW_FIRECRAWL_ACTIONS,
+                "headers": ALLOW_FIRECRAWL_HEADERS,
+                "profile": ALLOW_FIRECRAWL_PROFILE,
+            }
+            disabled = [
+                key
+                for key, allowed in gated.items()
+                if key in self.scrape_options and not allowed
+            ]
+            if disabled:
+                raise ValueError(
+                    f"disabled by operator: {', '.join(disabled)} "
+                    "(set ALLOW_FIRECRAWL_ACTIONS/HEADERS/PROFILE to enable)"
+                )
+        return self
 
 
 class CrawlData(BaseModel):
-    url: str = Field(description="Final public URL reported by Crawl4AI, or the requested URL when Crawl4AI does not provide one.", examples=["https://example.com"])
+    url: str = Field(description="Final public URL, or the requested URL when the provider does not report one.", examples=["https://example.com"])
     content: str = Field(description="Extracted page content in the best available requested format. Empty extraction returns an error instead of an empty success.", examples=["# Example Domain\n\nThis domain is for use in illustrative examples in documents..."])
+    provider: Literal["firecrawl", "crawl4ai"] | None = Field(
+        default=None,
+        description="Extraction provider that produced this response.",
+        examples=["firecrawl"],
+    )
+    metadata: dict[str, Any] | None = Field(
+        default=None,
+        description="Provider page metadata (title, description, language, status, final URL).",
+    )
+    extras: dict[str, Any] | None = Field(
+        default=None,
+        description="Additional Firecrawl fields requested through `scrape_options` (html, rawHtml, links, images, screenshot, summary, json, answer, highlights, attributes, and similar).",
+    )
+    degraded: dict[str, Any] | None = Field(
+        default=None,
+        description="Present when `allow_degraded` accepted a Crawl4AI fallback that could not honor every requested format/option.",
+    )
+    warnings: list[str] = Field(
+        default_factory=list,
+        description="Human-readable notices mirroring `degraded` and any truncated extras.",
+    )
 
 
 class CrawlEnvelope(BaseModel):
     ok: Literal[True] = Field(default=True, description="Always true for successful crawl responses.")
     data: CrawlData
+
+
+def validate_embedded_scrape_options(options: dict[str, Any]) -> None:
+    unavailable = {
+        "zeroDataRetention",
+        "threatProtection",
+        "alexandria",
+        "domainTools",
+    } & set(options)
+    if unavailable:
+        raise ValueError(f"unavailable on the free plan: {sorted(unavailable)}")
+    validate_scrape_options(options)
+    gated = {
+        "actions": ALLOW_FIRECRAWL_ACTIONS,
+        "headers": ALLOW_FIRECRAWL_HEADERS,
+        "profile": ALLOW_FIRECRAWL_PROFILE,
+    }
+    disabled = [key for key, allowed in gated.items() if key in options and not allowed]
+    if disabled:
+        raise ValueError(
+            f"disabled by operator: {', '.join(disabled)} "
+            "(set ALLOW_FIRECRAWL_ACTIONS/HEADERS/PROFILE to enable)"
+        )
+
+
+class MapRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    url: str = Field(min_length=1, description="Public site root to map.", examples=["https://example.com"])
+    search: str | None = Field(default=None, max_length=500, description="Optional search term used to rank/find URLs.")
+    sitemap: Literal["include", "skip", "only"] | None = Field(default=None, description="Firecrawl sitemap mode.")
+    include_subdomains: bool = Field(default=True, description="Include subdomains in the map.")
+    ignore_query_parameters: bool = Field(default=True, description="Collapse URLs that differ only by query parameters.")
+    limit: int = Field(default=100, ge=1, le=5000, description="Maximum mapped URLs.")
+    timeout_ms: int | None = Field(default=None, ge=1000, le=300_000, description="Firecrawl map timeout in milliseconds.")
+
+
+class MapData(BaseModel):
+    url: str = Field(description="Site root that was mapped.")
+    urls: list[dict[str, Any]] = Field(default_factory=list, description="Mapped URLs with optional title/description.")
+    provider: Literal["firecrawl"] = Field(default="firecrawl", description="Provider that produced the map.")
+
+
+class MapEnvelope(BaseModel):
+    ok: Literal[True] = Field(default=True)
+    data: MapData
+
+
+class CrawlSiteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    url: str = Field(min_length=1, description="Public site root to crawl.", examples=["https://example.com"])
+    limit: int = Field(default=100, ge=1, le=1000, description="Maximum pages to crawl.")
+    max_discovery_depth: int | None = Field(default=None, ge=1, le=10, description="Maximum link-discovery depth.")
+    include_paths: list[str] = Field(default_factory=list, max_length=100, description="Path globs to include.")
+    exclude_paths: list[str] = Field(default_factory=list, max_length=100, description="Path globs to exclude.")
+    sitemap: Literal["include", "skip", "only"] | None = Field(default=None, description="Firecrawl sitemap mode.")
+    ignore_query_parameters: bool = Field(default=True, description="Collapse URLs that differ only by query parameters.")
+    crawl_entire_domain: bool = Field(default=False, description="Crawl the whole domain, not just the seed path.")
+    allow_external_links: bool = Field(default=False, description="Allow external links.")
+    allow_subdomains: bool = Field(default=False, description="Allow subdomains.")
+    delay: float | None = Field(default=None, ge=0, le=60, description="Delay in seconds between requests.")
+    max_concurrency: int | None = Field(default=None, ge=1, le=10, description="Maximum concurrent crawl requests.")
+    scrape_options: dict[str, Any] | None = Field(default=None, description="Firecrawl scrapeOptions for each page.")
+    timeout_ms: int | None = Field(default=None, ge=1000, le=300_000, description="Firecrawl crawl timeout in milliseconds.")
+
+    @model_validator(mode="after")
+    def _validate_options(self) -> "CrawlSiteRequest":
+        if self.scrape_options is not None:
+            validate_embedded_scrape_options(self.scrape_options)
+        return self
+
+
+class BatchCrawlRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    urls: list[str] = Field(min_length=1, max_length=100, description="Public URLs to scrape in one batch.")
+    scrape_options: dict[str, Any] | None = Field(default=None, description="Firecrawl scrapeOptions for each URL.")
+    ignore_invalid_urls: bool = Field(default=True, description="Drop invalid/non-public URLs instead of failing the batch.")
+    timeout_ms: int | None = Field(default=None, ge=1000, le=300_000, description="Firecrawl batch timeout in milliseconds.")
+
+    @model_validator(mode="after")
+    def _validate_options(self) -> "BatchCrawlRequest":
+        if self.scrape_options is not None:
+            validate_embedded_scrape_options(self.scrape_options)
+        return self
+
+
+class JobData(BaseModel):
+    id: str = Field(description="Firecrawl job id.")
+    url: str | None = Field(default=None, description="Seed URL for a site crawl.")
+    status: str = Field(description="Firecrawl job status.")
+    completed: int = Field(default=0, description="Pages completed.")
+    total: int = Field(default=0, description="Pages discovered.")
+    items: list[dict[str, Any]] = Field(default_factory=list, description="Normalized page/item results.")
+    offset: int = Field(default=0, description="Item offset for this response.")
+    limit: int = Field(default=0, description="Item limit for this response.")
+    truncated: bool = Field(default=False, description="More items are available or the response budget was reached.")
+    provider: Literal["firecrawl"] = Field(default="firecrawl")
+
+
+class JobEnvelope(BaseModel):
+    ok: Literal[True] = Field(default=True)
+    data: JobData
 
 
 SEARCH_SUCCESS_EXAMPLE = {
@@ -1079,6 +1287,7 @@ async def _run_health_checks() -> dict[str, str]:
     tags=["Diagnostics"],
 )
 async def health():
+    usage = await asyncio.to_thread(firecrawl_usage_summary)
     now = time.monotonic()
     cached_at = _HEALTH_CACHE["at"]
     if isinstance(cached_at, float) and now - cached_at < HEALTH_CACHE_TTL:
@@ -1086,7 +1295,9 @@ async def health():
         if isinstance(cached, AppError):
             raise cached
         if isinstance(cached, dict):
-            return HealthEnvelope(data=HealthData(services=_health_services(), checks=cached))
+            return HealthEnvelope(
+                data=HealthData(services=_health_services(), checks=cached, usage=usage)
+            )
     try:
         checks = await _run_health_checks()
     except AppError as exc:
@@ -1095,7 +1306,9 @@ async def health():
         raise
     _HEALTH_CACHE["at"] = time.monotonic()
     _HEALTH_CACHE["result"] = checks
-    return HealthEnvelope(data=HealthData(services=_health_services(), checks=checks))
+    return HealthEnvelope(
+        data=HealthData(services=_health_services(), checks=checks, usage=usage)
+    )
 
 
 def _health_services() -> dict[str, str]:
@@ -1311,14 +1524,16 @@ async def search_get(
 @app.post(
     "/crawl",
     response_model=CrawlEnvelope,
+    response_model_exclude_none=True,
     responses=CRAWL_ERROR_RESPONSES,
     dependencies=[Depends(require_api_key)],
     summary="Crawl one public URL and return extracted content",
     description=(
-        "Use this endpoint when the caller already has a URL and needs Markdown. A plain, compatible Markdown request uses Firecrawl "
-        "when the target is allowed; explicit Crawl4AI formats/cache/options and Firecrawl-unavailable cases use internal Crawl4AI. "
-        "It validates public http(s) URLs and returns only normalized `url` and `content`. Do not use this endpoint for discovery; call "
-        "the search API first when you do not already know the URL."
+        "Use this endpoint when the caller already has a URL. A plain Markdown request uses Firecrawl when the target is allowed; "
+        "`scrape_options` opts into the free Firecrawl v2 scrape surface (all free formats and options) with Crawl4AI as a "
+        "strict/degraded fallback; explicit Crawl4AI cache/run options use internal Crawl4AI. It validates public http(s) URLs and "
+        "returns normalized `url` and `content`, plus `metadata`/`extras`/`provider` when available. Do not use this endpoint for "
+        "discovery; call the search API first when you do not already know the URL."
     ),
     operation_id="crawl_url",
     tags=["Crawl"],
@@ -1354,7 +1569,17 @@ async def crawl(request: CrawlRequest):
     client = await get_client()
     result = await crawl_direct_url(client, request)
 
-    return CrawlEnvelope(data=CrawlData(url=result["url"], content=result["content"]))
+    return CrawlEnvelope(
+        data=CrawlData(
+            url=result["url"],
+            content=result["content"],
+            provider=result.get("provider"),
+            metadata=result.get("metadata"),
+            extras=result.get("extras"),
+            degraded=result.get("degraded"),
+            warnings=result.get("warnings") or [],
+        )
+    )
 
 
 class _BraveKeyError(Exception):
@@ -1658,6 +1883,31 @@ def fallback_query_and_params(
     return query, params
 
 
+def crawl4ai_feature_loss(scrape_options: dict[str, Any] | None, content_format: str) -> list[str]:
+    """Formats/options Firecrawl supplied that Crawl4AI cannot reproduce."""
+    if not scrape_options:
+        return []
+    supported = {"markdown"}
+    if content_format in ("html", "cleaned_html"):
+        supported.add("html")
+    loss = [
+        f"format:{fmt}"
+        for fmt in normalize_formats(scrape_options.get("formats"))
+        if fmt not in supported
+    ]
+    defaults = {
+        "storeInCache": False,
+        "onlyMainContent": True,
+        "maxAge": 0,
+        "skipTlsVerification": False,
+    }
+    for key in set(scrape_options) - {"formats", "parsers"}:
+        if scrape_options.get(key) != defaults.get(key):
+            loss.append("options")
+            break
+    return loss
+
+
 async def discover_candidates(
     client: httpx.AsyncClient,
     query: str,
@@ -1884,6 +2134,47 @@ def cap_metadata(metadata: Any) -> Any:
     }
 
 
+def cap_one_extras(
+    extras: Any, per_field: int, budget: int
+) -> tuple[dict[str, Any] | None, int, list[str], bool]:
+    if not isinstance(extras, dict) or not extras:
+        return extras, 0, [], False
+    capped: dict[str, Any] = {}
+    omitted: list[str] = []
+    used = 0
+    truncated = False
+    for key, value in extras.items():
+        if isinstance(value, str):
+            limit = min(per_field, budget - used)
+            if limit <= 0:
+                omitted.append(key)
+                truncated = True
+                continue
+            if len(value.encode("utf-8")) > limit:
+                value = truncate_bytes(value, limit)
+                truncated = True
+            capped[key] = value
+            used += len(value.encode("utf-8"))
+        else:
+            encoded = json.dumps(value, ensure_ascii=False, default=str).encode("utf-8")
+            if len(encoded) > budget - used:
+                omitted.append(key)
+                truncated = True
+                continue
+            capped[key] = value
+            used += len(encoded)
+    if omitted:
+        capped["omitted"] = omitted
+    return (capped or None), used, omitted, truncated
+
+
+def cap_extras_payload(extras: Any) -> tuple[dict[str, Any] | None, bool, list[str]]:
+    capped, _used, omitted, truncated = cap_one_extras(
+        extras, MAX_EXTRAS_BYTES, MAX_TOTAL_EXTRAS_BYTES
+    )
+    return capped, truncated, omitted
+
+
 def cap_result_extras(
     results: list[SearchResult],
     per_field: int = MAX_EXTRAS_BYTES,
@@ -1894,35 +2185,12 @@ def cap_result_extras(
     truncated = False
     capped_results = []
     for result in results:
-        extras = result.extras
-        if not isinstance(extras, dict) or not extras:
-            capped_results.append(result)
-            continue
-        capped: dict[str, Any] = {}
-        omitted: list[str] = []
-        for key, value in extras.items():
-            if isinstance(value, str):
-                limit = min(per_field, budget)
-                if limit <= 0:
-                    omitted.append(key)
-                    truncated = True
-                    continue
-                if len(value.encode("utf-8")) > limit:
-                    value = truncate_bytes(value, limit)
-                    truncated = True
-                capped[key] = value
-                budget -= len(value.encode("utf-8"))
-            else:
-                encoded = json.dumps(value, ensure_ascii=False, default=str).encode("utf-8")
-                if len(encoded) > budget:
-                    omitted.append(key)
-                    truncated = True
-                    continue
-                capped[key] = value
-                budget -= len(encoded)
-        if omitted:
-            capped["omitted"] = omitted
-        capped_results.append(result.model_copy(update={"extras": capped or None}))
+        capped, used, _omitted, result_truncated = cap_one_extras(
+            result.extras, per_field, budget
+        )
+        budget -= used
+        truncated = truncated or result_truncated
+        capped_results.append(result.model_copy(update={"extras": capped}))
     return capped_results, truncated
 
 
@@ -2587,9 +2855,156 @@ async def crawl_url(client: httpx.AsyncClient, result: dict):
     }
 
 
+async def crawl4ai_fallback(
+    client: httpx.AsyncClient,
+    request: CrawlRequest,
+    loss: list[str],
+):
+    if loss and not request.allow_degraded:
+        raise AppError(
+            503,
+            "fallback_feature_unavailable",
+            "The requested scrape features are not available from Crawl4AI",
+            {"provider": "crawl4ai", "unsupported": loss},
+            retryable=True,
+            retry_after=OUTAGE_RETRY_AFTER,
+        )
+    payload = build_crawl_payload(request)
+    if is_pdf_target(request.url):
+        crawler_config = dict(payload.get("crawler_config") or {})
+        crawler_config["scraping_strategy"] = {
+            "type": "PDFContentScrapingStrategy",
+            "params": {},
+        }
+        payload["crawler_config"] = crawler_config
+    result = await call_crawl4ai(client, payload)
+    crawled_url = extract_crawled_url(result) or request.url
+    if not await is_allowed_public_url(crawled_url):
+        raise AppError(422, "invalid_crawled_url", "Crawled URL must be a public http(s) URL")
+    content = extract_crawl_content(result, request.content_format)
+    if not content:
+        raise AppError(502, "empty_crawl_result", "Crawl4AI did not return extractable content")
+    return {
+        "url": crawled_url,
+        "content": truncate_content(content, request.max_content_chars),
+        "provider": "crawl4ai",
+        "degraded": {"provider": "crawl4ai", "unsupported": loss} if loss else None,
+        "warnings": [
+            f"crawl4ai could not honor: {', '.join(loss)}"
+        ] if loss else [],
+    }
+
+
+async def crawl_with_scrape_options(client: httpx.AsyncClient, request: CrawlRequest):
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + CRAWL_TIMEOUT
+    loss = crawl4ai_feature_loss(request.scrape_options, request.content_format)
+    payload = firecrawl_scrape_full_payload(request.url, request.scrape_options or {})
+    try:
+        response = await firecrawl_request(
+            client, "/v2/scrape", payload, timeout=max(deadline - loop.time(), 0.0)
+        )
+    except FirecrawlUnavailable as exc:
+        if exc.category == "policy_denied":
+            _record_provider_health("firecrawl", "ok")
+            raise AppError(
+                422,
+                "firecrawl_policy_denied",
+                "The requested target is not available under provider policy",
+                {"provider": "firecrawl"},
+                retryable=False,
+            ) from exc
+        permanent = exc.category in (
+            "not_configured",
+            "invalid_configuration",
+            "provider_routed_domain",
+            "unsupported_enterprise_option",
+        )
+        if loss and not request.allow_degraded:
+            if permanent:
+                raise AppError(
+                    422,
+                    "unsupported_feature",
+                    "No configured provider can honor the requested scrape features",
+                    {"provider": "firecrawl", "unsupported": loss},
+                    retryable=False,
+                    hint="Remove the unsupported features or configure Firecrawl.",
+                ) from exc
+            raise AppError(
+                503,
+                "fallback_feature_unavailable",
+                "Firecrawl is unavailable and Crawl4AI cannot honor every requested feature",
+                {"provider": "firecrawl", "fallback_provider": "crawl4ai", "unsupported": loss},
+                retryable=True,
+                retry_after=exc.retry_after or OUTAGE_RETRY_AFTER,
+                hint="Retry when Firecrawl recovers, or set allow_degraded=true.",
+            ) from exc
+        if exc.category != "provider_routed_domain":
+            _record_provider_health(
+                "firecrawl", "not_configured" if exc.category == "not_configured" else "unavailable"
+            )
+            if exc.category != "not_configured":
+                logger.warning("firecrawl scrape failed (%s)", exc.category)
+        return await crawl4ai_fallback(client, request, loss)
+
+    if response.status_code < 500:
+        _record_provider_health("firecrawl", "ok")
+    if response.status_code in (400, 404, 422) and loss and not request.allow_degraded:
+        raise AppError(
+            422,
+            "unsupported_feature",
+            "Firecrawl rejected the requested scrape features",
+            {"provider": "firecrawl", "unsupported": loss},
+            retryable=False,
+        )
+    try:
+        reported_url_allowed = await firecrawl_metadata_url_is_public(response, deadline)
+    except asyncio.TimeoutError as exc:
+        raise AppError(
+            503,
+            "upstream_unavailable",
+            "Firecrawl returned a URL that could not be validated before the deadline",
+            retryable=True,
+        ) from exc
+    if not reported_url_allowed:
+        raise AppError(422, "invalid_crawled_url", "Crawled URL must be a public http(s) URL")
+    result = firecrawl_scrape_full_result(response, request.url, request.content_format)
+    if result is None:
+        if loss and not request.allow_degraded:
+            raise AppError(
+                503,
+                "fallback_feature_unavailable",
+                "Firecrawl did not return the requested scrape features",
+                {"provider": "firecrawl", "fallback_provider": "crawl4ai", "unsupported": loss},
+                retryable=True,
+                retry_after=OUTAGE_RETRY_AFTER,
+                hint="Retry, or set allow_degraded=true to accept Crawl4AI content.",
+            )
+        return await crawl4ai_fallback(client, request, loss)
+
+    extras, extras_truncated, omitted = cap_extras_payload(result.get("extras"))
+    warnings = []
+    if extras_truncated or omitted:
+        message = "extras were truncated to the response budget"
+        if omitted:
+            message += f"; omitted: {', '.join(omitted)}"
+        warnings.append(message)
+    return {
+        "url": result["url"],
+        "content": truncate_content(result["content"], request.max_content_chars),
+        "provider": "firecrawl",
+        "metadata": cap_metadata(result.get("metadata")),
+        "extras": extras,
+        "warnings": warnings,
+    }
+
+
 async def crawl_direct_url(client: httpx.AsyncClient, request: CrawlRequest):
     if not await is_allowed_public_url(request.url):
         raise AppError(422, "invalid_url", "URL must be a public http(s) URL")
+
+    if request.scrape_options is not None:
+        return await crawl_with_scrape_options(client, request)
 
     if (
         supports_markdown_crawl(request)
@@ -2636,18 +3051,415 @@ async def crawl_direct_url(client: httpx.AsyncClient, request: CrawlRequest):
                 raise AppError(422, "invalid_crawled_url", "Crawled URL must be a public http(s) URL")
             result = firecrawl_scrape_result(response, request.url)
             if result is not None:
-                return result
+                return {
+                    "url": result["url"],
+                    "content": truncate_content(result["content"], request.max_content_chars),
+                    "provider": "firecrawl",
+                }
 
-    payload = await call_crawl4ai(client, build_crawl_payload(request))
-    crawled_url = extract_crawled_url(payload) or request.url
-    if not await is_allowed_public_url(crawled_url):
-        raise AppError(422, "invalid_crawled_url", "Crawled URL must be a public http(s) URL")
+    return await crawl4ai_fallback(client, request, [])
 
-    content = extract_crawl_content(payload, request.content_format)
-    if not content:
-        raise AppError(502, "empty_crawl_result", "Crawl4AI did not return extractable content")
 
-    return {"url": crawled_url, "content": content}
+def _raise_firecrawl_unavailable(exc: FirecrawlUnavailable) -> None:
+    if exc.category == "policy_denied":
+        raise AppError(
+            422,
+            "firecrawl_policy_denied",
+            "The requested target is not available under provider policy",
+            {"provider": "firecrawl"},
+            retryable=False,
+        ) from exc
+    if exc.category in ("not_configured", "invalid_configuration"):
+        raise AppError(
+            503,
+            "firecrawl_not_configured",
+            "Firecrawl is not configured",
+            {"provider": "firecrawl"},
+            retryable=False,
+            hint="Configure at least one labeled Firecrawl key and restart the API.",
+        ) from exc
+    if exc.category == "unsupported_enterprise_option":
+        raise AppError(
+            422,
+            "unsupported_feature",
+            "The requested feature is unavailable on the free plan",
+            {"provider": "firecrawl"},
+            retryable=False,
+        ) from exc
+    if exc.category == "rate_limited":
+        raise AppError(
+            429,
+            "rate_limited",
+            "Firecrawl rate limited the request",
+            {"provider": "firecrawl"},
+            retryable=True,
+            retry_after=exc.retry_after or OUTAGE_RETRY_AFTER,
+        ) from exc
+    raise AppError(
+        503,
+        "upstream_unavailable",
+        "Firecrawl is unavailable",
+        {"provider": "firecrawl", "category": exc.category},
+        retryable=True,
+        retry_after=exc.retry_after or OUTAGE_RETRY_AFTER,
+    ) from exc
+
+
+def _raise_firecrawl_http(response: httpx.Response, *, job: bool = False) -> None:
+    if job and response.status_code == 404:
+        raise AppError(404, "job_not_found", "Crawl job not found", {"provider": "firecrawl"}, retryable=False)
+    if response.status_code == 401:
+        raise AppError(
+            503,
+            "firecrawl_not_configured",
+            "Firecrawl rejected the configured key",
+            {"provider": "firecrawl"},
+            retryable=False,
+        )
+    if response.status_code == 402:
+        raise AppError(
+            503,
+            "upstream_unavailable",
+            "Firecrawl credits are unavailable",
+            {"provider": "firecrawl"},
+            retryable=True,
+            retry_after=OUTAGE_RETRY_AFTER,
+        )
+    if response.status_code == 429:
+        raise AppError(
+            429,
+            "rate_limited",
+            "Firecrawl rate limited the request",
+            {"provider": "firecrawl"},
+            retryable=True,
+            retry_after=_retry_after(response, OUTAGE_RETRY_AFTER),
+        )
+    if response.status_code >= 500:
+        raise AppError(
+            503,
+            "upstream_unavailable",
+            "Firecrawl is unavailable",
+            {"provider": "firecrawl", "status": response.status_code},
+            retryable=True,
+            retry_after=OUTAGE_RETRY_AFTER,
+        )
+    if response.status_code >= 400:
+        raise AppError(
+            422,
+            "firecrawl_rejected",
+            "Firecrawl rejected the request",
+            {"provider": "firecrawl", "status": response.status_code},
+            retryable=False,
+        )
+
+
+def _scrape_options_payload(options: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not options:
+        return None
+    result = dict(options)
+    result.setdefault("storeInCache", False)
+    return result
+
+
+def _normalize_map_payload(payload: Any) -> list[dict[str, Any]] | None:
+    if not isinstance(payload, dict) or payload.get("success") is not True:
+        return None
+    links = payload.get("links")
+    if not isinstance(links, list) and isinstance(payload.get("data"), dict):
+        links = payload["data"].get("links")
+    if not isinstance(links, list):
+        return None
+    urls = []
+    for link in links:
+        if isinstance(link, str):
+            urls.append({"url": link})
+        elif isinstance(link, dict) and isinstance(link.get("url"), str):
+            item = {"url": link["url"]}
+            for key in ("title", "description"):
+                if isinstance(link.get(key), str):
+                    item[key] = link[key]
+            urls.append(item)
+    return urls
+
+
+def _normalize_job_payload(
+    payload: Any, job_id: str, *, offset: int, limit: int
+) -> JobData | None:
+    if not isinstance(payload, dict) or payload.get("success") is not True:
+        return None
+    items = payload.get("data")
+    if not isinstance(items, list):
+        items = []
+    total = payload.get("total")
+    if not isinstance(total, int) or isinstance(total, bool):
+        total = len(items)
+    completed = payload.get("completed")
+    if not isinstance(completed, int) or isinstance(completed, bool):
+        completed = 0
+    status = payload.get("status") if isinstance(payload.get("status"), str) else "unknown"
+    selected = items[offset : offset + limit]
+    normalized = []
+    budget = MAX_JOB_ITEMS_BYTES
+    for item in selected:
+        if not isinstance(item, dict):
+            continue
+        metadata = item.get("metadata")
+        url = item.get("url")
+        if not isinstance(url, str) and isinstance(metadata, dict):
+            url = metadata.get("sourceURL") or metadata.get("url")
+        content = ""
+        for key in ("markdown", "summary", "answer", "highlights", "html"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                content = value
+                break
+        content = truncate_bytes(content, MAX_JOB_ITEM_BYTES)
+        extras = {
+            key: item[key]
+            for key in (*FORMAT_RESPONSE_KEYS.values(), "warning", "actions", "tools")
+            if key not in ("markdown", "metadata") and item.get(key) is not None
+        }
+        extras, extras_truncated, omitted = cap_extras_payload(extras)
+        record: dict[str, Any] = {
+            "url": url if isinstance(url, str) else None,
+            "content": content,
+            "success": item.get("success", True),
+        }
+        error = item.get("error_message") or item.get("error")
+        if error:
+            record["error"] = str(error)[:500]
+        if isinstance(metadata, dict):
+            record["metadata"] = cap_metadata(metadata)
+        if extras:
+            record["extras"] = extras
+        if omitted:
+            record["omitted"] = omitted
+        normalized.append(record)
+        budget -= len(content.encode("utf-8"))
+        if budget <= 0:
+            break
+    seed = payload.get("url") if isinstance(payload.get("url"), str) else None
+    return JobData(
+        id=job_id,
+        url=seed,
+        status=status,
+        completed=completed,
+        total=max(total, completed),
+        items=normalized,
+        offset=offset,
+        limit=limit,
+        truncated=(len(items) > offset + len(normalized)) or budget <= 0,
+    )
+
+
+async def _validate_batch_urls(urls: list[str], ignore_invalid: bool) -> list[str]:
+    checks = await asyncio.gather(*(is_allowed_public_url(url) for url in urls))
+    allowed = [url for url, ok in zip(urls, checks) if ok]
+    invalid = [url for url, ok in zip(urls, checks) if not ok]
+    if not allowed:
+        raise AppError(
+            422,
+            "invalid_url",
+            "URL must be a public http(s) URL",
+            {"invalid": invalid[:20], "invalid_count": len(invalid)},
+        )
+    if invalid and not ignore_invalid:
+        raise AppError(
+            422,
+            "invalid_url",
+            "URL must be a public http(s) URL",
+            {"invalid": invalid[:20], "invalid_count": len(invalid)},
+        )
+    return allowed
+
+
+@app.post(
+    "/map",
+    response_model=MapEnvelope,
+    response_model_exclude_none=True,
+    dependencies=[Depends(require_api_key)],
+    summary="Map a public site to URLs",
+    description="Firecrawl `/v2/map` URL discovery. The seed must be public; this endpoint does not crawl page content.",
+    operation_id="map_site",
+    tags=["Crawl"],
+)
+async def map_site(request: MapRequest):
+    client = await get_client()
+    if not await is_allowed_public_url(request.url):
+        raise AppError(422, "invalid_url", "URL must be a public http(s) URL")
+    payload: dict[str, Any] = {
+        "url": request.url,
+        "limit": request.limit,
+        "includeSubdomains": request.include_subdomains,
+        "ignoreQueryParameters": request.ignore_query_parameters,
+    }
+    if request.search:
+        payload["search"] = request.search
+    if request.sitemap:
+        payload["sitemap"] = request.sitemap
+    if request.timeout_ms is not None:
+        payload["timeout"] = request.timeout_ms
+    try:
+        response = await firecrawl_request(client, "/v2/map", payload, timeout=CRAWL_TIMEOUT)
+    except FirecrawlUnavailable as exc:
+        _raise_firecrawl_unavailable(exc)
+    _raise_firecrawl_http(response)
+    urls = _normalize_map_payload(response.json())
+    if urls is None:
+        raise AppError(502, "upstream_error", "Firecrawl returned an invalid map response", retryable=True)
+    _record_provider_health("firecrawl", "ok")
+    return MapEnvelope(data=MapData(url=request.url, urls=urls))
+
+
+def _crawl_site_payload(request: CrawlSiteRequest) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "url": request.url,
+        "limit": request.limit,
+        "ignoreQueryParameters": request.ignore_query_parameters,
+        "crawlEntireDomain": request.crawl_entire_domain,
+        "allowExternalLinks": request.allow_external_links,
+        "allowSubdomains": request.allow_subdomains,
+    }
+    if request.max_discovery_depth is not None:
+        payload["maxDiscoveryDepth"] = request.max_discovery_depth
+    if request.include_paths:
+        payload["includePaths"] = request.include_paths
+    if request.exclude_paths:
+        payload["excludePaths"] = request.exclude_paths
+    if request.sitemap:
+        payload["sitemap"] = request.sitemap
+    if request.delay is not None:
+        payload["delay"] = request.delay
+    if request.max_concurrency is not None:
+        payload["maxConcurrency"] = request.max_concurrency
+    scrape_options = _scrape_options_payload(request.scrape_options)
+    if scrape_options:
+        payload["scrapeOptions"] = scrape_options
+    if request.timeout_ms is not None:
+        payload["timeout"] = request.timeout_ms
+    return payload
+
+
+@app.post(
+    "/crawl-site",
+    response_model=JobEnvelope,
+    response_model_exclude_none=True,
+    dependencies=[Depends(require_api_key)],
+    summary="Start a multi-page site crawl",
+    description="Firecrawl `/v2/crawl` job start. Poll GET /crawl-site/{job_id} for items.",
+    operation_id="start_site_crawl",
+    tags=["Crawl"],
+)
+async def start_site_crawl(request: CrawlSiteRequest):
+    client = await get_client()
+    if not await is_allowed_public_url(request.url):
+        raise AppError(422, "invalid_url", "URL must be a public http(s) URL")
+    try:
+        response = await firecrawl_request(
+            client, "/v2/crawl", _crawl_site_payload(request), timeout=CRAWL_TIMEOUT
+        )
+    except FirecrawlUnavailable as exc:
+        _raise_firecrawl_unavailable(exc)
+    _raise_firecrawl_http(response)
+    body = response.json()
+    job_id = body.get("id") if isinstance(body, dict) else None
+    if not isinstance(job_id, str) or not job_id:
+        raise AppError(502, "upstream_error", "Firecrawl did not return a crawl job id", retryable=True)
+    _record_provider_health("firecrawl", "ok")
+    return JobEnvelope(
+        data=JobData(id=job_id, url=request.url, status="scraping", completed=0, total=0)
+    )
+
+
+@app.get(
+    "/crawl-site/{job_id}",
+    response_model=JobEnvelope,
+    response_model_exclude_none=True,
+    dependencies=[Depends(require_api_key)],
+    summary="Poll a site crawl job",
+    operation_id="site_crawl_status",
+    tags=["Crawl"],
+)
+async def site_crawl_status(
+    job_id: str = Path(..., pattern=r"^[A-Za-z0-9_-]{1,100}$"),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=20, ge=1, le=100),
+):
+    client = await get_client()
+    try:
+        response = await firecrawl_status(client, f"/v2/crawl/{job_id}", timeout=CRAWL_TIMEOUT)
+    except FirecrawlUnavailable as exc:
+        _raise_firecrawl_unavailable(exc)
+    _raise_firecrawl_http(response, job=True)
+    data = _normalize_job_payload(response.json(), job_id, offset=offset, limit=limit)
+    if data is None:
+        raise AppError(502, "upstream_error", "Firecrawl returned an invalid crawl status", retryable=True)
+    return JobEnvelope(data=data)
+
+
+@app.post(
+    "/batch-crawl",
+    response_model=JobEnvelope,
+    response_model_exclude_none=True,
+    dependencies=[Depends(require_api_key)],
+    summary="Start a batch scrape",
+    description="Firecrawl `/v2/batch/scrape` job start. Poll GET /batch-crawl/{job_id} for items.",
+    operation_id="start_batch_crawl",
+    tags=["Crawl"],
+)
+async def start_batch_crawl(request: BatchCrawlRequest):
+    client = await get_client()
+    urls = await _validate_batch_urls(request.urls, request.ignore_invalid_urls)
+    payload: dict[str, Any] = {
+        "urls": urls,
+        "ignoreInvalidURLs": request.ignore_invalid_urls,
+    }
+    scrape_options = _scrape_options_payload(request.scrape_options)
+    if scrape_options:
+        payload["scrapeOptions"] = scrape_options
+    if request.timeout_ms is not None:
+        payload["timeout"] = request.timeout_ms
+    try:
+        response = await firecrawl_request(
+            client, "/v2/batch/scrape", payload, timeout=CRAWL_TIMEOUT
+        )
+    except FirecrawlUnavailable as exc:
+        _raise_firecrawl_unavailable(exc)
+    _raise_firecrawl_http(response)
+    body = response.json()
+    job_id = body.get("id") if isinstance(body, dict) else None
+    if not isinstance(job_id, str) or not job_id:
+        raise AppError(502, "upstream_error", "Firecrawl did not return a batch job id", retryable=True)
+    _record_provider_health("firecrawl", "ok")
+    return JobEnvelope(data=JobData(id=job_id, status="scraping", completed=0, total=0))
+
+
+@app.get(
+    "/batch-crawl/{job_id}",
+    response_model=JobEnvelope,
+    response_model_exclude_none=True,
+    dependencies=[Depends(require_api_key)],
+    summary="Poll a batch scrape job",
+    operation_id="batch_crawl_status",
+    tags=["Crawl"],
+)
+async def batch_crawl_status(
+    job_id: str = Path(..., pattern=r"^[A-Za-z0-9_-]{1,100}$"),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=20, ge=1, le=100),
+):
+    client = await get_client()
+    try:
+        response = await firecrawl_status(
+            client, f"/v2/batch/scrape/{job_id}", timeout=CRAWL_TIMEOUT
+        )
+    except FirecrawlUnavailable as exc:
+        _raise_firecrawl_unavailable(exc)
+    _raise_firecrawl_http(response, job=True)
+    data = _normalize_job_payload(response.json(), job_id, offset=offset, limit=limit)
+    if data is None:
+        raise AppError(502, "upstream_error", "Firecrawl returned an invalid batch status", retryable=True)
+    return JobEnvelope(data=data)
 
 
 # Server-owned crawl defaults, applied to every payload in call_crawl4ai().
@@ -2882,9 +3694,37 @@ def api_surface(request: Request):
 
 def filtered_openapi(surface: Literal["search", "crawl"]):
     schema = deepcopy(app.openapi())
-    allowed_paths = {"crawl": {"/crawl", "/health"}, "search": {"/health", "/search"}}[surface]
+    allowed_paths = {
+        "crawl": {
+            "/crawl",
+            "/map",
+            "/crawl-site",
+            "/crawl-site/{job_id}",
+            "/batch-crawl",
+            "/batch-crawl/{job_id}",
+            "/health",
+        },
+        "search": {"/health", "/search"},
+    }[surface]
     allowed_components = {
-        "crawl": {"CrawlData", "CrawlEnvelope", "CrawlRequest", "ErrorDetail", "ErrorEnvelope", "HTTPValidationError", "HealthData", "HealthEnvelope", "ValidationError"},
+        "crawl": {
+            "BatchCrawlRequest",
+            "CrawlData",
+            "CrawlEnvelope",
+            "CrawlRequest",
+            "CrawlSiteRequest",
+            "ErrorDetail",
+            "ErrorEnvelope",
+            "HTTPValidationError",
+            "HealthData",
+            "HealthEnvelope",
+            "JobData",
+            "JobEnvelope",
+            "MapData",
+            "MapEnvelope",
+            "MapRequest",
+            "ValidationError",
+        },
         "search": {"ErrorDetail", "ErrorEnvelope", "HTTPValidationError", "HealthData", "HealthEnvelope", "SearchData", "SearchEnvelope", "SearchRequest", "SearchResult", "ValidationError"},
     }[surface]
     schema["paths"] = {path: value for path, value in schema["paths"].items() if path in allowed_paths}
@@ -2893,24 +3733,36 @@ def filtered_openapi(surface: Literal["search", "crawl"]):
     if surface == "crawl":
         schema["info"]["title"] = "SparkFN Web Crawl API"
         schema["info"]["description"] = (
-            "Tool-facing API for extracting content from a known public URL. Use this service when an agent, CLI, or MCP tool "
+            "Tool-facing API for extracting content from known public URLs. Use this service when an agent, CLI, or MCP tool "
             "already has a URL and needs normalized page content for summarization, citation, or downstream reasoning. Do not use this "
             "API for search or discovery; use https://websearch.sparkfn.io for query-based discovery.\n\n"
-            "How to use: send POST /crawl with JSON body {\"url\": \"https://example.com\", \"content_format\": \"markdown\"} and an "
-            "X-API-Key header. The URL must be public http(s). Localhost, private networks, reserved/link-local IPs, and credentialed URLs "
-            "are rejected before Crawl4AI is called. Advanced Crawl4AI config fields are optional pass-through controls; leave them empty for normal use."
+            "How to use: POST /crawl for one URL, POST /map to discover a site's URLs, POST /crawl-site for a multi-page crawl, and "
+            "POST /batch-crawl for up to 100 URLs. All accept X-API-Key. Targets must be public http(s); localhost, private networks, "
+            "reserved/link-local IPs, and credentialed URLs are rejected. Site and batch jobs return a job id; poll the matching GET "
+            "endpoint with offset/limit. Crawl4AI config fields are pass-through controls; leave them empty for normal use."
         )
         schema["servers"] = [{"url": "https://webcrawl.sparkfn.io", "description": "Public crawl API"}]
-        schema["tags"] = [{"name": "Crawl", "description": "Extract content from one known public URL."}]
+        schema["tags"] = [
+            {"name": "Crawl", "description": "Map, crawl, or batch-scrape public URLs."},
+            {"name": "Diagnostics", "description": "Public service diagnostics for availability checks."},
+        ]
         schema["x-ai-usage"] = {
-            "when_to_use": "Use when you already know the exact URL and need extracted page content.",
-            "when_not_to_use": "Do not use for web search, discovery, private network probing, or arbitrary Crawl4AI administration.",
-            "authentication": "Send X-API-Key with every /crawl request. /health is public.",
+            "when_to_use": "Use when you already know the URL(s) and need extracted page content, a site map, or a bounded site crawl.",
+            "when_not_to_use": "Do not use for web search, discovery outside a known site, private network probing, or arbitrary Crawl4AI administration.",
+            "authentication": "Send X-API-Key with every request except /health.",
             "recommended_request": {"url": "https://example.com", "content_format": "markdown"},
+            "workflows": {
+                "single_url": "POST /crawl",
+                "discover_urls": "POST /map, then choose URLs",
+                "whole_site": "POST /crawl-site, then GET /crawl-site/{job_id} until status is completed",
+                "many_urls": "POST /batch-crawl, then GET /batch-crawl/{job_id} until status is completed",
+            },
             "recovery": {
                 "401": "Add or correct X-API-Key.",
                 "422": "Use a valid public http(s) URL and valid enum/body values.",
-                "502": "Retry later, try a simpler URL, or reduce advanced crawl options.",
+                "429": "Rate limited; honor retry_after.",
+                "404": "The crawl job id is unknown or expired; start a new job.",
+                "503": "Firecrawl is unavailable or not configured; retry later or use /crawl with its Crawl4AI fallback.",
             },
         }
     else:

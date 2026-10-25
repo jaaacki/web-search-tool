@@ -51,7 +51,11 @@ def check_get_defaults_and_openapi_surfaces(client):
 
     for host, paths, title in (
         ("websearch.sparkfn.io", {"/health", "/search"}, "SparkFN Web Search API"),
-        ("webcrawl.sparkfn.io", {"/health", "/crawl"}, "SparkFN Web Crawl API"),
+        (
+            "webcrawl.sparkfn.io",
+            {"/health", "/crawl", "/map", "/crawl-site", "/crawl-site/{job_id}", "/batch-crawl", "/batch-crawl/{job_id}"},
+            "SparkFN Web Crawl API",
+        ),
     ):
         response = client.get("/openapi.json", headers={"Host": host})
         assert response.status_code == 200, response.text
