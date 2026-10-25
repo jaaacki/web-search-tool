@@ -1397,7 +1397,8 @@ def test_strict_search_features_fail_when_no_provider_can_honor_them():
         except app.AppError as exc:
             assert exc.status_code == 503, vars(exc)
             assert exc.code == "fallback_feature_unavailable", exc.code
-            assert exc.details["unsupported"]["searxng"] == ["categories"], exc.details
+            assert exc.details["unsupported"] == ["categories"], exc.details
+            assert exc.details["unsupported_by_provider"]["searxng"] == ["categories"], exc.details
             assert exc.retryable is True, vars(exc)
         else:
             raise AssertionError("strict feature loss did not raise")
@@ -1504,12 +1505,244 @@ def test_inline_search_scrape_is_used_without_a_second_firecrawl_request():
         app.is_allowed_public_url = saved_check
 
 
-def test_inline_feature_loss_only_accepts_plain_markdown():
-    assert app.inline_feature_loss({"formats": ["markdown"]}) == []
-    assert app.inline_feature_loss({"formats": ["markdown", "links"]}) == ["formats"]
-    assert app.inline_feature_loss(
-        {"formats": ["markdown"], "onlyMainContent": True}
-    ) == ["options"]
+def test_inline_extras_only_results_keep_content_and_requested_formats():
+    saved_request = app.firecrawl_request
+    saved_check = app.is_allowed_public_url
+
+    async def firecrawl(*_args, **_kwargs):
+        raise AssertionError("extras-only inline content must not trigger a scrape")
+
+    async def allow(_url):
+        return True
+
+    app.firecrawl_request = firecrawl
+    app.is_allowed_public_url = allow
+    try:
+        request = app.SearchRequest(
+            query="q",
+            scrape_options={"formats": ["links"]},
+        )
+        candidates = [
+            {
+                "url": "https://inline.example/",
+                "title": "Inline",
+                "snippet": "fallback passage",
+                "_firecrawl_source": True,
+                "_inline": {
+                    "links": ["https://inline.example/next"],
+                    "metadata": {"statusCode": 200, "sourceURL": "https://inline.example/"},
+                },
+            }
+        ]
+        loss = set()
+        pages, local, _ = run(
+            app.scrape_firecrawl_candidates(
+                object(), candidates, time.monotonic() + 5, request, loss
+            )
+        )
+        assert pages == [
+            {
+                "url": "https://inline.example/",
+                "title": "Inline",
+                "snippet": "fallback passage",
+                "content": "fallback passage",
+                "metadata": {"statusCode": 200, "sourceURL": "https://inline.example/"},
+                "extras": {"links": ["https://inline.example/next"]},
+            }
+        ], pages
+        assert local == [], local
+        assert loss == set(), loss
+    finally:
+        app.firecrawl_request = saved_request
+        app.is_allowed_public_url = saved_check
+
+
+def test_inline_missing_requested_formats_are_reported_not_silently_dropped():
+    saved_request = app.firecrawl_request
+    saved_check = app.is_allowed_public_url
+
+    async def firecrawl(*_args, **_kwargs):
+        raise AssertionError("inline content must not trigger a second scrape")
+
+    async def allow(_url):
+        return True
+
+    app.firecrawl_request = firecrawl
+    app.is_allowed_public_url = allow
+    try:
+        request = app.SearchRequest(
+            query="q",
+            scrape_options={"formats": ["markdown", "links"]},
+        )
+        candidates = [
+            {
+                "url": "https://inline.example/",
+                "title": "Inline",
+                "snippet": "s",
+                "_firecrawl_source": True,
+                "_inline": {
+                    "markdown": "# Page",
+                    "metadata": {"statusCode": 200, "sourceURL": "https://inline.example/"},
+                },
+            }
+        ]
+        loss = set()
+        pages, _, _ = run(
+            app.scrape_firecrawl_candidates(
+                object(), candidates, time.monotonic() + 5, request, loss
+            )
+        )
+        assert [page["content"] for page in pages] == ["# Page"], pages
+        assert loss == {"format:links"}, loss
+    finally:
+        app.firecrawl_request = saved_request
+        app.is_allowed_public_url = saved_check
+
+
+def test_image_results_do_not_attempt_page_extraction():
+    saved_request = app.firecrawl_request
+    saved_check = app.is_allowed_public_url
+
+    async def firecrawl(*_args, **_kwargs):
+        raise AssertionError("image results must not trigger a page scrape")
+
+    async def allow(_url):
+        return True
+
+    app.firecrawl_request = firecrawl
+    app.is_allowed_public_url = allow
+    try:
+        request = app.SearchRequest(query="q")
+        candidates = [
+            {
+                "url": "https://img.example/photo.png",
+                "title": "Photo",
+                "snippet": "",
+                "source": "images",
+                "imageUrl": "https://img.example/photo.png",
+                "position": 1,
+            }
+        ]
+        loss = set()
+        pages, local, _ = run(
+            app.scrape_firecrawl_candidates(
+                object(), candidates, time.monotonic() + 5, request, loss
+            )
+        )
+        assert pages == [
+            {
+                "url": "https://img.example/photo.png",
+                "title": "Photo",
+                "snippet": "",
+                "content": "Photo",
+                "source": "images",
+                "imageUrl": "https://img.example/photo.png",
+                "position": 1,
+            }
+        ], pages
+        assert local == [], local
+        assert loss == set(), loss
+
+        image_request = app.SearchRequest(
+            query="q", scrape_options={"formats": ["images"]}
+        )
+        loss = set()
+        pages, _, _ = run(
+            app.scrape_firecrawl_candidates(
+                object(), candidates, time.monotonic() + 5, image_request, loss
+            )
+        )
+        assert pages and loss == set(), (pages, loss)
+
+        markdown_request = app.SearchRequest(
+            query="q", scrape_options={"formats": ["markdown"]}
+        )
+        loss = set()
+        run(
+            app.scrape_firecrawl_candidates(
+                object(), candidates, time.monotonic() + 5, markdown_request, loss
+            )
+        )
+        assert loss == {"format:markdown"}, loss
+    finally:
+        app.firecrawl_request = saved_request
+        app.is_allowed_public_url = saved_check
+
+
+def test_inline_reported_url_must_stay_public():
+    saved_request = app.firecrawl_request
+    saved_check = app.is_allowed_public_url
+
+    async def firecrawl(*_args, **_kwargs):
+        raise AssertionError("inline content must not trigger a second scrape")
+
+    async def allow(url):
+        return "127.0.0.1" not in url
+
+    app.firecrawl_request = firecrawl
+    app.is_allowed_public_url = allow
+    try:
+        request = app.SearchRequest(query="q")
+        candidates = [
+            {
+                "url": "https://inline.example/",
+                "title": "Inline",
+                "snippet": "s",
+                "_firecrawl_source": True,
+                "_inline": {
+                    "markdown": "# Page",
+                    "metadata": {
+                        "statusCode": 200,
+                        "sourceURL": "https://inline.example/",
+                        "url": "http://127.0.0.1/private",
+                    },
+                },
+            }
+        ]
+        loss = set()
+        pages, local, _ = run(
+            app.scrape_firecrawl_candidates(
+                object(), candidates, time.monotonic() + 5, request, loss
+            )
+        )
+        assert pages == [], pages
+        assert local == candidates, local
+        assert loss == set(), loss
+    finally:
+        app.firecrawl_request = saved_request
+        app.is_allowed_public_url = saved_check
+
+
+def test_strict_not_configured_firecrawl_is_unsupported_not_retryable():
+    saved_pool = app.BRAVE_POOL
+    saved_request = app.firecrawl_request
+    saved_searxng = app.search_searxng
+    app.BRAVE_POOL = app.BraveKeyPool(())
+
+    async def firecrawl(*_args, **_kwargs):
+        raise app.FirecrawlUnavailable(None, "not_configured", None, False)
+
+    async def searxng(*_args, **_kwargs):
+        raise AssertionError("strict mode must not call a fallback that loses features")
+
+    app.firecrawl_request = firecrawl
+    app.search_searxng = searxng
+    try:
+        request = app.SearchRequest(query="q", categories=["developer"])
+        try:
+            run(app.discover_candidates(object(), "q", 1, request))
+        except app.AppError as exc:
+            assert exc.status_code == 422, vars(exc)
+            assert exc.code == "unsupported_feature", exc.code
+            assert exc.retryable is False, vars(exc)
+            assert exc.details["unsupported"] == ["categories"], exc.details
+        else:
+            raise AssertionError("unconfigured Firecrawl did not raise unsupported_feature")
+    finally:
+        app.BRAVE_POOL = saved_pool
+        app.firecrawl_request = saved_request
+        app.search_searxng = saved_searxng
+        app.health_cache_reset()
 
 
 def test_fallback_query_and_params_translate_free_filters():

@@ -127,20 +127,31 @@ curl 'https://websearch.sparkfn.io/search?q=open%20source%20web%20search%20engin
 
 `POST /search` exposes the free Firecrawl v2 surface; the GET shortcut remains the simple subset.
 
-- `sources`: `web` (default), `news`, `images`. Non-web sources are Firecrawl-only.
-- `categories`: `developer`, `gov`, `research`, `pdf`. `gov` cannot be combined with other categories or filters.
-- `include_domains` / `exclude_domains`: hostnames only; the two cannot be combined. Brave/SearXNG use `site:` / `-site:`.
-- `time_range` (`day`, `week`, `month`, `year`) or raw `tbs`; `country`, `location`, `safe`, `highlights`, `ignore_invalid_urls`.
-- `scrape_options`: inline Firecrawl extraction. Markdown becomes `content`; every other returned field lands in `extras`. Requires `depth=advanced`. `actions`, `headers`, and `profile` are rejected unless `ALLOW_FIRECRAWL_ACTIONS`, `ALLOW_FIRECRAWL_HEADERS`, or `ALLOW_FIRECRAWL_PROFILE` is enabled.
+- `sources`: `web` (default), `news`, `images`. `images` results come back as image metadata
+  (`image_url`, `position`) without page extraction. Non-web sources are Firecrawl-only.
+- `categories`: `developer`, `gov`, `research`, `pdf`. `gov` cannot be combined with other categories
+  or filters; the automatic LinkedIn/X/shortener exclusions are skipped for it. `pdf` results are
+  routed to Crawl4AI with its PDF parser enabled.
+- `include_domains` / `exclude_domains`: hostnames only; the two cannot be combined. Brave/SearXNG
+  use `site:` / `-site:`. Setting `include_domains` disables the automatic cost-sensitive exclusions.
+- `time_range` (`day`, `week`, `month`, `year`) or raw `tbs`; `country`, `location`, `safe`,
+  `highlights`, `ignore_invalid_urls`.
+- `scrape_options`: inline Firecrawl extraction. Markdown becomes `content`; every other returned
+  field lands in `extras` (extras strings are capped by `SEARCH_MAX_EXTRAS_CHARS`; oversized
+  `rawBase64` is omitted). `storeInCache` defaults to false; set true to opt into Firecrawl caching.
+  Requires `depth=advanced`. `actions`, `headers`, and `profile` are rejected unless
+  `ALLOW_FIRECRAWL_ACTIONS`, `ALLOW_FIRECRAWL_HEADERS`, or `ALLOW_FIRECRAWL_PROFILE` is enabled.
 - `max_content_chars`: truncate returned `content` after ranking.
 - `candidates` is 1..100; `max_results` is 1..20.
 
 **Fallback contract.** Strict by default. If Firecrawl is unavailable and Brave/SearXNG/Crawl4AI
 cannot honor a requested filter or inline format, the request returns `422 unsupported_feature`
-(nothing can honor it) or `503 fallback_feature_unavailable` (Firecrawl is down and the fallback is a
-subset). Both carry `details.provider` and `details.unsupported`. Set `allow_degraded: true` to accept
-the subset; the response then carries `data.degraded` and human-readable `warnings`. Nothing is
-silently dropped.
+(nothing can honor it, `retryable: false`) or `503 fallback_feature_unavailable` (Firecrawl is down
+and the fallback is a subset, `retryable: true`). Both carry `details.provider`,
+`details.unsupported` (a list such as `["format:links", "options"]`), and, for discovery,
+`details.unsupported_by_provider`. Set `allow_degraded: true` to accept the subset; the response then
+carries `data.degraded` and human-readable `warnings`. Every error also carries `request_id` when a
+request id is available. Nothing is silently dropped.
 
 Headless crawl:
 
@@ -234,9 +245,10 @@ Each Firecrawl search/scrape attempt appends one JSON line to `FIRECRAWL_USAGE_L
 {"ts":"2026-10-25T12:00:00.000+00:00","request_id":"…","endpoint":"/v2/search","label":"primary@example.test","status":200,"credits":2.0,"category":null,"elapsed_ms":612}
 ```
 
-Search credits come from Firecrawl's `creditsUsed`; scrapes count one page. A write failure never
-fails the request. Set `LOG_FORMAT=json` to make stdout one JSON object per line. There is no hard
-credit or RPM cap: the existing reactive 429/402 guards still apply.
+Search credits come from Firecrawl's `creditsUsed`; if the provider omits it the ledger records an
+estimate of 2. Scrapes count one page. A write failure never fails the request. Set
+`LOG_FORMAT=json` to make stdout one JSON object per line. There is no hard credit or RPM cap: the
+existing reactive 429/402 guards still apply.
 
 ## Crawl stealth defaults
 

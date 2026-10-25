@@ -949,6 +949,14 @@ def test_forbidden_policy_status_does_not_fail_over():
     assert seen == ["Bearer primary"], seen
 
 
+def test_gov_category_skips_automatic_cost_exclusions():
+    gov = fc._search_payload({"query": "q", "limit": 10, "categories": ["gov"]})
+    assert "excludeDomains" not in gov, gov
+    developer = fc._search_payload({"query": "q", "limit": 10, "categories": ["developer"]})
+    assert "excludeDomains" in developer, developer
+    assert "linkedin.com" in developer["excludeDomains"], developer
+
+
 def test_usage_ledger_records_endpoint_credits_and_request_id():
     def handler(request):
         return response(request, body={"success": True, "creditsUsed": 2, "data": {"web": []}})

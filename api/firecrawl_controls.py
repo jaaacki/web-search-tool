@@ -139,6 +139,11 @@ def _search_payload(payload: dict[str, Any]) -> dict[str, Any]:
         # Enterprise/team-gated controls are unavailable on the free plan.
         if any(scrape.get(option) for option in ("zeroDataRetention", "threatProtection")):
             raise FirecrawlUnavailable(None, "unsupported_enterprise_option", None, False)
+    categories = result.get("categories")
+    if isinstance(categories, list) and "gov" in categories:
+        # Firecrawl forbids gov with any other filter; the automatic cost
+        # exclusions are filters too, so leave the payload untouched.
+        return result
     included = result.get("includeDomains")
     if isinstance(included, list) and included:
         # Firecrawl rejects include+exclude together; the caller's allowlist wins.

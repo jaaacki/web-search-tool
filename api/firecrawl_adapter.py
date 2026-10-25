@@ -54,6 +54,35 @@ def search_payload(
     return payload
 
 
+def _normalize_result(item: Any, source: str) -> dict[str, Any] | None:
+    if not isinstance(item, dict) or not isinstance(item.get("url"), str):
+        return None
+    result = {
+        "url": item["url"],
+        "title": item.get("title") if isinstance(item.get("title"), str) else "",
+        "description": (
+            item.get("description")
+            if isinstance(item.get("description"), str)
+            else item.get("snippet")
+            if isinstance(item.get("snippet"), str)
+            else ""
+        ),
+        "source": source,
+    }
+    for key in ("category", "date"):
+        if isinstance(item.get(key), str):
+            result[key] = item[key]
+    if isinstance(item.get("imageUrl"), str):
+        result["imageUrl"] = item["imageUrl"]
+    position = item.get("position")
+    if isinstance(position, int) and not isinstance(position, bool):
+        result["position"] = position
+    inline = {key: item[key] for key in INLINE_FIELDS if item.get(key) is not None}
+    if inline:
+        result["inline"] = inline
+    return result
+
+
 def search_results(response: Any) -> list[dict[str, Any]] | None:
     if response.status_code != 200:
         return None
@@ -69,52 +98,116 @@ def search_results(response: Any) -> list[dict[str, Any]] | None:
     if not any(isinstance(data.get(source), list) for source in SEARCH_SOURCES):
         return None
 
-    results = []
+    buckets: dict[str, list[dict[str, Any]]] = {source: [] for source in SEARCH_SOURCES}
     for source in SEARCH_SOURCES:
         rows = data.get(source)
         if not isinstance(rows, list):
             continue
         for item in rows:
-            if not isinstance(item, dict) or not isinstance(item.get("url"), str):
-                continue
-            result = {
-                "url": item["url"],
-                "title": item.get("title") if isinstance(item.get("title"), str) else "",
-                "description": (
-                    item.get("description")
-                    if isinstance(item.get("description"), str)
-                    else item.get("snippet")
-                    if isinstance(item.get("snippet"), str)
-                    else ""
-                ),
-                "source": source,
-            }
-            for key in ("category", "date", "imageUrl", "imageWidth", "imageHeight", "position"):
-                if item.get(key) is not None:
-                    result[key] = item[key]
-            inline = {key: item[key] for key in INLINE_FIELDS if item.get(key) is not None}
-            if inline:
-                result["inline"] = inline
-            results.append(result)
+            result = _normalize_result(item, source)
+            if result is not None:
+                buckets[source].append(result)
+
+    # Interleave sources so a full web bucket cannot starve news/images when
+    # shape_candidates later truncates to the requested candidate count.
+    results: list[dict[str, Any]] = []
+    while any(buckets.values()):
+        for source in SEARCH_SOURCES:
+            if buckets[source]:
+                results.append(buckets[source].pop(0))
     return results
 
 
+FORMAT_RESPONSE_KEYS = {
+    "markdown": "markdown",
+    "summary": "summary",
+    "html": "html",
+    "rawHtml": "rawHtml",
+    "rawBase64": "rawBase64",
+    "links": "links",
+    "images": "images",
+    "screenshot": "screenshot",
+    "json": "json",
+    "changeTracking": "changeTracking",
+    "branding": "branding",
+    "product": "product",
+    "menu": "menu",
+    "audio": "audio",
+    "video": "video",
+    "question": "answer",
+    "highlights": "highlights",
+    "attributes": "attributes",
+}
+
+
+def normalize_formats(formats: Any) -> list[str]:
+    if not isinstance(formats, list):
+        return []
+    normalized = []
+    for item in formats:
+        if isinstance(item, str):
+            normalized.append(item)
+        elif isinstance(item, dict) and isinstance(item.get("type"), str):
+            normalized.append(item["type"])
+    return normalized
+
+
+def missing_inline_formats(formats: list[str], item: dict[str, Any]) -> list[str]:
+    """Requested formats the inline result did not actually return."""
+    missing = []
+    for fmt in formats:
+        key = FORMAT_RESPONSE_KEYS.get(fmt)
+        value = item.get(key) if key else None
+        if key == "markdown":
+            if not isinstance(value, str) or not value.strip():
+                missing.append(fmt)
+        elif value is None:
+            missing.append(fmt)
+    return missing
+
+
 def inline_scrape_result(item: dict[str, Any], requested_url: str) -> dict[str, Any] | None:
-    """Page content returned by search `scrapeOptions`, without a second request."""
-    markdown = item.get("markdown")
-    if not isinstance(markdown, str) or not markdown.strip():
+    """Inline search content/extras, without a second request.
+
+    Accepts extras-only results (for example `formats: ["links"]`); the caller
+    supplies snippet/title as the passage when Markdown is absent.
+    """
+    if not isinstance(item, dict) or item.get("rawBase64"):
         return None
     metadata = item.get("metadata")
+    reported_url = None
     if isinstance(metadata, dict):
         status = metadata.get("statusCode")
         if isinstance(status, int) and not isinstance(status, bool) and not (200 <= status < 300 or status == 304):
             return None
         if metadata.get("error"):
             return None
-    result: dict[str, Any] = {"url": requested_url, "content": markdown}
-    extras = {key: item[key] for key in INLINE_FIELDS if key != "markdown" and item.get(key) is not None}
+        content_type = metadata.get("contentType")
+        if isinstance(content_type, str) and "pdf" in content_type.lower():
+            return None
+        source_url = metadata.get("sourceURL")
+        if isinstance(source_url, str) and not same_url_identity(source_url, requested_url):
+            return None
+        reported = metadata.get("url")
+        if isinstance(reported, str):
+            reported_url = reported
+
+    markdown = item.get("markdown")
+    content = markdown if isinstance(markdown, str) and markdown.strip() else ""
+    extras = {
+        key: item[key]
+        for key in INLINE_FIELDS
+        if key not in ("markdown", "metadata") and item.get(key) is not None
+    }
+    if not content and not extras:
+        return None
+    result: dict[str, Any] = {"url": requested_url, "content": content}
     if extras:
         result["extras"] = extras
+    if isinstance(metadata, dict):
+        result["metadata"] = metadata
+    if reported_url:
+        result["reported_url"] = reported_url
     return result
 
 

@@ -95,6 +95,12 @@ def test_search_uses_grouped_web_results_without_embedded_scraping():
             },
         },
         {
+            "url": "https://news.example/",
+            "title": "Not web",
+            "description": "",
+            "source": "news",
+        },
+        {
             "url": "https://b.example/",
             "title": "B",
             "description": "B snippet",
@@ -118,12 +124,6 @@ def test_search_uses_grouped_web_results_without_embedded_scraping():
             "source": "web",
             "category": "pdf",
         },
-        {
-            "url": "https://news.example/",
-            "title": "Not web",
-            "description": "",
-            "source": "news",
-        },
     ]
     assert adapter.is_pdf_target("https://reports.example/report.pdf")
     assert adapter.is_pdf_target("https://reports.example/download", "pdf")
@@ -139,15 +139,70 @@ def test_inline_scrape_result_uses_search_markdown_and_extras():
     assert adapter.inline_scrape_result(item, "https://a.example/") == {
         "url": "https://a.example/",
         "content": "# Page",
-        "extras": {
-            "links": ["https://a.example/"],
-            "metadata": {"statusCode": 200, "sourceURL": "https://a.example/"},
-        },
+        "extras": {"links": ["https://a.example/"]},
+        "metadata": {"statusCode": 200, "sourceURL": "https://a.example/"},
+    }
+    # Extras-only results are valid; the pipeline supplies snippet/title as passage.
+    assert adapter.inline_scrape_result(
+        {"links": ["https://a.example/"]}, "https://a.example/"
+    ) == {
+        "url": "https://a.example/",
+        "content": "",
+        "extras": {"links": ["https://a.example/"]},
     }
     assert adapter.inline_scrape_result(
         {"markdown": "# Gone", "metadata": {"statusCode": 404}}, "https://a.example/"
     ) is None
+    assert adapter.inline_scrape_result(
+        {"markdown": "# Wrong", "metadata": {"statusCode": 200, "sourceURL": "https://evil.example/"}},
+        "https://a.example/",
+    ) is None
+    assert adapter.inline_scrape_result(
+        {"markdown": "# PDF", "metadata": {"statusCode": 200, "contentType": "application/pdf"}},
+        "https://a.example/",
+    ) is None
+    assert adapter.inline_scrape_result(
+        {"markdown": "# Raw", "rawBase64": "AAAA"}, "https://a.example/"
+    ) is None
     assert adapter.inline_scrape_result({"markdown": "   "}, "https://a.example/") is None
+
+
+def test_search_results_interleaves_sources_and_ignores_mistyped_fields():
+    response = httpx.Response(
+        200,
+        json={
+            "success": True,
+            "data": {
+                "web": [
+                    {"url": f"https://w{i}.example/", "title": "W", "position": "bad"}
+                    for i in range(3)
+                ],
+                "news": [
+                    {"url": f"https://n{i}.example/", "title": "N", "snippet": "s", "position": i}
+                    for i in range(2)
+                ],
+            },
+        },
+    )
+    results = adapter.search_results(response)
+    assert [item["source"] for item in results] == [
+        "web",
+        "news",
+        "web",
+        "news",
+        "web",
+    ], results
+    assert "position" not in results[0], results[0]
+    assert results[1]["position"] == 0, results[1]
+
+
+def test_requested_inline_formats_report_missing_fields():
+    assert adapter.normalize_formats(["markdown", {"type": "json"}]) == ["markdown", "json"]
+    assert adapter.normalize_formats("markdown") == []
+    assert adapter.missing_inline_formats(["links"], {"links": []}) == []
+    assert adapter.missing_inline_formats(["markdown"], {"markdown": "  "}) == ["markdown"]
+    assert adapter.missing_inline_formats(["question"], {"answer": "x"}) == []
+    assert adapter.missing_inline_formats(["json"], {}) == ["json"]
 
 
 def test_search_rejects_provider_and_response_failures_but_keeps_empty_success():

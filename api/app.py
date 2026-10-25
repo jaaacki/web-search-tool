@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import ipaddress
 import logging
 import math
@@ -26,8 +27,11 @@ from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from firecrawl_adapter import (
+    FORMAT_RESPONSE_KEYS,
     inline_scrape_result as firecrawl_inline_result,
     is_pdf_target,
+    missing_inline_formats,
+    normalize_formats,
     scrape_payload as firecrawl_scrape_payload,
     scrape_target_url as firecrawl_scrape_target_url,
     scrape_result as firecrawl_scrape_result,
@@ -63,6 +67,9 @@ WEBSEARCH_API_KEY = os.getenv("WEBSEARCH_API_KEY", "")
 ALLOW_FIRECRAWL_ACTIONS = os.getenv("ALLOW_FIRECRAWL_ACTIONS", "").lower() in {"1", "true", "yes"}
 ALLOW_FIRECRAWL_HEADERS = os.getenv("ALLOW_FIRECRAWL_HEADERS", "").lower() in {"1", "true", "yes"}
 ALLOW_FIRECRAWL_PROFILE = os.getenv("ALLOW_FIRECRAWL_PROFILE", "").lower() in {"1", "true", "yes"}
+FIRECRAWL_FORMAT_TYPES = frozenset(FORMAT_RESPONSE_KEYS)
+# Keep inline extras bounded; rawBase64 above this is omitted rather than corrupted.
+MAX_EXTRAS_CHARS = int(os.getenv("SEARCH_MAX_EXTRAS_CHARS", "200000"))
 # Optional Brave Search API keys (comma-separated) for primary discovery.
 # Empty = SearXNG-only discovery, exactly today's behavior.
 BRAVE_API_KEYS = tuple(key.strip() for key in os.getenv("BRAVE_API_KEYS", "").split(",") if key.strip())
@@ -226,6 +233,11 @@ class ErrorDetail(BaseModel):
         description="The next action to take, when one is knowable: a command to run, or the setting to change.",
         examples=["Set SEARXNG_ENGINES to a comma-separated engine list and restart the API."],
     )
+    request_id: str | None = Field(
+        default=None,
+        description="Correlation id also returned in the X-Request-ID response header and written to the usage ledger.",
+        examples=["9f2c1d4e5a6b7c8d"],
+    )
 
 
 class ErrorEnvelope(BaseModel):
@@ -294,8 +306,9 @@ class SearchRequest(BaseModel):
         min_length=1,
         max_length=3,
         description=(
-            "Firecrawl result sources. `web` is the default; `news` and `images` add their result arrays. Non-web sources are "
-            "Firecrawl-only: strict mode returns `fallback_feature_unavailable` when a fallback provider would have to drop them, "
+            "Firecrawl result sources. `web` is the default; `news` and `images` add their result arrays. `images` results are "
+            "returned as image metadata (`image_url`, `position`) without page extraction. Non-web sources are Firecrawl-only: "
+            "strict mode returns `unsupported_feature` or `fallback_feature_unavailable` when a fallback would have to drop them, "
             "and `allow_degraded` returns the web subset with a warning."
         ),
         examples=[["web"], ["web", "news"]],
@@ -312,7 +325,10 @@ class SearchRequest(BaseModel):
     include_domains: list[str] = Field(
         default_factory=list,
         max_length=20,
-        description="Hostnames to include. Cannot be combined with `exclude_domains`. Firecrawl uses `includeDomains`; Brave and SearXNG use `site:` operators.",
+        description=(
+            "Hostnames to include. Cannot be combined with `exclude_domains`. Firecrawl uses `includeDomains`; Brave and "
+            "SearXNG use `site:` operators. When set, the automatic LinkedIn/X/shortener exclusions are not applied."
+        ),
         examples=[["docs.python.org"]],
     )
     exclude_domains: list[str] = Field(
@@ -363,7 +379,8 @@ class SearchRequest(BaseModel):
         default=None,
         description=(
             "Inline Firecrawl scrape options for every search result: `formats` plus the normal scrape options. Markdown is used as the "
-            "reranked content; every other returned field is exposed as `extras`. Enterprise-only controls (`zeroDataRetention`, "
+            "reranked content; every other returned field is exposed as `extras`. `storeInCache` defaults to false; set true to opt into "
+            "Firecrawl caching. `rawBase64` above SEARCH_MAX_EXTRAS_CHARS is omitted. Enterprise-only controls (`zeroDataRetention`, "
             "`threatProtection`, `alexandria`, `domainTools`) are rejected."
         ),
         examples=[{"formats": ["markdown", "links"], "onlyMainContent": True}],
@@ -372,7 +389,10 @@ class SearchRequest(BaseModel):
         default=None,
         ge=200,
         le=200_000,
-        description="Truncate each returned `content` after ranking. Snippets and extras are unchanged.",
+        description=(
+            "Truncate each returned `content` after ranking. Snippets are unchanged; inline extras are bounded separately by "
+            "SEARCH_MAX_EXTRAS_CHARS."
+        ),
         examples=[4000],
     )
     allow_degraded: bool = Field(
@@ -414,6 +434,8 @@ class SearchRequest(BaseModel):
             or self.tbs
             or self.country
             or self.location
+            or self.safe is not None
+            or self.highlights is not None
         ):
             raise ValueError("gov cannot be combined with other categories or filters")
         if self.scrape_options is not None:
@@ -421,6 +443,14 @@ class SearchRequest(BaseModel):
                 raise ValueError("scrape_options must be an object")
             if self.depth != "advanced":
                 raise ValueError("scrape_options requires depth=advanced")
+            formats = self.scrape_options.get("formats")
+            if formats is not None:
+                if not isinstance(formats, list) or not formats:
+                    raise ValueError("scrape_options.formats must be a non-empty array")
+                for item in formats:
+                    fmt = item if isinstance(item, str) else item.get("type") if isinstance(item, dict) else None
+                    if fmt not in FIRECRAWL_FORMAT_TYPES:
+                        raise ValueError(f"unsupported scrape format: {fmt!r}")
             unavailable = {
                 "zeroDataRetention",
                 "threatProtection",
@@ -963,12 +993,14 @@ def openapi(request: Request):
 async def search(request: SearchRequest):
     client = await get_client()
     started = time.perf_counter()
+    query_id = hashlib.sha256(request.query.encode("utf-8")).hexdigest()[:12]
+    logger.debug("search query=%r", request.query)
     degraded: dict[str, Any] = {}
     candidates = await discover_candidates(
         client, request.query, request.candidates, request, degraded
     )
     if not candidates:
-        logger.info("search q=%r results=0 elapsed=%.0fms stage=discovery", request.query, _ms(started))
+        logger.info("search q_id=%s results=0 elapsed=%.0fms stage=discovery", query_id, _ms(started))
         return search_response(request.query, [], degraded or None)
 
     discovered = time.perf_counter()
@@ -987,12 +1019,16 @@ async def search(request: SearchRequest):
                 503,
                 "fallback_feature_unavailable",
                 "Firecrawl could not return the requested scrape features and the fallback cannot honor them",
-                {"provider": "crawl4ai", "unsupported": sorted(extraction_loss)},
+                {
+                    "provider": "firecrawl",
+                    "fallback_provider": "crawl4ai",
+                    "unsupported": sorted(extraction_loss),
+                },
                 retryable=True,
                 retry_after=OUTAGE_RETRY_AFTER,
                 hint=(
                     "Retry when Firecrawl recovers, or set allow_degraded=true "
-                    "to accept markdown-only fallback content."
+                    "to accept the formats the fallback can return."
                 ),
             )
         if extraction_loss:
@@ -1017,8 +1053,8 @@ async def search(request: SearchRequest):
             )
     if not pages:
         logger.info(
-            "search q=%r depth=%s candidates=%d results=0 discovery=%.0fms crawl=%.0fms elapsed=%.0fms",
-            request.query, request.depth, len(candidates), _ms(started, discovered), _ms(discovered), _ms(started),
+            "search q_id=%s depth=%s candidates=%d results=0 discovery=%.0fms crawl=%.0fms elapsed=%.0fms",
+            query_id, request.depth, len(candidates), _ms(started, discovered), _ms(discovered), _ms(started),
         )
         return search_response(request.query, [], degraded or None)
 
@@ -1034,8 +1070,8 @@ async def search(request: SearchRequest):
             for result in ranked
         ]
     logger.info(
-        "search q=%r depth=%s candidates=%d pages=%d chunks=%d results=%d discovery=%.0fms crawl=%.0fms rerank=%.0fms elapsed=%.0fms rerank_path=%s",
-        request.query, request.depth, len(candidates), len(pages), len(chunks), len(ranked),
+        "search q_id=%s depth=%s candidates=%d pages=%d chunks=%d results=%d discovery=%.0fms crawl=%.0fms rerank=%.0fms elapsed=%.0fms rerank_path=%s",
+        query_id, request.depth, len(candidates), len(pages), len(chunks), len(ranked),
         _ms(started, discovered), _ms(discovered, crawled), _ms(crawled), _ms(started), rerank_path,
     )
 
@@ -1402,7 +1438,10 @@ def search_filters(request: SearchRequest | None) -> dict[str, Any]:
     if request.ignore_invalid_urls:
         filters["ignoreInvalidURLs"] = True
     if request.scrape_options:
-        filters["scrapeOptions"] = request.scrape_options
+        # Match the direct /crawl privacy default; callers can opt in explicitly.
+        scrape = dict(request.scrape_options)
+        scrape.setdefault("storeInCache", False)
+        filters["scrapeOptions"] = scrape
     return filters
 
 
@@ -1430,21 +1469,6 @@ def fallback_query_and_params(
         if request.country and provider == "brave":
             params["country"] = request.country.upper()
     return query, params
-
-
-def inline_feature_loss(scrape_options: dict[str, Any] | None) -> list[str]:
-    """Crawl4AI can return markdown; any other inline format or option is Firecrawl-only."""
-    if not scrape_options:
-        return []
-    loss = []
-    formats = scrape_options.get("formats")
-    if formats is not None:
-        normalized = [item.get("type") if isinstance(item, dict) else item for item in formats]
-        if normalized != ["markdown"]:
-            loss.append("formats")
-    if set(scrape_options) - {"formats"}:
-        loss.append("options")
-    return loss
 
 
 async def discover_candidates(
@@ -1596,15 +1620,31 @@ async def discover_candidates(
     if answered:
         return candidates[:limit]
     if blocked_features:
+        first_provider = sorted(blocked_features)[0]
+        details = {
+            "providers": failures,
+            "provider": first_provider,
+            "unsupported": blocked_features[first_provider],
+            "unsupported_by_provider": blocked_features,
+        }
+        if failures.get("firecrawl") in (
+            "not_configured",
+            "invalid_configuration",
+            "unsupported_enterprise_option",
+        ):
+            raise AppError(
+                422,
+                "unsupported_feature",
+                "No configured provider can honor the requested search features",
+                details,
+                retryable=False,
+                hint="Remove the unsupported features or configure Firecrawl and retry.",
+            )
         raise AppError(
             503,
             "fallback_feature_unavailable",
             "Firecrawl is unavailable and the fallback cannot honor the requested search features",
-            {
-                "providers": failures,
-                "provider": sorted(blocked_features)[0],
-                "unsupported": blocked_features,
-            },
+            details,
             retryable=True,
             retry_after=max(retry_afters, default=OUTAGE_RETRY_AFTER),
             hint="Retry when Firecrawl recovers, or set allow_degraded=true to accept the reduced result set.",
@@ -1633,6 +1673,24 @@ async def firecrawl_metadata_url_is_public(response: httpx.Response, deadline: f
     return await asyncio.wait_for(is_allowed_public_url(url), timeout=remaining)
 
 
+def cap_inline_extras(extras: Any) -> Any:
+    if not isinstance(extras, dict):
+        return extras
+    capped: dict[str, Any] = {}
+    omitted = []
+    for key, value in extras.items():
+        if isinstance(value, str) and len(value) > MAX_EXTRAS_CHARS:
+            if key == "rawBase64":
+                omitted.append(key)
+                continue
+            capped[key] = value[:MAX_EXTRAS_CHARS] + "\n\n[truncated]"
+        else:
+            capped[key] = value
+    if omitted:
+        capped["omitted"] = omitted
+    return capped
+
+
 async def scrape_firecrawl_candidates(
     client: httpx.AsyncClient,
     candidates: list[dict],
@@ -1646,12 +1704,36 @@ async def scrape_firecrawl_candidates(
     policy_denied: set[str] = set()
     rejected_metadata_urls: set[str] = set()
     seen_candidates: list[str] = []
-    loss = inline_feature_loss(search_request.scrape_options if search_request else None)
+    scrape_options = (search_request.scrape_options if search_request else None) or {}
+    requested_formats = normalize_formats(scrape_options.get("formats"))
+    # The separate Firecrawl scrape already uses these defaults; only options that
+    # actually differ from them are lost when that path is used.
+    fallback_defaults = {
+        "storeInCache": False,
+        "onlyMainContent": True,
+        "maxAge": 0,
+        "skipTlsVerification": False,
+        "parsers": [],
+    }
+    requested_option_keys = {
+        key
+        for key in set(scrape_options) - {"formats"}
+        if scrape_options.get(key) != fallback_defaults.get(key)
+    }
+
+    def mark_missing(formats: list[str]) -> None:
+        if extraction_loss is not None:
+            extraction_loss.update(f"format:{fmt}" for fmt in formats)
+
+    def mark_option_loss() -> None:
+        if requested_option_keys and extraction_loss is not None:
+            extraction_loss.add("options")
 
     def defer(candidate: dict) -> None:
         local_candidates.append(candidate)
-        if loss and extraction_loss is not None:
-            extraction_loss.update(loss)
+        # Crawl4AI returns Markdown; every other requested format is lost.
+        mark_missing([fmt for fmt in requested_formats if fmt != "markdown"])
+        mark_option_loss()
 
     for candidate in candidates:
         url = candidate["url"]
@@ -1662,17 +1744,32 @@ async def scrape_firecrawl_candidates(
         if isinstance(inline, dict):
             page = firecrawl_inline_result(inline, url)
             if page is not None:
-                extras = page.get("extras") or {}
-                metadata = extras.pop("metadata", None) if isinstance(extras, dict) else None
+                reported = page.get("reported_url")
+                if isinstance(reported, str):
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        defer(candidate)
+                        continue
+                    try:
+                        allowed = await asyncio.wait_for(is_allowed_public_url(reported), timeout=remaining)
+                    except asyncio.TimeoutError:
+                        defer(candidate)
+                        continue
+                    if not allowed:
+                        defer(candidate)
+                        continue
+                mark_missing(missing_inline_formats(requested_formats, inline))
+                extras = cap_inline_extras(page.get("extras") or {})
+                metadata = page.get("metadata")
                 pages.append(
                     {
                         "url": page["url"],
                         "title": candidate["title"],
                         "snippet": candidate.get("snippet", ""),
-                        "content": page["content"],
+                        "content": page["content"] or candidate.get("snippet") or candidate["title"],
                         **{
                             key: candidate[key]
-                            for key in ("source", "published_date", "image_url", "position", "category")
+                            for key in ("source", "date", "imageUrl", "position")
                             if candidate.get(key) is not None
                         },
                         **({"metadata": metadata} if isinstance(metadata, dict) else {}),
@@ -1680,6 +1777,30 @@ async def scrape_firecrawl_candidates(
                     }
                 )
                 continue
+            mark_missing(missing_inline_formats(requested_formats, inline))
+            if candidate.get("source") != "images":
+                defer(candidate)
+                continue
+            # Image results still have their own metadata path below.
+
+        if candidate.get("source") == "images":
+            image_fields = {"images": [candidate["imageUrl"]]} if candidate.get("imageUrl") else {}
+            mark_missing(missing_inline_formats(requested_formats, image_fields))
+            pages.append(
+                {
+                    "url": url,
+                    "title": candidate["title"],
+                    "snippet": candidate.get("snippet", ""),
+                    "content": candidate.get("snippet") or candidate["title"],
+                    **{
+                        key: candidate[key]
+                        for key in ("source", "date", "imageUrl", "position")
+                        if candidate.get(key) is not None
+                    },
+                }
+            )
+            continue
+
         if not candidate.get("_firecrawl_source"):
             defer(candidate)
             continue
@@ -1703,6 +1824,9 @@ async def scrape_firecrawl_candidates(
         if remaining <= 0:
             defer(candidate)
             continue
+        # The separate scrape is Markdown-only and does not carry scrapeOptions.
+        mark_missing([fmt for fmt in requested_formats if fmt != "markdown"])
+        mark_option_loss()
         try:
             response = await firecrawl_request(
                 client, "/v2/scrape", firecrawl_scrape_payload(url), timeout=remaining
@@ -1747,6 +1871,11 @@ async def scrape_firecrawl_candidates(
                     "title": candidate["title"],
                     "snippet": candidate.get("snippet", ""),
                     "content": page["content"],
+                    **{
+                        key: candidate[key]
+                        for key in ("source", "date", "imageUrl", "position")
+                        if candidate.get(key) is not None
+                    },
                 }
             )
 
@@ -2039,6 +2168,9 @@ async def crawl_all(
 SEARCH_CRAWLER_CONFIG = {
     "excluded_tags": ["nav", "footer", "header", "aside", "form"],
     "remove_overlay_elements": True,
+    # PDF candidates are routed here from Firecrawl; without this Crawl4AI
+    # returns no Markdown for them.
+    "pdf": True,
     "markdown_generator": {
         "type": "DefaultMarkdownGenerator",
         "params": {
@@ -2998,6 +3130,7 @@ def error_response(
     # transient, everything else needs the caller (or an operator) to change something.
     if retryable is None:
         retryable = status_code >= 500 or status_code == 429
+    correlation_id = request_id_var.get()
     return JSONResponse(
         status_code=status_code,
         content=jsonable_encoder(
@@ -3009,6 +3142,7 @@ def error_response(
                     retryable=retryable,
                     retry_after=retry_after,
                     hint=hint,
+                    request_id=None if correlation_id == "-" else correlation_id,
                 )
             )
         ),
