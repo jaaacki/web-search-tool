@@ -3433,9 +3433,11 @@ async def start_batch_crawl(request: BatchCrawlRequest):
         "urls": urls,
         "ignoreInvalidURLs": request.ignore_invalid_urls,
     }
+    # /v2/batch/scrape takes scrape options at the top level; only /v2/crawl
+    # nests them under scrapeOptions.
     scrape_options = _scrape_options_payload(request.scrape_options)
     if scrape_options:
-        payload["scrapeOptions"] = scrape_options
+        payload.update(scrape_options)
     if request.timeout_ms is not None:
         payload["timeout"] = request.timeout_ms
     try:

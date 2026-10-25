@@ -391,7 +391,8 @@ def test_batch_crawl_filters_non_public_urls_and_polls_batch_endpoint():
                 {
                     "urls": ["https://example.com/a"],
                     "ignoreInvalidURLs": True,
-                    "scrapeOptions": {"formats": ["markdown"], "storeInCache": False},
+                    "formats": ["markdown"],
+                    "storeInCache": False,
                 },
             )
         ], calls
