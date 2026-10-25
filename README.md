@@ -138,7 +138,9 @@ curl 'https://websearch.sparkfn.io/search?q=open%20source%20web%20search%20engin
   `highlights`, `ignore_invalid_urls`.
 - `scrape_options`: inline Firecrawl extraction. Markdown becomes `content`; every other returned
   field lands in `extras` (extras strings are capped by `SEARCH_MAX_EXTRAS_BYTES`; oversized
-  `rawBase64` is omitted). `storeInCache` defaults to false; set true to opt into Firecrawl caching.
+  `rawBase64` is omitted; metadata strings are capped by `SEARCH_MAX_METADATA_BYTES`; the whole
+  extras payload is capped by `SEARCH_MAX_TOTAL_EXTRAS_BYTES`). `storeInCache` defaults to false;
+  set true to opt into Firecrawl caching.
   Requires `depth=advanced`. `actions`, `headers`, and `profile` are rejected unless
   `ALLOW_FIRECRAWL_ACTIONS`, `ALLOW_FIRECRAWL_HEADERS`, or `ALLOW_FIRECRAWL_PROFILE` is enabled.
 - `max_content_chars`: truncate returned `content` after ranking.

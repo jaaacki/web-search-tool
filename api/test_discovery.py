@@ -1653,6 +1653,7 @@ def test_image_results_do_not_attempt_page_extraction():
             )
         )
         assert pages and loss == set(), (pages, loss)
+        assert pages[0]["extras"]["images"] == ["https://img.example/photo.png"], pages
 
         markdown_request = app.SearchRequest(
             query="q", scrape_options={"formats": ["markdown"]}

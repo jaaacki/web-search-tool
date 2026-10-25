@@ -167,6 +167,12 @@ def check_free_surface_contract(client):
     assert bounded[0].extras["rawBase64"].endswith("[truncated]"), bounded[0].extras
     assert bounded[1].extras["summary"].endswith("[truncated]"), bounded[1].extras
 
+    metadata = app.cap_metadata(
+        {"description": "m" * (app.MAX_METADATA_BYTES + 1), "language": "en"}
+    )
+    assert metadata["description"].endswith("[truncated]"), metadata
+    assert metadata["language"] == "en", metadata
+
 
 def demo():
     app.WEBSEARCH_API_KEY = "dependency-contract-test-key"

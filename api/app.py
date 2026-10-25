@@ -79,6 +79,7 @@ FIRECRAWL_FORMAT_REQUIREMENTS = {
 MAX_EXTRAS_BYTES = int(os.getenv("SEARCH_MAX_EXTRAS_BYTES", "200000"))
 # Keep the whole inline-extras payload below the MCP client's 2 MB response cap.
 MAX_TOTAL_EXTRAS_BYTES = int(os.getenv("SEARCH_MAX_TOTAL_EXTRAS_BYTES", "1000000"))
+MAX_METADATA_BYTES = int(os.getenv("SEARCH_MAX_METADATA_BYTES", "20000"))
 # Optional Brave Search API keys (comma-separated) for primary discovery.
 # Empty = SearXNG-only discovery, exactly today's behavior.
 BRAVE_API_KEYS = tuple(key.strip() for key in os.getenv("BRAVE_API_KEYS", "").split(",") if key.strip())
@@ -1706,6 +1707,17 @@ def truncate_bytes(text: str, limit: int) -> str:
     return encoded[: max(limit, 0)].decode("utf-8", "ignore") + "\n\n[truncated]"
 
 
+def cap_metadata(metadata: Any) -> Any:
+    if not isinstance(metadata, dict):
+        return metadata
+    return {
+        key: truncate_bytes(value, MAX_METADATA_BYTES)
+        if isinstance(value, str) and len(value.encode("utf-8")) > MAX_METADATA_BYTES
+        else value
+        for key, value in metadata.items()
+    }
+
+
 def cap_result_extras(
     results: list[SearchResult],
     per_field: int = MAX_EXTRAS_BYTES,
@@ -1830,7 +1842,7 @@ async def scrape_firecrawl_candidates(
                         continue
                 mark_missing(missing_inline_formats(requested_formats, inline))
                 extras = cap_inline_extras(page.get("extras") or {})
-                metadata = page.get("metadata")
+                metadata = cap_metadata(page.get("metadata"))
                 pages.append(
                     {
                         "url": page["url"],
@@ -1855,6 +1867,11 @@ async def scrape_firecrawl_candidates(
 
         if candidate.get("source") == "images":
             image_fields = {"images": [candidate["imageUrl"]]} if candidate.get("imageUrl") else {}
+            image_extras = (
+                cap_inline_extras(image_fields)
+                if "images" in requested_formats and image_fields
+                else {}
+            )
             mark_missing(missing_inline_formats(requested_formats, image_fields))
             pages.append(
                 {
@@ -1867,6 +1884,7 @@ async def scrape_firecrawl_candidates(
                         for key in ("source", "date", "imageUrl", "position")
                         if candidate.get(key) is not None
                     },
+                    **({"extras": image_extras} if image_extras else {}),
                 }
             )
             continue
