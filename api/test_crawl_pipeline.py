@@ -78,7 +78,7 @@ def test_firecrawl_subdeadline_preserves_pages_and_runs_crawl4ai_with_original_d
                 crawl_item(url, f"# Crawl4AI content for {url}") for url in payload["urls"]
             ]}
 
-        async def rerank(_client, _query, chunks, _top_k):
+        async def rerank(_client, _query, chunks, _top_k, **_kwargs):
             return [app.SearchResult(
                 title=item["title"], url=item["url"], snippet=item["snippet"],
                 content=item["content"], score=None,
@@ -112,6 +112,7 @@ def test_firecrawl_subdeadline_preserves_pages_and_runs_crawl4ai_with_original_d
             assert set(results) == {prefix["url"], *expected_local}, results
             assert "Firecrawl content" in results[prefix["url"]], results
             assert all("Crawl4AI content" in results[url] for url in expected_local), results
+            assert response.data.degraded is None, response.data.degraded
 
     try:
         for total in (45.0, 8.0):

@@ -544,7 +544,7 @@ def test_firecrawl_search_is_web_first_and_basic_mode_does_not_scrape():
                 request=httpx.Request("GET", url),
             )
 
-    async def rerank(_client, _query, chunks, top_k):
+    async def rerank(_client, _query, chunks, top_k, **_kwargs):
         seen["chunks"] = chunks
         return [
             app.SearchResult(
@@ -642,14 +642,14 @@ def test_advanced_search_scrapes_firecrawl_once_and_skips_policy_denied_target()
                 request=httpx.Request("GET", url),
             )
 
-    async def crawl_all(_client, candidates, *, deadline=None):
+    async def crawl_all(_client, candidates, *, deadline=None, **_kwargs):
         crawled.extend(item["url"] for item in candidates)
         return [
             {"url": item["url"], "title": item["title"], "snippet": item["snippet"], "content": "# Local page"}
             for item in candidates
         ]
 
-    async def rerank(_client, _query, chunks, top_k):
+    async def rerank(_client, _query, chunks, top_k, **_kwargs):
         return [
             app.SearchResult(
                 title=item["title"], url=item["url"], snippet=item["snippet"], content=item["content"], score=None
@@ -708,11 +708,11 @@ def test_advanced_search_degrades_to_snippets_inside_the_total_budget():
     async def firecrawl(_client, items, _deadline, _request, _loss):
         return [], list(items), set()
 
-    async def crawl(_client, _items, *, deadline=None):
+    async def crawl(_client, _items, *, deadline=None, **_kwargs):
         await asyncio.sleep(max(0, deadline - asyncio.get_running_loop().time()))
         return []
 
-    async def rerank(_client, _query, chunks, top_k):
+    async def rerank(_client, _query, chunks, top_k, **_kwargs):
         return [
             app.SearchResult(
                 title=item["title"],
@@ -769,10 +769,10 @@ def test_advanced_search_does_not_start_a_crawl_when_discovery_used_the_budget()
         await asyncio.sleep(0.8)
         return [dict(item) for item in candidates]
 
-    async def crawl(_client, _items, *, deadline=None):
+    async def crawl(_client, _items, *, deadline=None, **_kwargs):
         raise AssertionError("a crawl started after discovery consumed the budget")
 
-    async def rerank(_client, _query, chunks, top_k):
+    async def rerank(_client, _query, chunks, top_k, **_kwargs):
         return [
             app.SearchResult(
                 title=item["title"],
@@ -798,7 +798,7 @@ def test_advanced_search_does_not_start_a_crawl_when_discovery_used_the_budget()
         response = run(app.search(app.SearchRequest(query="q", candidates=1, depth="advanced")))
         assert response.data.results[0].content == "snip"
         assert response.data.degraded["crawl"]["reason"] == "budget_exhausted"
-        assert any("before crawling" in warning for warning in response.data.warnings)
+        assert any("left no room to crawl" in warning for warning in response.data.warnings)
     finally:
         for name, value in saved.items():
             setattr(app, name, value)
@@ -807,6 +807,171 @@ def test_advanced_search_does_not_start_a_crawl_when_discovery_used_the_budget()
             app.SEARCH_RERANK_RESERVE,
             app.SEARCH_MIN_CRAWL,
         ) = saved_budget
+
+
+def test_advanced_search_keeps_inline_markdown_when_crawling_is_skipped():
+    saved = {
+        name: getattr(app, name)
+        for name in (
+            "discover_candidates",
+            "crawl_all",
+            "rerank",
+            "is_allowed_public_url",
+            "firecrawl_request",
+        )
+    }
+    saved_budget = (
+        app.SEARCH_TOTAL_TIMEOUT,
+        app.SEARCH_RERANK_RESERVE,
+        app.SEARCH_MIN_CRAWL,
+    )
+    url = "https://inline.example/"
+    candidates = [
+        {
+            "url": url,
+            "title": "Inline",
+            "snippet": "snippet only",
+            "_firecrawl_source": True,
+            "_inline": {
+                "markdown": "# Inline page " * 50,
+                "metadata": {"statusCode": 200, "sourceURL": url},
+            },
+        }
+    ]
+
+    async def discovery(_client, _query, _limit, _request, _degraded, deadline=None):
+        return [dict(item) for item in candidates]
+
+    async def no_crawl(_client, _items, *, deadline=None, **_kwargs):
+        raise AssertionError("crawl started with no budget")
+
+    async def allow(_url):
+        return True
+
+    async def no_firecrawl(*_args, **_kwargs):
+        raise AssertionError("an inline page triggered a provider scrape")
+
+    async def rerank(_client, _query, chunks, top_k, **_kwargs):
+        return [
+            app.SearchResult(
+                title=item["title"],
+                url=item["url"],
+                snippet=item.get("snippet"),
+                content=item["content"],
+            )
+            for item in chunks[:top_k]
+        ], "mock"
+
+    app.discover_candidates = discovery
+    app.crawl_all = no_crawl
+    app.rerank = rerank
+    app.is_allowed_public_url = allow
+    app.firecrawl_request = no_firecrawl
+    app.SEARCH_TOTAL_TIMEOUT = 1.2
+    app.SEARCH_RERANK_RESERVE = 0.5
+    app.SEARCH_MIN_CRAWL = 3
+    try:
+        response = run(app.search(app.SearchRequest(query="q", candidates=1, depth="advanced")))
+        assert "Inline page" in response.data.results[0].content, response.data.results
+        assert response.data.degraded is None, response.data.degraded
+    finally:
+        for name, value in saved.items():
+            setattr(app, name, value)
+        (
+            app.SEARCH_TOTAL_TIMEOUT,
+            app.SEARCH_RERANK_RESERVE,
+            app.SEARCH_MIN_CRAWL,
+        ) = saved_budget
+
+
+def test_partial_crawl_fills_dropped_candidates_with_snippets():
+    saved = {
+        name: getattr(app, name)
+        for name in ("discover_candidates", "scrape_firecrawl_candidates", "crawl_all", "rerank")
+    }
+    candidates = [
+        {"url": "https://a.example/", "title": "A", "snippet": "snip a"},
+        {"url": "https://b.example/", "title": "B", "snippet": "snip b"},
+    ]
+
+    async def discovery(_client, _query, _limit, _request, _degraded, deadline=None):
+        return [dict(item) for item in candidates]
+
+    async def firecrawl(_client, items, _deadline, _request, _loss):
+        return [], list(items), set()
+
+    async def crawl(_client, items, *, deadline=None, **_kwargs):
+        return [
+            {
+                "url": items[0]["url"],
+                "title": items[0]["title"],
+                "snippet": items[0]["snippet"],
+                "content": "page a content " * 50,
+            }
+        ]
+
+    async def rerank(_client, _query, chunks, top_k, **_kwargs):
+        return [
+            app.SearchResult(
+                title=item["title"],
+                url=item["url"],
+                snippet=item.get("snippet"),
+                content=item["content"],
+            )
+            for item in chunks[:top_k]
+        ], "mock"
+
+    app.discover_candidates = discovery
+    app.scrape_firecrawl_candidates = firecrawl
+    app.crawl_all = crawl
+    app.rerank = rerank
+    try:
+        response = run(app.search(app.SearchRequest(query="q", candidates=2, depth="advanced")))
+        results = {item.url: item.content for item in response.data.results}
+        assert "page a content" in results["https://a.example/"], results
+        assert results["https://b.example/"] == "snip b", results
+        assert response.data.degraded["crawl"] == {
+            "reason": "partial_crawl",
+            "snippets": 1,
+        }, response.data.degraded
+    finally:
+        for name, value in saved.items():
+            setattr(app, name, value)
+
+
+def test_all_policy_denied_search_returns_422_not_snippets():
+    saved = {
+        name: getattr(app, name)
+        for name in ("discover_candidates", "scrape_firecrawl_candidates", "crawl_all")
+    }
+    candidates = [
+        {"url": "https://a.example/", "title": "A", "snippet": "a"},
+        {"url": "https://b.example/", "title": "B", "snippet": "b"},
+    ]
+
+    async def discovery(_client, _query, _limit, _request, _degraded, deadline=None):
+        return [dict(item) for item in candidates]
+
+    async def firecrawl(_client, _items, _deadline, _request, _loss):
+        return [], [], {item["url"] for item in candidates}
+
+    async def crawl(_client, _items, *, deadline=None, **_kwargs):
+        raise AssertionError("a policy-denied search started a crawl")
+
+    app.discover_candidates = discovery
+    app.scrape_firecrawl_candidates = firecrawl
+    app.crawl_all = crawl
+    try:
+        try:
+            run(app.search(app.SearchRequest(query="q", candidates=2, depth="advanced")))
+        except app.AppError as exc:
+            assert exc.status_code == 422, exc.status_code
+            assert exc.code == "firecrawl_policy_denied", exc.code
+        else:
+            raise AssertionError("policy-denied targets returned a search result")
+    finally:
+        for name, value in saved.items():
+            setattr(app, name, value)
 
 
 def test_fill_uncrawled_with_snippets_matches_trailing_slashes():
@@ -819,6 +984,24 @@ def test_fill_uncrawled_with_snippets_matches_trailing_slashes():
     )
     assert count == 1, filled
     assert [item["url"] for item in filled] == ["https://a.example/", "https://b.example/"]
+    redirected, redirected_count = app.fill_uncrawled_with_snippets(
+        [
+            {
+                "url": "https://a.example/final",
+                "_crawl_request_url": "https://a.example/start",
+                "content": "page",
+            }
+        ],
+        [
+            {"url": "https://a.example/start", "title": "A", "snippet": "a"},
+            {"url": "https://b.example/", "title": "B", "snippet": "b"},
+        ],
+    )
+    assert redirected_count == 1, redirected
+    assert [item["url"] for item in redirected] == [
+        "https://a.example/final",
+        "https://b.example/",
+    ], redirected
 
 
 def test_discovery_outage_returns_retryable_error_and_does_not_retry_searxng():
@@ -1961,7 +2144,7 @@ def test_search_strict_and_degraded_extraction_loss():
         loss.add("format:links")
         return [], candidates, set()
 
-    async def fake_crawl(_client, candidates, *, deadline=None):
+    async def fake_crawl(_client, candidates, *, deadline=None, **_kwargs):
         return [
             {
                 "url": candidate["url"],
@@ -1972,7 +2155,7 @@ def test_search_strict_and_degraded_extraction_loss():
             for candidate in candidates
         ]
 
-    async def fake_rerank(_client, _query, chunks, _top_k):
+    async def fake_rerank(_client, _query, chunks, _top_k, **_kwargs):
         return (
             [
                 app.SearchResult(
