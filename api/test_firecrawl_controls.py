@@ -1770,6 +1770,31 @@ def test_ledger_records_each_provider_attempt_not_just_the_last():
     run(check())
 
 
+def test_policy_denied_scrape_is_not_billed_in_the_ledger():
+    def handler(request):
+        return response(request, status=403, body={"success": False})
+
+    async def check():
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "usage.jsonl"
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                instance = controls(
+                    tmp, [("first@example.test", "key-a")], usage_path=ledger
+                )
+                try:
+                    await instance.request(
+                        client, "/v2/scrape", {"url": "https://example.org"}, timeout=1
+                    )
+                except fc.FirecrawlUnavailable as exc:
+                    assert exc.category == "policy_denied", exc.category
+                else:
+                    raise AssertionError("policy denial returned a scrape")
+            line = json.loads(ledger.read_text().splitlines()[0])
+            assert line["status"] == 403 and line["credits"] == 0.0, line
+
+    run(check())
+
+
 def test_malformed_job_owner_timestamp_does_not_fail_a_billable_crawl():
     def handler(request):
         return response(request, body={"success": True, "id": "job-3", "data": []})
