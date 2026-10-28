@@ -1770,6 +1770,26 @@ def test_ledger_records_each_provider_attempt_not_just_the_last():
     run(check())
 
 
+def test_synchronous_release_removes_a_lease_without_the_event_loop():
+    with tempfile.TemporaryDirectory() as tmp:
+        instance = controls(tmp, [("first@example.test", "key-a")])
+        instance._write_state(
+            {
+                "budgets": {
+                    instance._budgets[0].id: {
+                        "leases": [
+                            {"id": "ours", "expires": time.time() + 60, "for": 60}
+                        ]
+                    }
+                }
+            }
+        )
+        instance._release_sync(
+            fc._Lease(instance._budgets[0], "ours", False, time.time())
+        )
+        assert "leases" not in instance._read_state()["budgets"][instance._budgets[0].id]
+
+
 def test_policy_denied_scrape_is_not_billed_in_the_ledger():
     def handler(request):
         return response(request, status=403, body={"success": False})

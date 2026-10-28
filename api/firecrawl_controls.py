@@ -590,7 +590,10 @@ class FirecrawlControls:
                     try:
                         await self._settle(lease)
                     except asyncio.CancelledError:
-                        pass
+                        # A second cancellation can interrupt the async settle;
+                        # remove the lease synchronously before propagating.
+                        self._release_sync(lease)
+                        raise
 
     async def _admit(
         self, deadline: float, *, exclude: set[str] | None = None
@@ -843,6 +846,41 @@ class FirecrawlControls:
                 return
         finally:
             self._release_lock(fd)
+
+    def _release_sync(self, lease: _Lease) -> None:
+        """Best-effort lease removal that cannot be cancelled by the event loop."""
+        fd = None
+        try:
+            fd = os.open(
+                self._lock_path,
+                os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return
+            try:
+                state = self._read_state()
+                group = self._group_state(state, lease.budget.id)
+                current = group.get("leases")
+                leases = [
+                    item
+                    for item in (current if isinstance(current, list) else [])
+                    if isinstance(item, dict) and item.get("id") != lease.lease_id
+                ]
+                if leases:
+                    group["leases"] = leases
+                else:
+                    group.pop("leases", None)
+                self._write_state(state)
+            except FirecrawlUnavailable:
+                return
+        except OSError:
+            return
+        finally:
+            if fd is not None:
+                self._release_lock(fd)
 
     @staticmethod
     def _job_owner(
