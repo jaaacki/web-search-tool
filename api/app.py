@@ -279,6 +279,12 @@ HEALTH_CACHE_TTL = float(os.getenv("HEALTH_CACHE_TTL", "60"))
 OUTAGE_RETRY_AFTER = float(os.getenv("OUTAGE_RETRY_AFTER", "30"))
 DISCOVERY_TIMEOUT = float(os.getenv("DISCOVERY_TIMEOUT", "20"))
 CRAWL_TIMEOUT = float(os.getenv("CRAWL_TIMEOUT", "45"))
+# The hosted tool call aborts around 30 s. Keep the whole search under that,
+# reserving time to rerank, and degrade to discovery snippets rather than
+# letting the caller's request die mid-crawl.
+SEARCH_TOTAL_TIMEOUT = float(os.getenv("SEARCH_TOTAL_TIMEOUT", "24"))
+SEARCH_RERANK_RESERVE = float(os.getenv("SEARCH_RERANK_RESERVE", "5"))
+SEARCH_MIN_CRAWL = float(os.getenv("SEARCH_MIN_CRAWL", "3"))
 RERANK_TIMEOUT = float(os.getenv("RERANK_TIMEOUT", "4"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "300"))
 # Cheapest chunks the cross-encoder sees: lexical prefilter keeps this many. Sized so a
@@ -487,9 +493,10 @@ class SearchRequest(BaseModel):
     depth: Literal["basic", "advanced"] = Field(
         default="advanced",
         description=(
-            "How much work each result costs. `advanced` (default) crawls every candidate page and returns a cleaned passage from the page "
-            "itself. `basic` skips crawling and returns the discovery snippet as `content`, so it answers in about a second instead of "
-            "5-45; use it when you only need to choose URLs, and re-query with `advanced` (or crawl the URL) once you need the text."
+            "How much work each result costs. `advanced` (default) crawls candidate pages and returns a cleaned passage from the page "
+            "itself, inside a bounded search budget; candidates the budget does not reach come back as discovery snippets with "
+            "`degraded.crawl` and a warning. `basic` skips crawling and returns the discovery snippet as `content`, answering in about "
+            "a second; use it when you only need to choose URLs, and re-query with `advanced` (or crawl the URL) once you need the text."
         ),
         examples=["basic"],
     )
@@ -714,8 +721,9 @@ class SearchData(BaseModel):
     degraded: dict[str, Any] | None = Field(
         default=None,
         description=(
-            "Present only when `allow_degraded` accepted a provider that could not honor every requested feature. "
-            "Names the provider and the unsupported features."
+            "Present when `allow_degraded` accepted a provider that could not honor every requested feature, or when the "
+            "search budget ended before the crawl finished. Provider entries name the provider and unsupported features; "
+            "`crawl` carries `{reason: budget_exhausted, snippets: n}` for candidates returned as discovery snippets."
         ),
     )
     warnings: list[str] = Field(
@@ -1254,7 +1262,10 @@ _HEALTH_CACHE: dict[str, object] = {"at": 0.0, "result": None}
 
 def _record_provider_health(provider: str, status: str) -> None:
     _PROVIDER_HEALTH[provider] = {"at": time.monotonic(), "status": status}
+    # Invalidate both halves of the cache. `at = 0.0` alone still reads as fresh
+    # while process uptime is below HEALTH_CACHE_TTL, reviving an old verdict.
     _HEALTH_CACHE["at"] = 0.0
+    _HEALTH_CACHE["result"] = None
 
 
 def _provider_health(provider: str, configured: bool) -> str:
@@ -1415,24 +1426,38 @@ def openapi(request: Request):
 async def search(request: SearchRequest):
     client = await get_client()
     started = time.perf_counter()
+    loop = asyncio.get_running_loop()
+    budget = max(SEARCH_TOTAL_TIMEOUT, 1.0)
+    search_deadline = loop.time() + budget
+    reserve = min(max(SEARCH_RERANK_RESERVE, 0.0), max(budget - 1.0, 0.0))
+    discovery_deadline = search_deadline - reserve
     query_id = hashlib.sha256(request.query.encode("utf-8")).hexdigest()[:12]
     if LOG_QUERIES:
         logger.debug("search query=%r", request.query)
     degraded: dict[str, Any] = {}
+    budget_notes: list[str] = []
     candidates = await discover_candidates(
-        client, request.query, request.candidates, request, degraded
+        client, request.query, request.candidates, request, degraded, deadline=discovery_deadline
     )
     if not candidates:
         logger.info("search q_id=%s results=0 elapsed=%.0fms stage=discovery", query_id, _ms(started))
-        return search_response(request.query, [], degraded or None)
+        return search_response(request.query, [], degraded or None, budget_notes or None)
 
     discovered = time.perf_counter()
     if request.depth == "basic":
         pages = snippet_pages(candidates)
+    elif search_deadline - reserve - loop.time() < SEARCH_MIN_CRAWL:
+        pages = snippet_pages(candidates)
+        for item in pages:
+            item["_fallback_snippet"] = True
+        degraded["crawl"] = {"reason": "budget_exhausted", "snippets": len(candidates)}
+        budget_notes.append(
+            "search budget was consumed before crawling; results are discovery snippets"
+        )
     else:
-        crawl_started = asyncio.get_running_loop().time()
-        crawl_deadline = crawl_started + CRAWL_TIMEOUT
-        firecrawl_deadline = crawl_started + CRAWL_TIMEOUT / 2
+        crawl_started = loop.time()
+        crawl_deadline = min(crawl_started + CRAWL_TIMEOUT, search_deadline - reserve)
+        firecrawl_deadline = min(crawl_started + CRAWL_TIMEOUT / 2, crawl_deadline)
         extraction_loss: set[str] = set()
         firecrawl_pages, crawl_candidates, policy_denied = await scrape_firecrawl_candidates(
             client, candidates, firecrawl_deadline, request, extraction_loss
@@ -1459,13 +1484,26 @@ async def search(request: SearchRequest):
                 {"provider": "crawl4ai", "unsupported": sorted(extraction_loss)}
             )
         pages = firecrawl_pages
+        crawl_failed = False
         if crawl_candidates:
             try:
                 pages.extend(await crawl_all(client, crawl_candidates, deadline=crawl_deadline))
             except AppError as exc:
-                if not pages:
+                if not pages and loop.time() < crawl_deadline - 0.25:
                     raise
+                crawl_failed = True
                 logger.warning("crawl fallback failed after Firecrawl content (%s)", exc.code)
+        if crawl_failed or loop.time() >= crawl_deadline - 0.25:
+            filled_pages, filled = fill_uncrawled_with_snippets(pages, candidates)
+            if filled:
+                pages = filled_pages
+                degraded["crawl"] = {
+                    "reason": "budget_exhausted",
+                    "snippets": filled,
+                }
+                budget_notes.append(
+                    f"crawl budget exhausted; {filled} candidate(s) returned as discovery snippets"
+                )
         if not pages and policy_denied and not crawl_candidates:
             raise AppError(
                 422,
@@ -1479,13 +1517,23 @@ async def search(request: SearchRequest):
             "search q_id=%s depth=%s candidates=%d results=0 discovery=%.0fms crawl=%.0fms elapsed=%.0fms",
             query_id, request.depth, len(candidates), _ms(started, discovered), _ms(discovered), _ms(started),
         )
-        return search_response(request.query, [], degraded or None)
+        return search_response(request.query, [], degraded or None, budget_notes or None)
 
     crawled = time.perf_counter()
     # Basic pages are already the passages: a snippet is a clean summary, and the
     # boilerplate filter is tuned for page markdown (it drops short lines, which is
     # most snippets), so they go to the reranker as-is.
-    chunks = pages if request.depth == "basic" else chunk_documents(pages)
+    if request.depth == "basic":
+        chunks = pages
+    else:
+        fallback_chunks = [
+            {key: value for key, value in item.items() if key != "_fallback_snippet"}
+            for item in pages
+            if item.get("_fallback_snippet")
+        ]
+        chunks = chunk_documents(
+            [item for item in pages if not item.get("_fallback_snippet")]
+        ) + fallback_chunks
     ranked, rerank_path = await rerank(client, request.query, chunks, request.max_results)
     if request.max_content_chars:
         ranked = [
@@ -1507,7 +1555,7 @@ async def search(request: SearchRequest):
         _ms(started, discovered), _ms(discovered, crawled), _ms(crawled), _ms(started), rerank_path,
     )
 
-    warnings = []
+    warnings = list(budget_notes)
     if extras_truncated or omitted_extras:
         message = "inline extras were truncated to the response budget"
         if omitted_extras:
@@ -1966,12 +2014,17 @@ async def discover_candidates(
     limit: int,
     search_request: SearchRequest | None = None,
     degraded_out: dict[str, Any] | None = None,
+    deadline: float | None = None,
 ):
     loop = asyncio.get_running_loop()
     started = loop.time()
-    deadline = started + max(DISCOVERY_TIMEOUT, 0.0)
+    discovery_deadline = started + max(DISCOVERY_TIMEOUT, 0.0)
+    if deadline is not None:
+        discovery_deadline = min(discovery_deadline, deadline)
     # ponytail: fixed half-stage primary ceiling; adaptive shares only if measured latency needs them.
-    firecrawl_deadline = started + max(DISCOVERY_TIMEOUT, 0.0) / 2
+    firecrawl_deadline = min(
+        started + max(DISCOVERY_TIMEOUT, 0.0) / 2, discovery_deadline
+    )
     failures: dict[str, str] = {}
     retry_afters: list[float] = []
     candidates: list[dict] = []
@@ -2048,12 +2101,12 @@ async def discover_candidates(
                     {"provider": "brave", "unsupported": brave_loss}
                 )
             brave_retry_after: float | None = None
-            remaining = deadline - loop.time()
+            remaining = discovery_deadline - loop.time()
             if remaining > 0:
                 try:
                     brave_query, brave_params = fallback_query_and_params(query, search_request, "brave")
                     brave, brave_retry_after = await BRAVE_POOL.search(
-                        client, brave_query, limit - len(candidates), deadline, brave_params
+                        client, brave_query, limit - len(candidates), discovery_deadline, brave_params
                     )
                     if brave is None:
                         failures["brave"] = "unavailable"
@@ -2084,7 +2137,7 @@ async def discover_candidates(
                 degraded_out.setdefault("providers", []).append(
                     {"provider": "searxng", "unsupported": searxng_loss}
                 )
-            remaining = deadline - loop.time()
+            remaining = discovery_deadline - loop.time()
             if remaining > 0:
                 try:
                     searxng_query, searxng_params = fallback_query_and_params(query, search_request, "searxng")
@@ -2093,7 +2146,7 @@ async def discover_candidates(
                         searxng_query,
                         limit - len(candidates),
                         timeout=remaining,
-                        deadline=deadline,
+                        deadline=discovery_deadline,
                         params=searxng_params,
                     )
                     answered = True
@@ -2670,6 +2723,27 @@ def snippet_pages(candidates: list[dict]) -> list[dict]:
         }
         for item in candidates
     ]
+
+
+def fill_uncrawled_with_snippets(
+    pages: list[dict], candidates: list[dict]
+) -> tuple[list[dict], int]:
+    """Answer with discovery snippets for candidates the crawl budget did not reach."""
+    covered = {
+        str(page.get("url", "")).rstrip("/") for page in pages if isinstance(page, dict)
+    }
+    missing = [
+        item
+        for item in candidates
+        if isinstance(item, dict) and str(item.get("url", "")).rstrip("/") not in covered
+    ]
+    if not missing:
+        return pages, 0
+    snippets = snippet_pages(missing)
+    for item in snippets:
+        # Snippets are already passages; chunk_documents would drop short ones.
+        item["_fallback_snippet"] = True
+    return [*pages, *snippets], len(missing)
 
 
 async def crawl_all(

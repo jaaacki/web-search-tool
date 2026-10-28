@@ -216,6 +216,20 @@ def test_health_is_green_when_engines_answer():
         restore()
 
 
+def test_provider_success_invalidates_a_cached_health_verdict():
+    app.health_cache_reset()
+    try:
+        app._HEALTH_CACHE["at"] = 1.0
+        app._HEALTH_CACHE["result"] = app.AppError(
+            503, "upstream_unavailable", "cached outage"
+        )
+        app._record_provider_health("firecrawl", "ok")
+        assert app._HEALTH_CACHE["result"] is None, app._HEALTH_CACHE
+        assert app._HEALTH_CACHE["at"] == 0.0, app._HEALTH_CACHE
+    finally:
+        app.health_cache_reset()
+
+
 def test_health_service_probes_are_bounded_by_health_timeout():
     seen = []
 

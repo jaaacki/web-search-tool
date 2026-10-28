@@ -87,7 +87,12 @@ def test_firecrawl_subdeadline_preserves_pages_and_runs_crawl4ai_with_original_d
         with patch.object(asyncio, "get_running_loop") as get_loop, patch.object(
             asyncio, "wait_for", wraps=asyncio.wait_for
         ) as wait_for, patch.object(app, "CRAWL_TIMEOUT", total), patch.object(
-            app, "discover_candidates", lambda *_: asyncio.sleep(0, result=candidates)
+            # Keep the total budget out of this stage-budget test: the crawl
+            # deadline must still be exactly CRAWL_TIMEOUT.
+            app, "SEARCH_TOTAL_TIMEOUT", total + 5), patch.object(
+            app, "SEARCH_RERANK_RESERVE", 5
+        ), patch.object(
+            app, "discover_candidates", lambda *_args, **_kwargs: asyncio.sleep(0, result=candidates)
         ), patch.object(app, "get_client", lambda: asyncio.sleep(0, result=None)), patch.object(
             app, "firecrawl_request", firecrawl
         ), patch.object(app, "firecrawl_url_allowed", lambda _: True), patch.object(
@@ -535,7 +540,7 @@ def test_failed_crawls_are_retryable_but_no_candidates_remain_empty():
 
         saved_client, saved_discover = app.get_client, app.discover_candidates
         app.get_client = lambda: asyncio.sleep(0, result=None)
-        app.discover_candidates = lambda *_args: asyncio.sleep(0, result=[])
+        app.discover_candidates = lambda *_args, **_kwargs: asyncio.sleep(0, result=[])
         try:
             result = await app.search(app.SearchRequest(query="no matches"))
         finally:

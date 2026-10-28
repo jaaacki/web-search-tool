@@ -687,6 +687,140 @@ def test_advanced_search_scrapes_firecrawl_once_and_skips_policy_denied_target()
         app.health_cache_reset()
 
 
+def test_advanced_search_degrades_to_snippets_inside_the_total_budget():
+    saved = {
+        name: getattr(app, name)
+        for name in (
+            "discover_candidates",
+            "scrape_firecrawl_candidates",
+            "crawl_all",
+            "rerank",
+        )
+    }
+    candidates = [
+        {"url": "https://a.example/", "title": "A", "snippet": "snip a"},
+        {"url": "https://b.example/", "title": "B", "snippet": "snip b"},
+    ]
+
+    async def discovery(_client, _query, _limit, _request, _degraded, deadline=None):
+        return [dict(item) for item in candidates]
+
+    async def firecrawl(_client, items, _deadline, _request, _loss):
+        return [], list(items), set()
+
+    async def crawl(_client, _items, *, deadline=None):
+        await asyncio.sleep(max(0, deadline - asyncio.get_running_loop().time()))
+        return []
+
+    async def rerank(_client, _query, chunks, top_k):
+        return [
+            app.SearchResult(
+                title=item["title"],
+                url=item["url"],
+                snippet=item.get("snippet"),
+                content=item["content"],
+            )
+            for item in chunks[:top_k]
+        ], "mock"
+
+    saved_budget = (
+        app.SEARCH_TOTAL_TIMEOUT,
+        app.SEARCH_RERANK_RESERVE,
+        app.SEARCH_MIN_CRAWL,
+    )
+    app.discover_candidates = discovery
+    app.scrape_firecrawl_candidates = firecrawl
+    app.crawl_all = crawl
+    app.rerank = rerank
+    app.SEARCH_TOTAL_TIMEOUT = 2.0
+    app.SEARCH_RERANK_RESERVE = 0.5
+    app.SEARCH_MIN_CRAWL = 0.05
+    try:
+        started = time.perf_counter()
+        response = run(app.search(app.SearchRequest(query="q", candidates=2, depth="advanced")))
+        elapsed = time.perf_counter() - started
+        assert elapsed < 3, elapsed
+        assert {item.content for item in response.data.results} == {"snip a", "snip b"}
+        assert response.data.degraded["crawl"]["reason"] == "budget_exhausted"
+        assert any("discovery snippets" in warning for warning in response.data.warnings)
+    finally:
+        for name, value in saved.items():
+            setattr(app, name, value)
+        (
+            app.SEARCH_TOTAL_TIMEOUT,
+            app.SEARCH_RERANK_RESERVE,
+            app.SEARCH_MIN_CRAWL,
+        ) = saved_budget
+
+
+def test_advanced_search_does_not_start_a_crawl_when_discovery_used_the_budget():
+    saved = {
+        name: getattr(app, name)
+        for name in (
+            "discover_candidates",
+            "scrape_firecrawl_candidates",
+            "crawl_all",
+            "rerank",
+        )
+    }
+    candidates = [{"url": "https://a.example/", "title": "A", "snippet": "snip"}]
+
+    async def discovery(_client, _query, _limit, _request, _degraded, deadline=None):
+        await asyncio.sleep(0.8)
+        return [dict(item) for item in candidates]
+
+    async def crawl(_client, _items, *, deadline=None):
+        raise AssertionError("a crawl started after discovery consumed the budget")
+
+    async def rerank(_client, _query, chunks, top_k):
+        return [
+            app.SearchResult(
+                title=item["title"],
+                url=item["url"],
+                snippet=item.get("snippet"),
+                content=item["content"],
+            )
+            for item in chunks[:top_k]
+        ], "mock"
+
+    saved_budget = (
+        app.SEARCH_TOTAL_TIMEOUT,
+        app.SEARCH_RERANK_RESERVE,
+        app.SEARCH_MIN_CRAWL,
+    )
+    app.discover_candidates = discovery
+    app.crawl_all = crawl
+    app.rerank = rerank
+    app.SEARCH_TOTAL_TIMEOUT = 1.2
+    app.SEARCH_RERANK_RESERVE = 0.5
+    app.SEARCH_MIN_CRAWL = 0.3
+    try:
+        response = run(app.search(app.SearchRequest(query="q", candidates=1, depth="advanced")))
+        assert response.data.results[0].content == "snip"
+        assert response.data.degraded["crawl"]["reason"] == "budget_exhausted"
+        assert any("before crawling" in warning for warning in response.data.warnings)
+    finally:
+        for name, value in saved.items():
+            setattr(app, name, value)
+        (
+            app.SEARCH_TOTAL_TIMEOUT,
+            app.SEARCH_RERANK_RESERVE,
+            app.SEARCH_MIN_CRAWL,
+        ) = saved_budget
+
+
+def test_fill_uncrawled_with_snippets_matches_trailing_slashes():
+    filled, count = app.fill_uncrawled_with_snippets(
+        [{"url": "https://a.example/", "content": "page"}],
+        [
+            {"url": "https://a.example", "title": "A", "snippet": "a"},
+            {"url": "https://b.example/", "title": "B", "snippet": "b"},
+        ],
+    )
+    assert count == 1, filled
+    assert [item["url"] for item in filled] == ["https://a.example/", "https://b.example/"]
+
+
 def test_discovery_outage_returns_retryable_error_and_does_not_retry_searxng():
     paths = []
     saved_pool = app.BRAVE_POOL
