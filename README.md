@@ -155,6 +155,13 @@ and the fallback is a subset, `retryable: true`). Both carry `details.provider`,
 carries `data.degraded` and human-readable `warnings`. Every error also carries `request_id` when a
 request id is available. Nothing is silently dropped.
 
+**Search budget.** `SEARCH_TOTAL_TIMEOUT` (24 s) bounds discovery, crawl, and rerank together;
+`SEARCH_RERANK_RESERVE` (5 s) keeps time for reranking and `SEARCH_MIN_CRAWL` (3 s) is the least
+crawl time worth starting. If the budget runs out, `advanced` returns the crawled pages plus
+discovery snippets for the candidates it did not reach, with
+`data.degraded.crawl = {"reason": "budget_exhausted", "snippets": n}` and a warning. This keeps the
+call inside a hosted tool's 30 s exec timeout instead of aborting mid-crawl.
+
 Headless crawl:
 
 ```bash
