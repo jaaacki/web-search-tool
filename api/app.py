@@ -37,6 +37,7 @@ from firecrawl_adapter import (
     scrape_full_result as firecrawl_scrape_full_result,
     scrape_payload as firecrawl_scrape_payload,
     scrape_target_url as firecrawl_scrape_target_url,
+    same_url_identity_relaxed,
     scrape_result as firecrawl_scrape_result,
     search_payload as firecrawl_search_payload,
     search_results as firecrawl_search_results,
@@ -723,7 +724,7 @@ class SearchData(BaseModel):
         description=(
             "Present when `allow_degraded` accepted a provider that could not honor every requested feature, or when the "
             "search budget ended before the crawl finished. Provider entries name the provider and unsupported features; "
-            "`crawl` carries `{reason: budget_exhausted, snippets: n}` for candidates returned as discovery snippets."
+            "`crawl` carries `{reason, snippets: n}` for candidates returned as discovery snippets; reason is `budget_exhausted`, `crawl_failed`, or `partial_crawl`."
         ),
     )
     warnings: list[str] = Field(
@@ -1446,18 +1447,11 @@ async def search(request: SearchRequest):
     discovered = time.perf_counter()
     if request.depth == "basic":
         pages = snippet_pages(candidates)
-    elif search_deadline - reserve - loop.time() < SEARCH_MIN_CRAWL:
-        pages = snippet_pages(candidates)
-        for item in pages:
-            item["_fallback_snippet"] = True
-        degraded["crawl"] = {"reason": "budget_exhausted", "snippets": len(candidates)}
-        budget_notes.append(
-            "search budget was consumed before crawling; results are discovery snippets"
-        )
     else:
         crawl_started = loop.time()
         crawl_deadline = min(crawl_started + CRAWL_TIMEOUT, search_deadline - reserve)
         firecrawl_deadline = min(crawl_started + CRAWL_TIMEOUT / 2, crawl_deadline)
+        crawl_skipped = search_deadline - reserve - crawl_started < SEARCH_MIN_CRAWL
         extraction_loss: set[str] = set()
         firecrawl_pages, crawl_candidates, policy_denied = await scrape_firecrawl_candidates(
             client, candidates, firecrawl_deadline, request, extraction_loss
@@ -1485,25 +1479,21 @@ async def search(request: SearchRequest):
             )
         pages = firecrawl_pages
         crawl_failed = False
-        if crawl_candidates:
+        if not crawl_skipped and crawl_candidates:
             try:
-                pages.extend(await crawl_all(client, crawl_candidates, deadline=crawl_deadline))
+                pages.extend(
+                    await crawl_all(
+                        client,
+                        crawl_candidates,
+                        deadline=crawl_deadline,
+                        keep_request_urls=True,
+                    )
+                )
             except AppError as exc:
                 if not pages and loop.time() < crawl_deadline - 0.25:
                     raise
                 crawl_failed = True
                 logger.warning("crawl fallback failed after Firecrawl content (%s)", exc.code)
-        if crawl_failed or loop.time() >= crawl_deadline - 0.25:
-            filled_pages, filled = fill_uncrawled_with_snippets(pages, candidates)
-            if filled:
-                pages = filled_pages
-                degraded["crawl"] = {
-                    "reason": "budget_exhausted",
-                    "snippets": filled,
-                }
-                budget_notes.append(
-                    f"crawl budget exhausted; {filled} candidate(s) returned as discovery snippets"
-                )
         if not pages and policy_denied and not crawl_candidates:
             raise AppError(
                 422,
@@ -1512,6 +1502,30 @@ async def search(request: SearchRequest):
                 {"provider": "firecrawl"},
                 retryable=False,
             )
+        filled_pages, filled = fill_uncrawled_with_snippets(
+            pages, candidates, exclude=policy_denied
+        )
+        if filled:
+            pages = filled_pages
+            if crawl_skipped:
+                reason, detail = "budget_exhausted", "search budget left no room to crawl"
+            elif crawl_failed and loop.time() < crawl_deadline - 0.25:
+                reason, detail = "crawl_failed", "crawl failed"
+            elif crawl_failed or loop.time() >= crawl_deadline - 0.25:
+                reason, detail = "budget_exhausted", "crawl budget exhausted"
+            else:
+                reason, detail = "partial_crawl", "crawl returned partial coverage"
+            degraded["crawl"] = {"reason": reason, "snippets": filled}
+            budget_notes.append(
+                f"{detail}; {filled} candidate(s) returned as discovery snippets"
+            )
+        if any(
+            isinstance(page, dict) and "_crawl_request_url" in page for page in pages
+        ):
+            pages = [
+                {key: value for key, value in page.items() if key != "_crawl_request_url"}
+                for page in pages
+            ]
     if not pages:
         logger.info(
             "search q_id=%s depth=%s candidates=%d results=0 discovery=%.0fms crawl=%.0fms elapsed=%.0fms",
@@ -1534,7 +1548,13 @@ async def search(request: SearchRequest):
         chunks = chunk_documents(
             [item for item in pages if not item.get("_fallback_snippet")]
         ) + fallback_chunks
-    ranked, rerank_path = await rerank(client, request.query, chunks, request.max_results)
+    ranked, rerank_path = await rerank(
+        client,
+        request.query,
+        chunks,
+        request.max_results,
+        timeout=min(RERANK_TIMEOUT, max(0.05, search_deadline - loop.time())),
+    )
     if request.max_content_chars:
         ranked = [
             result.model_copy(update={"content": truncate_content(result.content, request.max_content_chars)})
@@ -2325,6 +2345,10 @@ async def scrape_firecrawl_candidates(
     extraction_loss: set[str] | None = None,
 ) -> tuple[list[dict], list[dict], set[str]]:
     loop = asyncio.get_running_loop()
+    # Inline content is already fetched and billed; give its final-URL validation
+    # a short grace even when the crawl budget is spent, without extending the
+    # grace per candidate.
+    inline_deadline = max(deadline, loop.time() + 0.25)
     pages = []
     local_candidates = []
     policy_denied: set[str] = set()
@@ -2372,7 +2396,7 @@ async def scrape_firecrawl_candidates(
             if page is not None:
                 reported = page.get("reported_url")
                 if isinstance(reported, str):
-                    remaining = deadline - loop.time()
+                    remaining = inline_deadline - loop.time()
                     if remaining <= 0:
                         defer(candidate)
                         continue
@@ -2489,9 +2513,11 @@ async def scrape_firecrawl_candidates(
             reported_url_allowed = await firecrawl_metadata_url_is_public(response, deadline)
         except asyncio.TimeoutError:
             rejected_metadata_urls.add(url)
+            candidate["_drop"] = True
             continue
         if not reported_url_allowed:
             rejected_metadata_urls.add(url)
+            candidate["_drop"] = True
             continue
         page = firecrawl_scrape_result(response, url)
         if page is None:
@@ -2726,16 +2752,31 @@ def snippet_pages(candidates: list[dict]) -> list[dict]:
 
 
 def fill_uncrawled_with_snippets(
-    pages: list[dict], candidates: list[dict]
+    pages: list[dict],
+    candidates: list[dict],
+    *,
+    exclude: set[str] | None = None,
 ) -> tuple[list[dict], int]:
-    """Answer with discovery snippets for candidates the crawl budget did not reach."""
-    covered = {
-        str(page.get("url", "")).rstrip("/") for page in pages if isinstance(page, dict)
-    }
+    """Answer with discovery snippets for candidates the crawl did not reach."""
+    covered: list[str] = []
+    for page in pages:
+        if not isinstance(page, dict):
+            continue
+        for key in ("_crawl_request_url", "url"):
+            value = page.get(key)
+            if isinstance(value, str) and value:
+                covered.append(value)
+    blocked = [url for url in (exclude or set()) if isinstance(url, str)]
     missing = [
         item
         for item in candidates
-        if isinstance(item, dict) and str(item.get("url", "")).rstrip("/") not in covered
+        if isinstance(item, dict)
+        and not item.get("_drop")
+        and isinstance(item.get("url"), str)
+        and not any(
+            same_url_identity_relaxed(item["url"], url) for url in covered
+        )
+        and not any(same_url_identity_relaxed(item["url"], url) for url in blocked)
     ]
     if not missing:
         return pages, 0
@@ -2747,7 +2788,11 @@ def fill_uncrawled_with_snippets(
 
 
 async def crawl_all(
-    client: httpx.AsyncClient, candidates: list[dict], *, deadline: float | None = None
+    client: httpx.AsyncClient,
+    candidates: list[dict],
+    *,
+    deadline: float | None = None,
+    keep_request_urls: bool = False,
 ):
     """Bulk crawl, recover missing candidates, and keep successes inside one deadline."""
     loop = asyncio.get_running_loop()
@@ -2811,6 +2856,8 @@ async def crawl_all(
         )
     order = {item["url"]: index for index, item in enumerate(allowed)}
     pages.sort(key=lambda page: order.get(page["_crawl_request_url"], len(order)))
+    if keep_request_urls:
+        return pages
     return [{key: value for key, value in page.items() if key != "_crawl_request_url"} for page in pages]
 
 
@@ -4422,7 +4469,13 @@ def trip_rerank_breaker(reason) -> None:
     _rerank_skip_until = time.monotonic() + RERANK_COOLDOWN
 
 
-async def cross_encode(client: httpx.AsyncClient, query: str, documents: list[str]):
+async def cross_encode(
+    client: httpx.AsyncClient,
+    query: str,
+    documents: list[str],
+    *,
+    timeout: float | None = None,
+):
     """Cross-encoder score for every document, in input order; None if unavailable.
 
     Returning None (rather than zeros) is what sends the caller to the lexical-order
@@ -4431,6 +4484,11 @@ async def cross_encode(client: httpx.AsyncClient, query: str, documents: list[st
     if not rerank_available():
         return None
 
+    budget = (
+        RERANK_TIMEOUT
+        if timeout is None
+        else max(0.05, min(RERANK_TIMEOUT, timeout))
+    )
     batches = [documents[i : i + RERANK_BATCH] for i in range(0, len(documents), RERANK_BATCH)]
     try:
         responses = await asyncio.gather(
@@ -4438,7 +4496,7 @@ async def cross_encode(client: httpx.AsyncClient, query: str, documents: list[st
                 client.post(
                     f"{RERANKER_URL}/rerank",
                     json={"query": query, "texts": batch},
-                    timeout=RERANK_TIMEOUT,
+                    timeout=budget,
                 )
                 for batch in batches
             )
@@ -4478,7 +4536,14 @@ def query_aligned_passage(query: str, content: str) -> str:
     return windows[max(range(len(windows)), key=scores.__getitem__)]
 
 
-async def rerank(client: httpx.AsyncClient, query: str, chunks: list[dict], top_k: int):
+async def rerank(
+    client: httpx.AsyncClient,
+    query: str,
+    chunks: list[dict],
+    top_k: int,
+    *,
+    timeout: float | None = None,
+):
     """Two-stage rerank. Returns (results, path) where path names the ranking that won."""
     if not chunks:
         return [], "empty"
@@ -4506,7 +4571,7 @@ async def rerank(client: httpx.AsyncClient, query: str, chunks: list[dict], top_
 
     # Stage 2: cross-encoder over the source-diverse head, blended with discovery rank.
     passages = [query_aligned_passage(query, chunks[index]["content"]) for index in head]
-    cross_encoder = await cross_encode(client, query, passages)
+    cross_encoder = await cross_encode(client, query, passages, timeout=timeout)
     if cross_encoder is None:
         order = [(index, None) for index in by_lexical]
         path = "lexical-fallback"

@@ -205,6 +205,32 @@ def test_rerank_passage_window_captures_late_evidence_and_returns_full_chunk():
     assert result[0].content == content, "full original chunk must remain in the API result"
 
 
+def test_rerank_threads_the_remaining_budget_to_the_cross_encoder():
+    seen = []
+
+    async def fake_cross(_client, _query, documents, *, timeout=None):
+        seen.append(timeout)
+        return [0.5] * len(documents)
+
+    saved = app.cross_encode
+    app.cross_encode = fake_cross
+    try:
+        results, path = asyncio.run(
+            app.rerank(
+                None,
+                "q",
+                [chunk("https://a.example/", "alpha evidence")],
+                1,
+                timeout=1.25,
+            )
+        )
+    finally:
+        app.cross_encode = saved
+    assert seen == [1.25], seen
+    assert path == "cross-encoder", path
+    assert len(results) == 1, results
+
+
 if __name__ == "__main__":
     for name, test in sorted(globals().items()):
         if name.startswith("test_"):
