@@ -38,9 +38,9 @@ MAX_RETRY_AFTER = 86_400.0
 DEFAULT_KEY_CONCURRENCY = 2
 DEFAULT_KEY_RPM = 10
 RATE_WINDOW_SECONDS = 60.0
-# A crashed worker must not strand a slot forever; leases outlive the request
-# (the longest provider timeout is 45 s) but expire within a few minutes.
-MAX_LEASE_SECONDS = 180.0
+# A crashed worker must not strand a slot forever; leases outlive the longest
+# provider timeout (45 s) with slack, and a lost release frees the slot in 60 s.
+MAX_LEASE_SECONDS = 60.0
 JOB_START_ENDPOINTS = ("/v2/crawl", "/v2/batch/scrape")
 JOB_OWNER_TTL_SECONDS = 86_400.0
 MAX_JOB_OWNERS = 500
