@@ -268,6 +268,8 @@ provider call.
 Key-scoped failures rotate within the same request: 401 marks that key invalid for 15 minutes,
 429 applies the advertised `Retry-After`, and 402 is rotated past after the non-billable usage
 check. A positive or unavailable usage answer blocks only that key and lets the next key serve the
+request. Each key is tried at most once per request, so a one-second `Retry-After` cannot turn one
+call into a provider-call loop; the caller gets the earliest cooldown and can retry the whole
 request. Policy 403s and provider 5xx answers are not key-scoped and surface immediately instead
 of being retried on other keys. Failover never bypasses spending caps, rate limits or policy
 restrictions. Crawl and batch job starts record the key that created them, so status polling asks
