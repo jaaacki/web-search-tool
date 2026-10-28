@@ -283,7 +283,8 @@ cap is claimed; configure vendor key spend limits separately. After a 15-minute 
 cooldown, cached usage is refreshed before the key is used again; success clears the guard and
 another 402 restarts it. There are no background or dummy probes. The provider exposes no per-key
 reset date; a verified daily/weekly cap reset is picked up by that recheck. Container
-stop/restart or recreation clears the local `/tmp` state, not the provider's spending limits.
+recreation clears the local `/tmp` state (a restart keeps it) but never the provider's spending
+limits; state timestamps are wall-clock, so a host reboot does not strand slots.
 
 Search gives Firecrawl at most half of each stage's existing budget, including shared-lock waits,
 HTTP and URL validation: 10 of 20 seconds for discovery and 22.5 of 45 seconds for extraction by default.
