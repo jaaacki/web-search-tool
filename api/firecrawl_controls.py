@@ -30,6 +30,19 @@ LOCK_PATH = Path("/tmp/websearch-firecrawl-controls.lock")
 USAGE_RECHECK_SECONDS = 900.0
 USAGE_TAIL_BYTES = 512 * 1024
 MAX_RETRY_AFTER = 86_400.0
+# Firecrawl Free plan: 2 concurrent browsers and 10 requests/minute per team.
+# Keys from separate teams each get their own allowance, so these are per-key
+# ceilings until the provider says otherwise with a 429.
+DEFAULT_KEY_CONCURRENCY = 2
+DEFAULT_KEY_RPM = 10
+RATE_WINDOW_SECONDS = 60.0
+# A crashed worker must not strand a slot forever; leases outlive the request
+# (the longest provider timeout is 45 s) but expire within a few minutes.
+MAX_LEASE_SECONDS = 180.0
+JOB_START_ENDPOINTS = ("/v2/crawl", "/v2/batch/scrape")
+JOB_OWNER_TTL_SECONDS = 3600.0
+MAX_JOB_OWNERS = 500
+JOB_PATH_RE = re.compile(r"/v2/(batch/scrape|crawl)/([A-Za-z0-9_-]{1,200})(?:[/?#]|$)")
 # Firecrawl status pages are chunked at ~10 MB and formats such as screenshot
 # or rawBase64 can be large. Refuse anything bigger instead of materialising it.
 MAX_UPSTREAM_BYTES = int(os.getenv("FIRECRAWL_MAX_RESPONSE_BYTES", str(16 * 1024 * 1024)))
@@ -110,6 +123,32 @@ class _Budget:
     id: str
     keys: tuple[str, ...] = field(repr=False)
     label: str = ""
+
+
+@dataclass(frozen=True)
+class _Lease:
+    budget: _Budget
+    lease_id: str = field(repr=False)
+    recheck: bool = False
+
+
+def _env_positive_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("%s is not an integer; using %d", name, default)
+        return default
+    if value <= 0:
+        logger.warning("%s must be positive; using %d", name, default)
+        return default
+    return value
+
+
+def _earliest(current: float | None, candidate: float) -> float:
+    return candidate if current is None else min(current, candidate)
 
 
 def _key_slots(value: Any) -> tuple[_Budget, ...]:
@@ -292,12 +331,32 @@ class FirecrawlControls:
         state_path: Path = STATE_PATH,
         lock_path: Path = LOCK_PATH,
         usage_path: Path | None = None,
+        concurrency: int | None = None,
+        rpm: int | None = None,
+        rate_window: float | None = None,
+        lease_seconds: float | None = None,
     ):
         self._budgets = budgets
         self._config_error = config_error
         self._state_path = Path(state_path)
         self._lock_path = Path(lock_path)
         self._usage_path = Path(usage_path) if usage_path else None
+        self._concurrency = max(
+            1,
+            concurrency
+            if concurrency is not None
+            else _env_positive_int("FIRECRAWL_KEY_CONCURRENCY", DEFAULT_KEY_CONCURRENCY),
+        )
+        self._rpm = max(
+            1,
+            rpm if rpm is not None else _env_positive_int("FIRECRAWL_KEY_RPM", DEFAULT_KEY_RPM),
+        )
+        self._rate_window = float(
+            rate_window if rate_window is not None else RATE_WINDOW_SECONDS
+        )
+        self._lease_seconds = float(
+            lease_seconds if lease_seconds is not None else MAX_LEASE_SECONDS
+        )
 
     @classmethod
     def from_env(cls) -> "FirecrawlControls":
@@ -362,100 +421,134 @@ class FirecrawlControls:
             "elapsed_ms": None,
         }
         attempted = False
-        fd = await self._acquire_lock(deadline)
+        last_error: FirecrawlUnavailable | None = None
         try:
-            state = self._read_state()
-            exhausted_error = FirecrawlUnavailable(402, "team_exhausted", USAGE_RECHECK_SECONDS, True)
-            last_error = exhausted_error
-            for budget in self._budgets:
-                group = self._group_state(state, budget.id)
-                blocked = await self._refresh_block(client, budget, group, state, deadline)
-                if blocked is not None:
-                    if blocked.category in ("team_exhausted", "invalid_auth"):
-                        last_error = blocked if blocked.category == "invalid_auth" else exhausted_error
-                        continue
-                    raise blocked
-
-                remaining = deadline - loop.time()
-                if remaining <= 0:
-                    raise FirecrawlUnavailable(None, "request_timeout", 1.0, True)
-                key = budget.keys[0]
-                outcome.update(label=budget.label, status=None, credits=0.0, category=None)
-                attempted = True
+            while True:
                 try:
-                    response = await _send_bounded(
-                        client,
-                        "POST",
-                        f"{API_ROOT}{endpoint}",
-                        json_body=request_payload,
-                        headers={"Authorization": "Bearer " + key, "Accept": "application/json"},
-                        timeout=remaining,
-                    )
+                    lease = await self._admit(deadline)
                 except FirecrawlUnavailable as exc:
-                    if exc.category == "response_too_large":
-                        outcome["category"] = "response_too_large"
-                    else:
-                        outcome["category"] = exc.category
+                    # Capacity or deadline exhaustion should not hide the provider
+                    # failure that caused the wait.
+                    if last_error is not None and exc.category in ("team_concurrency", "request_timeout"):
+                        raise last_error
                     raise
-
-                outcome["status"] = response.status_code
-
-                if 200 <= response.status_code < 300:
-                    outcome["credits"] = _response_credits(endpoint, response)
-                    group.clear()
+                attempted = True
+                settled = False
+                outcome.update(label=lease.budget.label, status=None, credits=0.0, category=None)
+                try:
+                    if lease.recheck:
+                        blocked_error = await self._recheck_guard(client, lease, deadline)
+                        if blocked_error is not None:
+                            settled = True
+                            last_error = blocked_error
+                            continue
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        raise last_error or FirecrawlUnavailable(None, "request_timeout", 1.0, True)
                     try:
-                        self._write_state(state)
-                    except FirecrawlUnavailable:
-                        # The provider response is already billable; do not discard it.
-                        logger.warning("firecrawl control state not persisted label=%s", budget.label)
-                    logger.info(
-                        "firecrawl request ok label=%s endpoint=%s elapsed_ms=%d credits=%.1f",
-                        budget.label,
-                        endpoint,
-                        int((timeout - max(0, deadline - loop.time())) * 1000),
-                        outcome["credits"],
-                    )
-                    return response
+                        response = await _send_bounded(
+                            client,
+                            "POST",
+                            f"{API_ROOT}{endpoint}",
+                            json_body=request_payload,
+                            headers={
+                                "Authorization": "Bearer " + lease.budget.keys[0],
+                                "Accept": "application/json",
+                            },
+                            timeout=remaining,
+                        )
+                    except FirecrawlUnavailable as exc:
+                        outcome["category"] = exc.category
+                        raise
 
-                if response.status_code == 402:
-                    usage = await self._credit_usage(client, key, deadline, budget.label)
-                    if usage is not None and usage["remaining"] <= 0:
-                        self._block(group, "team_exhausted", usage)
-                        self._write_state(state)
-                        logger.warning("firecrawl key exhausted label=%s remaining=0", budget.label)
-                        last_error = exhausted_error
+                    status = response.status_code
+                    outcome["status"] = status
+
+                    if 200 <= status < 300:
+                        outcome["credits"] = _response_credits(endpoint, response)
+                        await self._settle(
+                            lease, clear_block=True, job=self._job_owner(endpoint, response)
+                        )
+                        settled = True
+                        logger.info(
+                            "firecrawl request ok label=%s endpoint=%s elapsed_ms=%d credits=%.1f",
+                            lease.budget.label,
+                            endpoint,
+                            int((timeout - max(0, deadline - loop.time())) * 1000),
+                            outcome["credits"],
+                        )
+                        return response
+
+                    if status == 402:
+                        usage = await self._credit_usage(
+                            client, lease.budget.keys[0], deadline, lease.budget.label
+                        )
+                        if usage is not None and usage["remaining"] <= 0:
+                            await self._settle(lease, block="team_exhausted", usage=usage)
+                            logger.warning(
+                                "firecrawl key exhausted label=%s remaining=0", lease.budget.label
+                            )
+                            last_error = FirecrawlUnavailable(
+                                402, "team_exhausted", USAGE_RECHECK_SECONDS, True
+                            )
+                        else:
+                            await self._settle(lease, block="key_cap_or_ambiguous", usage=usage)
+                            logger.warning(
+                                "firecrawl key blocked label=%s category=key_cap_or_ambiguous",
+                                lease.budget.label,
+                            )
+                            last_error = FirecrawlUnavailable(
+                                402, "key_cap_or_ambiguous", USAGE_RECHECK_SECONDS, True
+                            )
+                        settled = True
                         continue
-                    self._block(group, "key_cap_or_ambiguous", usage)
-                    self._write_state(state)
-                    logger.warning("firecrawl key blocked label=%s category=key_cap_or_ambiguous", budget.label)
-                    raise FirecrawlUnavailable(402, "key_cap_or_ambiguous", USAGE_RECHECK_SECONDS, True)
 
-                if response.status_code == 429:
-                    delay = _retry_after(response)
-                    group.clear()
-                    group.update(blocked="rate_limited", next_check=time.monotonic() + delay)
-                    self._write_state(state)
-                    logger.warning("firecrawl key rate limited label=%s retry_after=%.0f", budget.label, delay)
-                    raise FirecrawlUnavailable(429, "rate_limited", delay, True)
+                    if status == 429:
+                        delay = _retry_after(response)
+                        await self._settle(lease, block="rate_limited", retry=delay)
+                        settled = True
+                        logger.warning(
+                            "firecrawl key rate limited label=%s retry_after=%.0f",
+                            lease.budget.label,
+                            delay,
+                        )
+                        last_error = FirecrawlUnavailable(429, "rate_limited", delay, True)
+                        continue
 
-                if response.status_code == 401:
-                    self._block(group, "invalid_auth", None)
-                    self._write_state(state)
-                    logger.warning("firecrawl key blocked label=%s category=invalid_auth", budget.label)
-                    last_error = FirecrawlUnavailable(401, "invalid_auth", USAGE_RECHECK_SECONDS, True)
-                    continue
-                if response.status_code == 403:
-                    raise FirecrawlUnavailable(403, "policy_denied", None, False)
-                if response.status_code >= 500:
-                    raise FirecrawlUnavailable(response.status_code, "provider_unavailable", 1.0, True)
+                    if status == 401:
+                        await self._settle(lease, block="invalid_auth")
+                        settled = True
+                        logger.warning(
+                            "firecrawl key blocked label=%s category=invalid_auth",
+                            lease.budget.label,
+                        )
+                        last_error = FirecrawlUnavailable(
+                            401, "invalid_auth", USAGE_RECHECK_SECONDS, True
+                        )
+                        continue
 
-                # The adapter owns target-level errors (invalid URLs, unsupported
-                # content, no record, and page status); do not rotate a key for them.
-                if endpoint == "/v2/scrape":
-                    outcome["credits"] = 1.0
-                return response
+                    await self._settle(lease)
+                    settled = True
+                    if status == 403:
+                        raise FirecrawlUnavailable(403, "policy_denied", None, False)
+                    if status >= 500:
+                        raise FirecrawlUnavailable(
+                            status, "provider_unavailable", 1.0, True
+                        )
 
-            raise last_error
+                    # The adapter owns target-level errors (invalid URLs, unsupported
+                    # content, no record, and page status); do not rotate a key for them.
+                    if endpoint == "/v2/scrape":
+                        outcome["credits"] = 1.0
+                    return response
+                finally:
+                    if not settled:
+                        # Cancellation, timeout, and transport errors must not strand
+                        # a key slot until its lease expires.
+                        try:
+                            await self._settle(lease)
+                        except asyncio.CancelledError:
+                            pass
         except FirecrawlUnavailable as exc:
             if outcome["status"] is None:
                 outcome["status"] = exc.status
@@ -465,64 +558,260 @@ class FirecrawlControls:
             if attempted:
                 outcome["elapsed_ms"] = int((time.perf_counter() - started) * 1000)
                 self._append_usage(outcome)
+
+    async def _admit(self, deadline: float) -> _Lease:
+        """Reserve the least-loaded healthy key, waiting only when every key is busy."""
+        loop = asyncio.get_running_loop()
+        while True:
+            now = time.monotonic()
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise FirecrawlUnavailable(None, "request_timeout", 1.0, True)
+            fd = await self._acquire_lock(deadline)
+            wait_seconds: float | None = None
+            capacity_limited = False
+            blocked: list[FirecrawlUnavailable] = []
+            try:
+                state = self._read_state()
+                now_wall = time.time()
+                candidates: list[tuple[int, float, int, _Budget, bool]] = []
+                for position, budget in enumerate(self._budgets):
+                    group = self._group_state(state, budget.id)
+                    self._prune_group(group, now, now_wall)
+                    reason = group.get("blocked")
+                    recheck = False
+                    if reason:
+                        next_check = group.get("next_check")
+                        if isinstance(next_check, (int, float)) and now < next_check:
+                            blocked.append(self._block_error(reason, next_check - now))
+                            wait_seconds = _earliest(wait_seconds, next_check - now)
+                            continue
+                        recheck = reason in ("team_exhausted", "key_cap_or_ambiguous")
+                    leases = group.get("leases")
+                    if isinstance(leases, list) and len(leases) >= self._concurrency:
+                        # A slot frees when its request settles, not when its
+                        # crash-backstop lease expires, so poll instead of
+                        # waiting for the expiry timestamp.
+                        capacity_limited = True
+                        continue
+                    rate = group.get("rate")
+                    if isinstance(rate, list) and len(rate) >= self._rpm:
+                        wait_seconds = _earliest(
+                            wait_seconds, rate[0] + self._rate_window - now_wall
+                        )
+                        continue
+                    candidates.append(
+                        (
+                            len(leases) if isinstance(leases, list) else 0,
+                            group.get("last_used") or 0.0,
+                            position,
+                            budget,
+                            recheck,
+                        )
+                    )
+                if candidates:
+                    _, _, _, budget, recheck = min(candidates)
+                    group = self._group_state(state, budget.id)
+                    if group.get("blocked") and not recheck:
+                        self._clear_block(group)
+                    lease_id = os.urandom(8).hex()
+                    expires = now + max(self._lease_seconds, remaining + 5.0)
+                    group.setdefault("leases", []).append(
+                        {"id": lease_id, "expires": expires}
+                    )
+                    group.setdefault("rate", []).append(now_wall)
+                    group["last_used"] = now_wall
+                    self._write_state(state)
+                    return _Lease(budget, lease_id, recheck)
+                if blocked and len(blocked) == len(self._budgets):
+                    if wait_seconds is None or wait_seconds >= remaining:
+                        raise blocked[-1]
+            finally:
+                self._release_lock(fd)
+            wait = remaining if wait_seconds is None else wait_seconds
+            if capacity_limited:
+                # Poll for a released slot; only a cooldown longer than the
+                # request's remaining budget is worth answering immediately.
+                wait = min(wait, 0.05)
+            elif wait >= remaining:
+                raise FirecrawlUnavailable(429, "team_concurrency", max(0.5, wait), True)
+            await asyncio.sleep(max(0.01, min(wait, 0.25)))
+
+    @staticmethod
+    def _block_error(reason: str, retry_after: float) -> FirecrawlUnavailable:
+        if reason == "rate_limited":
+            return FirecrawlUnavailable(429, reason, max(1.0, retry_after), True)
+        if reason == "invalid_auth":
+            return FirecrawlUnavailable(
+                401, reason, max(1.0, min(retry_after, USAGE_RECHECK_SECONDS)), True
+            )
+        if reason == "team_exhausted":
+            return FirecrawlUnavailable(402, reason, USAGE_RECHECK_SECONDS, True)
+        return FirecrawlUnavailable(
+            402, "key_cap_or_ambiguous", max(1.0, min(retry_after, USAGE_RECHECK_SECONDS)), True
+        )
+
+    def _prune_group(self, group: dict[str, Any], now: float, now_wall: float) -> None:
+        leases = group.get("leases")
+        if isinstance(leases, list):
+            live = [
+                lease
+                for lease in leases
+                if isinstance(lease, dict)
+                and isinstance(lease.get("expires"), (int, float))
+                and lease["expires"] > now
+            ]
+            if live:
+                group["leases"] = live
+            else:
+                group.pop("leases", None)
+        rate = group.get("rate")
+        if isinstance(rate, list):
+            live_events = [
+                stamp
+                for stamp in rate
+                if isinstance(stamp, (int, float))
+                and now_wall - stamp < self._rate_window
+            ]
+            if live_events:
+                group["rate"] = live_events
+            else:
+                group.pop("rate", None)
+
+    @staticmethod
+    def _clear_block(group: dict[str, Any]) -> None:
+        for key in ("blocked", "next_check", "remaining", "billing_period_end"):
+            group.pop(key, None)
+
+    async def _recheck_guard(
+        self, client: httpx.AsyncClient, lease: _Lease, deadline: float
+    ) -> FirecrawlUnavailable | None:
+        """Verify an expired exhaustion guard without holding the shared lock."""
+        usage = await self._credit_usage(
+            client, lease.budget.keys[0], deadline, lease.budget.label
+        )
+        if usage is None:
+            await self._settle(lease, block="key_cap_or_ambiguous")
+            return FirecrawlUnavailable(
+                402, "key_cap_or_ambiguous", USAGE_RECHECK_SECONDS, True
+            )
+        if usage["remaining"] <= 0:
+            await self._settle(lease, block="team_exhausted", usage=usage)
+            return FirecrawlUnavailable(402, "team_exhausted", USAGE_RECHECK_SECONDS, True)
+        await self._settle(lease, clear_block=True, release=False)
+        logger.info(
+            "firecrawl key recovered label=%s remaining=%.0f",
+            lease.budget.label,
+            usage["remaining"],
+        )
+        return None
+
+    async def _settle(
+        self,
+        lease: _Lease,
+        *,
+        block: str | None = None,
+        usage: dict[str, Any] | None = None,
+        retry: float = USAGE_RECHECK_SECONDS,
+        clear_block: bool = False,
+        release: bool = True,
+        job: tuple[str, str] | None = None,
+    ) -> None:
+        """Release a slot and record the outcome in one short locked write."""
+        loop = asyncio.get_running_loop()
+        try:
+            fd = await self._acquire_lock(loop.time() + 2.0)
+        except FirecrawlUnavailable:
+            return
+        try:
+            try:
+                state = self._read_state()
+                group = self._group_state(state, lease.budget.id)
+                if release:
+                    leases = [
+                        item
+                        for item in group.get("leases", [])
+                        if item.get("id") != lease.lease_id
+                    ]
+                    if leases:
+                        group["leases"] = leases
+                    else:
+                        group.pop("leases", None)
+                if clear_block:
+                    self._clear_block(group)
+                if block:
+                    self._block(group, block, usage, retry=retry)
+                if job is not None:
+                    self._remember_job_owner(state, lease.budget.id, *job)
+                self._write_state(state)
+            except FirecrawlUnavailable:
+                # The provider outcome is authoritative; a lost state update only
+                # costs one cooldown or one lease that expires on its own.
+                return
+        finally:
             self._release_lock(fd)
 
-    async def _refresh_block(
-        self,
-        client: httpx.AsyncClient,
-        budget: _Budget,
-        group: dict[str, Any],
-        state: dict[str, Any],
-        deadline: float,
-    ) -> FirecrawlUnavailable | None:
-        blocked = group.get("blocked")
-        if not blocked:
+    @staticmethod
+    def _job_owner(
+        endpoint: str, response: httpx.Response
+    ) -> tuple[str, str] | None:
+        if endpoint not in JOB_START_ENDPOINTS:
             return None
-        now = time.monotonic()
-        next_check = group.get("next_check")
-        if isinstance(next_check, (int, float)) and now < next_check:
-            retry_after = max(1.0, next_check - now)
-            if blocked == "team_exhausted":
-                return FirecrawlUnavailable(402, blocked, retry_after, True)
-            if blocked == "rate_limited":
-                return FirecrawlUnavailable(429, blocked, retry_after, True)
-            if blocked == "invalid_auth":
-                return FirecrawlUnavailable(401, blocked, min(retry_after, USAGE_RECHECK_SECONDS), True)
-            return FirecrawlUnavailable(402, "key_cap_or_ambiguous", retry_after, True)
-
-        if blocked == "rate_limited":
-            group.clear()
+        try:
+            payload = response.json()
+        except ValueError:
             return None
-        if blocked == "invalid_auth":
-            # Only a caller retries the same key; another 401 re-arms the guard.
-            group.clear()
-            self._write_state(state)
-            logger.info("firecrawl same-key retry allowed after cooldown label=%s", budget.label)
+        job_id = payload.get("id") if isinstance(payload, dict) else None
+        if not isinstance(job_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", job_id):
             return None
+        return endpoint, job_id
 
-        key = budget.keys[0]
-        usage = await self._credit_usage(client, key, deadline, budget.label)
-        if usage is None:
-            self._block(group, "key_cap_or_ambiguous", None)
-            self._write_state(state)
-            return FirecrawlUnavailable(402, "key_cap_or_ambiguous", USAGE_RECHECK_SECONDS, True)
-        if usage["remaining"] <= 0:
-            self._block(group, "team_exhausted", usage)
-            self._write_state(state)
-            return FirecrawlUnavailable(402, "team_exhausted", USAGE_RECHECK_SECONDS, True)
+    @staticmethod
+    def _remember_job_owner(
+        state: dict[str, Any], budget_id: str, endpoint: str, job_id: str
+    ) -> None:
+        owners = state.setdefault("job_owners", {})
+        if not isinstance(owners, dict):
+            owners = {}
+            state["job_owners"] = owners
+        now = time.time()
+        owners[f"{endpoint}/{job_id}"] = {"budget": budget_id, "at": now}
+        cutoff = now - JOB_OWNER_TTL_SECONDS
+        for key in [
+            key
+            for key, value in owners.items()
+            if not isinstance(value, dict) or value.get("at", 0.0) < cutoff
+        ]:
+            owners.pop(key, None)
+        if len(owners) > MAX_JOB_OWNERS:
+            ordered = sorted(
+                owners.items(),
+                key=lambda item: item[1].get("at", 0.0) if isinstance(item[1], dict) else 0.0,
+            )
+            for key, _ in ordered[: len(ordered) - MAX_JOB_OWNERS]:
+                owners.pop(key, None)
 
-        if blocked == "team_exhausted":
-            group.clear()
-            self._write_state(state)
-            logger.info("firecrawl key recovered label=%s remaining=%.0f", budget.label, usage["remaining"])
+    def _job_key(self, path: str) -> str | None:
+        match = JOB_PATH_RE.search(path)
+        if match is None:
             return None
+        return f"/v2/{match.group(1)}/{match.group(2)}"
 
-        # After this cached usage check, allow one caller-driven request on the same
-        # key; success clears the block, while another 402 re-blocks its slot.
-        self._block(group, "key_cap_or_ambiguous", usage)
-        self._write_state(state)
-        logger.info("firecrawl same-key retry allowed after cooldown label=%s", budget.label)
-        return None
+    def _ordered_budgets(self, path: str) -> tuple[tuple[_Budget, ...], bool]:
+        """The key that started a job is tried first; status reads are free."""
+        job_key = self._job_key(path)
+        if job_key is None:
+            return self._budgets, False
+        try:
+            state = self._read_state()
+        except FirecrawlUnavailable:
+            return self._budgets, False
+        owner = state.get("job_owners", {}).get(job_key)
+        budget_id = owner.get("budget") if isinstance(owner, dict) else None
+        if not isinstance(budget_id, str):
+            return self._budgets, False
+        ordered = tuple(sorted(self._budgets, key=lambda budget: budget.id != budget_id))
+        return ordered, ordered[0].id == budget_id
 
     async def _credit_usage(
         self, client: httpx.AsyncClient, key: str, deadline: float, label: str
@@ -562,14 +851,19 @@ class FirecrawlControls:
         return group
 
     @staticmethod
-    def _block(group: dict[str, Any], reason: str, usage: dict[str, Any] | None) -> None:
-        group.clear()
-        group.update(
-            blocked=reason,
-            next_check=time.monotonic() + USAGE_RECHECK_SECONDS,
-            remaining=usage.get("remaining") if usage else None,
-            billing_period_end=usage.get("period_end") if usage else None,
-        )
+    def _block(
+        group: dict[str, Any],
+        reason: str,
+        usage: dict[str, Any] | None,
+        *,
+        retry: float = USAGE_RECHECK_SECONDS,
+    ) -> None:
+        # Keep live leases, rate history, and recency: other callers may still be
+        # in flight on this key, and blocking one key must not erase their slots.
+        group["blocked"] = reason
+        group["next_check"] = time.monotonic() + retry
+        group["remaining"] = usage.get("remaining") if usage else None
+        group["billing_period_end"] = usage.get("period_end") if usage else None
 
     async def _acquire_lock(self, deadline: float) -> int:
         try:
@@ -629,6 +923,9 @@ class FirecrawlControls:
         jobs = state.get("jobs")
         if isinstance(jobs, dict):
             cleaned["jobs"] = jobs
+        owners = state.get("job_owners")
+        if isinstance(owners, dict):
+            cleaned["job_owners"] = owners
         return cleaned
 
     async def status(
@@ -667,7 +964,8 @@ class FirecrawlControls:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         last = None
-        for index, budget in enumerate(self._budgets):
+        budgets, pinned = self._ordered_budgets(path)
+        for index, budget in enumerate(budgets):
             remaining = deadline - loop.time()
             if remaining <= 0:
                 if last is not None:
@@ -686,7 +984,11 @@ class FirecrawlControls:
                 if exc.category == "transport_timeout" and last is not None:
                     return last
                 raise
-            if response.status_code in (401, 402, 403, 404, 429) and index < len(self._budgets) - 1:
+            if response.status_code == 429 and pinned and index == 0:
+                # Only the owning key can read this job; a 404 from another key
+                # would misreport a throttled poll as a missing job.
+                return response
+            if response.status_code in (401, 402, 403, 404, 429) and index < len(budgets) - 1:
                 last = response
                 continue
             return response

@@ -251,24 +251,39 @@ An explicitly empty value or `[]` disables Firecrawl. Only when this variable is
 explicit labeled entries; they are not auto-labeled. Compose forwards the new variable through its
 existing `env_file`; no unlabeled CSV interface is supported.
 
-An invalid-auth 401 tries the next key; the bad key is skipped for 15 minutes before one
-caller-requested operation may retry it, without a usage probe. A 402 tries the next key only after
-the non-billable team-usage check confirms remaining credits are zero or negative. Keys from the
-same Firecrawl team share credits: another key does not create funds, and the same depleted team
-will still deny requests. Balances are not summed or assumed independent. Positive, malformed or
-unavailable usage leaves a 402 ambiguous/key-cap-like and stops rotation, as do policy 403s and
-rate 429s. Failover never bypasses spending caps, rate limits or policy restrictions. Cooldowns
-are shared across workers by a credential hash, not by list position or label. Renaming a label or
-reordering entries preserves that credential's guard; replacing a credential does not inherit it.
-Logs show the readable label, never the key; control state stores only the credential hash.
+Requests are spread across the pool instead of filling one key: each attempt takes the healthy
+key with the fewest in-flight calls, breaking ties by least-recent use. Every key has its own
+in-flight cap (default 2) and rolling request window (default 10/minute), matching the Firecrawl
+Free plan. Set `FIRECRAWL_KEY_CONCURRENCY` and `FIRECRAWL_KEY_RPM` if the plan changes. These are
+per-key ceilings, but Firecrawl enforces its limits per team, so keys from the same team share the
+real allowance; rotation cannot create capacity or funds that the team does not have.
+
+The shared control lock now covers only state reads and writes. It is never held across a provider
+call, so independent requests run concurrently, up to each key's cap. In-flight slots are recorded
+as time-limited leases, so a crashed worker releases its slot when the lease expires rather than
+blocking the pool forever. When every key is at capacity, a request waits within its own deadline
+for the next free slot; if none frees in time it returns 503 with `Retry-After` and makes no
+provider call.
+
+Key-scoped failures rotate within the same request: 401 marks that key invalid for 15 minutes,
+429 applies the advertised `Retry-After`, and 402 is rotated past after the non-billable usage
+check. A positive or unavailable usage answer blocks only that key and lets the next key serve the
+request. Policy 403s and provider 5xx answers are not key-scoped and surface immediately instead
+of being retried on other keys. Failover never bypasses spending caps, rate limits or policy
+restrictions. Crawl and batch job starts record the key that created them, so status polling asks
+that key first instead of scanning the whole pool.
+
+Cooldowns and guards are shared across workers by a credential hash, not by list position or
+label. Renaming a label or reordering entries preserves that credential's guard; replacing a
+credential does not inherit it. Logs show the readable label, never the key; control state stores
+only the credential hash.
 
 No pay-as-you-go or billing setting is enabled automatically, and no universal per-request credit
-cap is claimed; configure vendor key spend limits separately. After a 15-minute ambiguous-402
-cooldown and cached usage refresh, one caller-requested operation may retry only the same key;
-success clears the guard and another 402 restarts it. There are no background or dummy probes.
-The provider exposes no per-key reset date; a verified daily/weekly cap reset can be retried by
-that same-key operation. Container stop/restart or recreation clears the local `/tmp` guard,
-not the provider's spending limits.
+cap is claimed; configure vendor key spend limits separately. After a 15-minute exhaustion
+cooldown, cached usage is refreshed before the key is used again; success clears the guard and
+another 402 restarts it. There are no background or dummy probes. The provider exposes no per-key
+reset date; a verified daily/weekly cap reset is picked up by that recheck. Container
+stop/restart or recreation clears the local `/tmp` state, not the provider's spending limits.
 
 Search gives Firecrawl at most half of each stage's existing budget, including shared-lock waits,
 HTTP and URL validation: 10 of 20 seconds for discovery and 22.5 of 45 seconds for extraction by default.

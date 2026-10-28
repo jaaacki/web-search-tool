@@ -453,11 +453,12 @@ def test_invalid_auth_fails_over_with_shared_cooldown_and_same_key_recovery():
                     instance._write_state(state)
                     primary_status = 200
                     assert (await instance.request(client, endpoint, payload, timeout=2)).status_code == 200
-                    assert instance._read_state()["budgets"][instance._budgets[0].id] == {}
+                    group = instance._read_state()["budgets"][instance._budgets[0].id]
+                    assert "blocked" not in group and "next_check" not in group, group
 
         run(check())
         assert seen == [(endpoint, "Bearer " + key) for key in (
-            "primary", "sibling", "sibling", "primary", "sibling", "sibling", "primary",
+            "primary", "sibling", "independent", "primary", "sibling", "independent", "primary",
         )], seen
 
 
@@ -480,13 +481,8 @@ def test_reordered_and_replaced_keys_keep_their_own_sanitized_guards():
                 original._write_state(state)
                 reordered = controls(tmp, [("renamed@example.test", secrets[1]),
                                             ("first@example.test", secrets[0]), ("fresh@example.test", secrets[2])])
-                try:
-                    await reordered.request(client, "/v2/search", {"query": "q"}, timeout=1)
-                except fc.FirecrawlUnavailable as exc:
-                    assert exc.category == "key_cap_or_ambiguous"
-                else:
-                    raise AssertionError("reordering lost the cap guard")
-                assert seen == []
+                assert (await reordered.request(client, "/v2/search", {"query": "q"}, timeout=1)).status_code == 200
+                assert seen == ["Bearer " + secrets[2]], seen
                 reordered = controls(tmp, [("renamed@example.test", secrets[0]),
                                             ("fresh@example.test", secrets[2]), ("capped@example.test", secrets[1])])
                 assert (await reordered.request(client, "/v2/search", {"query": "q"}, timeout=1)).status_code == 200
@@ -500,7 +496,7 @@ def test_reordered_and_replaced_keys_keep_their_own_sanitized_guards():
 
     with patch.object(fc, "logger") as logs:
         run(check())
-    assert seen == ["Bearer " + secrets[2], "Bearer " + secrets[3]], seen
+    assert seen == ["Bearer " + secrets[2], "Bearer " + secrets[2], "Bearer " + secrets[3]], seen
     logged = str(logs.mock_calls)
     assert "fresh@example.test" in logged and "first@example.test" in logged, logged
     assert "label=%s" in logged and not any(secret in logged for secret in secrets), logged
@@ -555,9 +551,8 @@ def test_all_skipped_budgets_preserve_the_last_failure_and_safe_metadata():
         assert seen == expected_calls, seen
 
 
-def test_invalid_auth_does_not_bypass_later_cap_policy_rate_or_provider_errors():
-    for status, category in ((402, "key_cap_or_ambiguous"), (403, "policy_denied"),
-                             (429, "rate_limited"), (500, "provider_unavailable")):
+def test_key_scoped_failures_rotate_while_policy_and_provider_errors_surface():
+    for status, category in ((402, "key_cap_or_ambiguous"), (429, "rate_limited")):
         seen = []
 
         def handler(request):
@@ -565,39 +560,78 @@ def test_invalid_auth_does_not_bypass_later_cap_policy_rate_or_provider_errors()
             seen.append((request.url.path, key))
             if request.url.path == fc.CREDIT_USAGE_PATH:
                 return response(request, body={"success": True, "data": {"remainingCredits": 3}})
-            return response(request, 401 if key == "Bearer primary" else status)
+            if key == "Bearer primary":
+                return response(request, 401)
+            if key == "Bearer backup":
+                return response(request, status)
+            return response(request, 200)
 
         async def check():
             with tempfile.TemporaryDirectory() as tmp:
                 async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-                    try:
-                        await controls(tmp, [("first@example.test", "primary"), ("secondary@example.test", "backup"), ("reserve@example.test", "unused")]).request(
-                            client, "/v2/search", {"query": "q"}, timeout=2
-                        )
-                    except fc.FirecrawlUnavailable as exc:
-                        assert (exc.status, exc.category) == (status, category), vars(exc)
-                    else:
-                        raise AssertionError("failover bypassed a non-rotating failure")
+                    result = await controls(
+                        tmp,
+                        [("first@example.test", "primary"),
+                         ("secondary@example.test", "backup"),
+                         ("reserve@example.test", "unused")],
+                    ).request(client, "/v2/search", {"query": "q"}, timeout=2)
+                    assert result.status_code == 200
 
         run(check())
         expected = [("/v2/search", "Bearer primary"), ("/v2/search", "Bearer backup")]
         if status == 402:
             expected.append((fc.CREDIT_USAGE_PATH, "Bearer backup"))
+        expected.append(("/v2/search", "Bearer unused"))
         assert seen == expected, seen
+
+    for failure in (403, 500):
+        seen = []
+
+        def handler(request):
+            key = request.headers["Authorization"]
+            seen.append((request.url.path, key))
+            if request.url.path == fc.CREDIT_USAGE_PATH:
+                return response(request, body={"success": True, "data": {"remainingCredits": 3}})
+            return response(request, 401 if key == "Bearer primary" else failure)
+
+        async def check():
+            with tempfile.TemporaryDirectory() as tmp:
+                async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                    try:
+                        await controls(
+                            tmp,
+                            [("first@example.test", "primary"),
+                             ("secondary@example.test", "backup"),
+                             ("reserve@example.test", "unused")],
+                        ).request(client, "/v2/search", {"query": "q"}, timeout=2)
+                    except fc.FirecrawlUnavailable as exc:
+                        assert (exc.status, exc.category) == (
+                            failure,
+                            "policy_denied" if failure == 403 else "provider_unavailable",
+                        ), vars(exc)
+                    else:
+                        raise AssertionError("provider-wide failure was rotated past")
+
+        run(check())
+        assert seen == [
+            ("/v2/search", "Bearer primary"),
+            ("/v2/search", "Bearer backup"),
+        ], seen
 
 
 def test_auth_recovery_does_not_fail_over_after_policy_or_provider_errors():
     for status, category in ((403, "policy_denied"), (500, "provider_unavailable")):
         seen = []
-        primary_status = 401
+        failing = [False]
 
         def handler(request):
             key = request.headers["Authorization"]
             seen.append(key)
-            return response(request, primary_status if key == "Bearer primary" else 200)
+            if failing[0]:
+                return response(request, status)
+            return response(request, 401 if key == "Bearer primary" else 200)
 
         async def check():
-            nonlocal primary_status
             with tempfile.TemporaryDirectory() as tmp:
                 async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
                     instance = controls(tmp, [("first@example.test", "primary"), ("secondary@example.test", "backup")])
@@ -605,7 +639,7 @@ def test_auth_recovery_does_not_fail_over_after_policy_or_provider_errors():
                     state = instance._read_state()
                     state["budgets"][instance._budgets[0].id]["next_check"] = time.monotonic() - 1
                     instance._write_state(state)
-                    primary_status = status
+                    failing[0] = True
                     for _ in range(2):
                         try:
                             await instance.request(client, "/v2/search", {"query": "q"}, timeout=2)
@@ -615,7 +649,7 @@ def test_auth_recovery_does_not_fail_over_after_policy_or_provider_errors():
                             raise AssertionError("stale auth guard bypassed a later non-rotating failure")
 
         run(check())
-        assert seen == ["Bearer primary", "Bearer backup", "Bearer primary", "Bearer primary"], seen
+        assert seen == ["Bearer primary", "Bearer backup", "Bearer primary", "Bearer backup"], seen
 
 
 def test_auth_failover_uses_the_remaining_operation_deadline():
@@ -638,8 +672,10 @@ def test_auth_failover_uses_the_remaining_operation_deadline():
                     instance, "_release_lock", wraps=instance._release_lock
                 ) as release:
                     assert (await instance.request(client, "/v2/search", {"query": "q"}, timeout=2)).status_code == 200
-                    assert acquire.call_count == release.call_count == 1
-                    assert acquire.call_args.args == (2.0,)
+                    # One short lock for admission, one for the outcome; never
+                    # across the provider call itself.
+                    assert acquire.call_count == release.call_count
+                    assert acquire.call_count >= 2
 
     with patch.object(asyncio, "get_running_loop") as get_loop, patch.object(
         asyncio, "wait_for", wraps=asyncio.wait_for
@@ -670,10 +706,7 @@ def test_positive_balance_blocks_during_cooldown_then_retries_same_key():
     async def check():
         with tempfile.TemporaryDirectory() as tmp:
             async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-                instance = controls(
-                    tmp,
-                    [("first@example.test", "primary"), ("secondary@example.test", "sibling"), ("other@example.test", "independent")],
-                )
+                instance = controls(tmp, [("first@example.test", "primary")])
                 try:
                     await instance.request(client, "/v2/search", {"query": "q"}, timeout=2)
                 except fc.FirecrawlUnavailable as exc:
@@ -716,7 +749,7 @@ def test_unavailable_usage_is_ambiguous_and_fails_closed():
         with tempfile.TemporaryDirectory() as tmp:
             async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
                 try:
-                    await controls(tmp, [("first@example.test", "key-a"), ("secondary@example.test", "key-b") ]).request(
+                    await controls(tmp, [("first@example.test", "key-a")]).request(
                         client, "/v2/search", {"query": "q"}, timeout=2
                     )
                 except fc.FirecrawlUnavailable as exc:
@@ -727,7 +760,7 @@ def test_unavailable_usage_is_ambiguous_and_fails_closed():
 
     run(check())
     assert len(seen) == 2, seen
-    assert all(key != "Bearer key-b" for _, key in seen), seen
+    assert all(key == "Bearer key-a" for _, key in seen), seen
 
 
 def test_malformed_usage_never_confirms_team_exhaustion():
@@ -743,7 +776,7 @@ def test_malformed_usage_never_confirms_team_exhaustion():
         with tempfile.TemporaryDirectory() as tmp:
             async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
                 try:
-                    await controls(tmp, [("first@example.test", "key-a"), ("secondary@example.test", "key-b") ]).request(
+                    await controls(tmp, [("first@example.test", "key-a")]).request(
                         client, "/v2/search", {"query": "q"}, timeout=2
                     )
                 except fc.FirecrawlUnavailable as exc:
@@ -902,14 +935,15 @@ def test_nonfinite_retry_after_uses_bounded_cooldown():
                         except fc.FirecrawlUnavailable as exc:
                             assert exc.category == "rate_limited", exc.category
                             if attempt == 0:
-                                assert exc.retry_after == 60, exc.retry_after
+                                assert 59 <= exc.retry_after <= 60, exc.retry_after
                             else:
                                 assert 1 <= exc.retry_after <= 60, exc.retry_after
                         else:
                             raise AssertionError(f"Retry-After {value} disabled the shared cooldown")
 
         run(check())
-        assert len(seen) == 1, (value, len(seen))
+        # Every healthy key is tried before the shared rate-limit answer.
+        assert len(seen) == 3, (value, len(seen))
 
 
 def test_two_controls_share_one_inflight_limit_and_timeout_waiting_requests():
@@ -917,14 +951,14 @@ def test_two_controls_share_one_inflight_limit_and_timeout_waiting_requests():
         with tempfile.TemporaryDirectory() as tmp:
             transport = SlowTransport()
             clients = [httpx.AsyncClient(transport=transport) for _ in range(2)]
-            instances = [controls(tmp, [("first@example.test", "key")]) for _ in range(2)]
+            instances = [controls(tmp, [("first@example.test", "key")], concurrency=1) for _ in range(2)]
             first = asyncio.create_task(instances[0].request(clients[0], "/v2/search", {"query": "q"}, timeout=1))
             try:
                 await transport.entered.wait()
                 try:
                     await instances[1].request(clients[1], "/v2/search", {"query": "q"}, timeout=0.01)
                 except fc.FirecrawlUnavailable as exc:
-                    assert exc.category == "team_concurrency", exc.category
+                    assert exc.category in ("team_concurrency", "request_timeout"), exc.category
                 else:
                     raise AssertionError("waiting request exceeded its deadline")
                 transport.release.set()
@@ -1076,6 +1110,304 @@ def test_usage_summary_totals_today_and_maps_endpoints():
             "last_request_at": f"{today}T03:00:00Z",
         }, summary
         assert controls(tmp, []).usage_summary() is None
+
+
+def test_sequential_requests_spread_across_the_whole_pool():
+    seen = []
+
+    def handler(request):
+        seen.append(request.headers["Authorization"])
+        return response(request)
+
+    async def check():
+        with tempfile.TemporaryDirectory() as tmp:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                instance = controls(
+                    tmp,
+                    [
+                        ("first@example.test", "key-a"),
+                        ("second@example.test", "key-b"),
+                        ("third@example.test", "key-c"),
+                    ],
+                )
+                for _ in range(6):
+                    result = await instance.request(client, "/v2/search", {"query": "q"}, timeout=1)
+                    assert result.status_code == 200
+
+    run(check())
+    assert seen == ["Bearer key-a", "Bearer key-b", "Bearer key-c"] * 2, seen
+
+
+def test_rate_limited_key_fails_over_within_the_same_request():
+    seen = []
+
+    def handler(request):
+        auth = request.headers["Authorization"]
+        seen.append(auth)
+        if auth == "Bearer key-a":
+            return response(request, 429, {"success": False}, {"Retry-After": "2"})
+        return response(request)
+
+    async def check():
+        with tempfile.TemporaryDirectory() as tmp:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                instance = controls(
+                    tmp, [("first@example.test", "key-a"), ("second@example.test", "key-b")]
+                )
+                assert (
+                    await instance.request(client, "/v2/search", {"query": "q"}, timeout=2)
+                ).status_code == 200
+                state = instance._read_state()
+                assert state["budgets"][instance._budgets[0].id]["blocked"] == "rate_limited", state
+                assert (
+                    await instance.request(client, "/v2/search", {"query": "q"}, timeout=2)
+                ).status_code == 200
+
+    run(check())
+    assert seen == ["Bearer key-a", "Bearer key-b", "Bearer key-b"], seen
+
+
+def test_exhausted_key_fails_over_to_another_team():
+    seen = []
+
+    def handler(request):
+        auth = request.headers["Authorization"]
+        seen.append((request.url.path, auth))
+        if request.url.path == fc.CREDIT_USAGE_PATH:
+            return response(request, body={"success": True, "data": {"remainingCredits": 0}})
+        if auth == "Bearer key-a":
+            return response(request, 402, {"success": False})
+        return response(request)
+
+    async def check():
+        with tempfile.TemporaryDirectory() as tmp:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                instance = controls(
+                    tmp, [("first@example.test", "key-a"), ("second@example.test", "key-b")]
+                )
+                result = await instance.request(client, "/v2/search", {"query": "q"}, timeout=2)
+                assert result.status_code == 200
+                state = instance._read_state()
+                assert state["budgets"][instance._budgets[0].id]["blocked"] == "team_exhausted", state
+
+    run(check())
+    assert seen == [
+        ("/v2/search", "Bearer key-a"),
+        (fc.CREDIT_USAGE_PATH, "Bearer key-a"),
+        ("/v2/search", "Bearer key-b"),
+    ], seen
+
+
+def test_per_key_rate_window_skips_a_hot_key():
+    seen = []
+
+    def handler(request):
+        seen.append(request.headers["Authorization"])
+        return response(request)
+
+    async def check():
+        with tempfile.TemporaryDirectory() as tmp:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                instance = controls(
+                    tmp,
+                    [("first@example.test", "key-a"), ("second@example.test", "key-b")],
+                    rpm=1,
+                    rate_window=0.25,
+                )
+                for _ in range(3):
+                    result = await instance.request(client, "/v2/search", {"query": "q"}, timeout=2)
+                    assert result.status_code == 200
+
+    run(check())
+    assert seen == ["Bearer key-a", "Bearer key-b", "Bearer key-a"], seen
+
+
+def test_expired_leases_do_not_hold_a_key_slot():
+    seen = []
+
+    def handler(request):
+        seen.append(request.headers["Authorization"])
+        return response(request)
+
+    async def check():
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = controls(
+                tmp,
+                [("first@example.test", "key-a"), ("second@example.test", "key-b")],
+                concurrency=1,
+            )
+            instance._write_state(
+                {
+                    "budgets": {
+                        instance._budgets[0].id: {
+                            "leases": [{"id": "dead", "expires": time.monotonic() - 1}]
+                        },
+                        instance._budgets[1].id: {
+                            "leases": [{"id": "live", "expires": time.monotonic() + 60}]
+                        },
+                    }
+                }
+            )
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                result = await instance.request(client, "/v2/search", {"query": "q"}, timeout=1)
+                assert result.status_code == 200
+
+    run(check())
+    assert seen == ["Bearer key-a"], seen
+
+
+def test_parallel_requests_fill_each_key_to_its_concurrency_limit():
+    class PoolTransport(httpx.AsyncBaseTransport):
+        def __init__(self):
+            self.active = 0
+            self.max_active = 0
+            self.by_key = {}
+            self.full = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def handle_async_request(self, request):
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            key = request.headers["Authorization"]
+            self.by_key[key] = self.by_key.get(key, 0) + 1
+            if self.active == 4:
+                self.full.set()
+            await self.release.wait()
+            self.active -= 1
+            return response(request)
+
+    async def check():
+        with tempfile.TemporaryDirectory() as tmp:
+            transport = PoolTransport()
+            async with httpx.AsyncClient(transport=transport) as client:
+                instance = controls(
+                    tmp,
+                    [("first@example.test", "key-a"), ("second@example.test", "key-b")],
+                    concurrency=2,
+                )
+                tasks = [
+                    asyncio.create_task(
+                        instance.request(client, "/v2/search", {"query": "q"}, timeout=2)
+                    )
+                    for _ in range(4)
+                ]
+                try:
+                    await asyncio.wait_for(transport.full.wait(), 1)
+                    try:
+                        await instance.request(client, "/v2/search", {"query": "q"}, timeout=0.05)
+                    except fc.FirecrawlUnavailable as exc:
+                        assert exc.category in ("team_concurrency", "request_timeout"), exc.category
+                    else:
+                        raise AssertionError("a fifth request exceeded every key's concurrency")
+                finally:
+                    transport.release.set()
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+            assert all(getattr(item, "status_code", None) == 200 for item in results), results
+            assert transport.max_active == 4, transport.max_active
+            assert transport.by_key == {"Bearer key-a": 2, "Bearer key-b": 2}, transport.by_key
+
+    run(check())
+
+
+def test_waiting_requests_queue_for_a_released_slot_instead_of_failing():
+    class QueuedTransport(httpx.AsyncBaseTransport):
+        def __init__(self):
+            self.active = 0
+            self.max_active = 0
+
+        async def handle_async_request(self, request):
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            await asyncio.sleep(0.02)
+            self.active -= 1
+            return response(request)
+
+    async def check():
+        with tempfile.TemporaryDirectory() as tmp:
+            transport = QueuedTransport()
+            async with httpx.AsyncClient(transport=transport) as client:
+                instance = controls(
+                    tmp, [("first@example.test", "key-one")], concurrency=2, rpm=1000
+                )
+                results = await asyncio.gather(
+                    *[
+                        instance.request(client, "/v2/search", {"query": "q"}, timeout=2)
+                        for _ in range(6)
+                    ],
+                    return_exceptions=True,
+                )
+            assert all(getattr(item, "status_code", None) == 200 for item in results), results
+            assert transport.max_active == 2, transport.max_active
+
+    run(check())
+
+
+def test_job_start_records_its_key_and_status_uses_it_first():
+    calls = []
+
+    def handler(request):
+        calls.append((request.url.path, request.headers["Authorization"]))
+        if request.url.path == "/v2/crawl":
+            return response(request, body={"success": True, "id": "job-7", "data": []})
+        return response(request, body={"success": True, "status": "completed", "data": []})
+
+    async def check():
+        with tempfile.TemporaryDirectory() as tmp:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                instance = controls(
+                    tmp,
+                    [
+                        ("first@example.test", "key-one"),
+                        ("second@example.test", "key-two"),
+                        ("third@example.test", "key-three"),
+                    ],
+                )
+                for _ in range(2):
+                    assert (
+                        await instance.request(client, "/v2/search", {"query": "q"}, timeout=1)
+                    ).status_code == 200
+                assert (
+                    await instance.request(
+                        client, "/v2/crawl", {"url": "https://example.org", "limit": 1}, timeout=1
+                    )
+                ).status_code == 200
+                calls.clear()
+                result = await instance.status(client, "/v2/crawl/job-7", timeout=1)
+                assert result.status_code == 200
+
+    run(check())
+    assert calls == [("/v2/crawl/job-7", "Bearer key-three")], calls
+
+
+def test_status_returns_owner_throttle_instead_of_a_foreign_404():
+    calls = []
+
+    def handler(request):
+        key = request.headers["Authorization"]
+        calls.append((request.url.path, key))
+        if request.url.path == "/v2/crawl":
+            return response(request, body={"success": True, "id": "job-9", "data": []})
+        if key == "Bearer key-one":
+            return response(request, status=429, body={"success": False}, headers={"Retry-After": "3"})
+        return response(request, status=404, body={"success": False})
+
+    async def check():
+        with tempfile.TemporaryDirectory() as tmp:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                instance = controls(
+                    tmp, [("first@example.test", "key-one"), ("second@example.test", "key-two")]
+                )
+                assert (
+                    await instance.request(
+                        client, "/v2/crawl", {"url": "https://example.org", "limit": 1}, timeout=1
+                    )
+                ).status_code == 200
+                calls.clear()
+                result = await instance.status(client, "/v2/crawl/job-9", timeout=1)
+                assert result.status_code == 429, result.status_code
+
+    run(check())
+    assert calls == [("/v2/crawl/job-9", "Bearer key-one")], calls
 
 
 def demo():
