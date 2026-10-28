@@ -99,7 +99,11 @@ async def _send_bounded(
         raise FirecrawlUnavailable(None, "transport_error", 1.0, True) from exc
     finally:
         if response is not None:
-            await response.aclose()
+            try:
+                await response.aclose()
+            except Exception:
+                # Closing must never mask the provider's answer.
+                pass
     return httpx.Response(status, headers=response_headers, content=body, request=request)
 
 
@@ -420,19 +424,25 @@ class FirecrawlControls:
             "category": None,
             "elapsed_ms": None,
         }
-        attempted = False
+        provider_called = False
+        tried: set[str] = set()
+        earliest_retry: float | None = None
         last_error: FirecrawlUnavailable | None = None
         try:
             while True:
                 try:
-                    lease = await self._admit(deadline)
+                    lease = await self._admit(deadline, exclude=tried)
                 except FirecrawlUnavailable as exc:
                     # Capacity or deadline exhaustion should not hide the provider
                     # failure that caused the wait.
                     if last_error is not None and exc.category in ("team_concurrency", "request_timeout"):
+                        if last_error.category == "rate_limited" and earliest_retry is not None:
+                            last_error = FirecrawlUnavailable(
+                                429, "rate_limited", max(1.0, earliest_retry), True
+                            )
                         raise last_error
                     raise
-                attempted = True
+                tried.add(lease.budget.id)
                 settled = False
                 outcome.update(label=lease.budget.label, status=None, credits=0.0, category=None)
                 try:
@@ -445,6 +455,7 @@ class FirecrawlControls:
                     remaining = deadline - loop.time()
                     if remaining <= 0:
                         raise last_error or FirecrawlUnavailable(None, "request_timeout", 1.0, True)
+                    provider_called = True
                     try:
                         response = await _send_bounded(
                             client,
@@ -512,6 +523,7 @@ class FirecrawlControls:
                             lease.budget.label,
                             delay,
                         )
+                        earliest_retry = _earliest(earliest_retry, delay)
                         last_error = FirecrawlUnavailable(429, "rate_limited", delay, True)
                         continue
 
@@ -555,13 +567,16 @@ class FirecrawlControls:
             outcome["category"] = exc.category
             raise
         finally:
-            if attempted:
+            if provider_called:
                 outcome["elapsed_ms"] = int((time.perf_counter() - started) * 1000)
                 self._append_usage(outcome)
 
-    async def _admit(self, deadline: float) -> _Lease:
+    async def _admit(
+        self, deadline: float, *, exclude: set[str] | None = None
+    ) -> _Lease:
         """Reserve the least-loaded healthy key, waiting only when every key is busy."""
         loop = asyncio.get_running_loop()
+        poll = 0.02
         while True:
             if deadline - loop.time() <= 0:
                 raise FirecrawlUnavailable(None, "request_timeout", 1.0, True)
@@ -577,6 +592,10 @@ class FirecrawlControls:
                 state = self._read_state()
                 candidates: list[tuple[int, float, int, _Budget, bool]] = []
                 for position, budget in enumerate(self._budgets):
+                    if exclude and budget.id in exclude:
+                        # One attempt per key per request: a short Retry-After
+                        # must not turn one call into a provider-call loop.
+                        continue
                     group = self._group_state(state, budget.id)
                     self._prune_group(group, now)
                     reason = group.get("blocked")
@@ -584,8 +603,14 @@ class FirecrawlControls:
                     if reason:
                         next_check = group.get("next_check")
                         if isinstance(next_check, (int, float)) and now < next_check:
-                            blocked.append(self._block_error(reason, next_check - now))
-                            wait_seconds = _earliest(wait_seconds, next_check - now)
+                            retry = next_check - now
+                            granted = group.get("blocked_for")
+                            if isinstance(granted, (int, float)) and retry > granted:
+                                # A backwards clock step must not stretch a
+                                # cooldown past the duration it was set for.
+                                retry = granted
+                            blocked.append(self._block_error(reason, retry))
+                            wait_seconds = _earliest(wait_seconds, retry)
                             continue
                         recheck = reason in ("team_exhausted", "key_cap_or_ambiguous")
                     leases = group.get("leases")
@@ -601,10 +626,13 @@ class FirecrawlControls:
                             wait_seconds, rate[0] + self._rate_window - now
                         )
                         continue
+                    last_used = group.get("last_used")
+                    if not isinstance(last_used, (int, float)):
+                        last_used = 0.0
                     candidates.append(
                         (
                             len(leases) if isinstance(leases, list) else 0,
-                            group.get("last_used") or 0.0,
+                            last_used,
                             position,
                             budget,
                             recheck,
@@ -616,9 +644,9 @@ class FirecrawlControls:
                     if group.get("blocked") and not recheck:
                         self._clear_block(group)
                     lease_id = os.urandom(8).hex()
-                    expires = now + max(self._lease_seconds, remaining + 5.0)
+                    granted = max(self._lease_seconds, remaining + 5.0)
                     group.setdefault("leases", []).append(
-                        {"id": lease_id, "expires": expires}
+                        {"id": lease_id, "expires": now + granted, "for": granted}
                     )
                     group.setdefault("rate", []).append(now)
                     group["last_used"] = now
@@ -638,9 +666,10 @@ class FirecrawlControls:
                 self._release_lock(fd)
             wait = remaining if wait_seconds is None else wait_seconds
             if capacity_limited:
-                # Poll for a released slot; only a cooldown longer than the
-                # request's remaining budget is worth answering immediately.
-                wait = min(wait, 0.05)
+                # Poll for a released slot with backoff; only a cooldown longer
+                # than the request's remaining budget is answered immediately.
+                wait = min(wait, poll)
+                poll = min(poll * 2, 0.1)
             elif wait >= remaining:
                 raise FirecrawlUnavailable(429, "team_concurrency", max(0.5, wait), True)
             await asyncio.sleep(max(0.01, min(wait, 0.25)))
@@ -661,24 +690,41 @@ class FirecrawlControls:
 
     def _prune_group(self, group: dict[str, Any], now: float) -> None:
         leases = group.get("leases")
+        if leases is not None and not isinstance(leases, list):
+            group.pop("leases", None)
+            leases = None
         if isinstance(leases, list):
-            live = [
-                lease
-                for lease in leases
-                if isinstance(lease, dict)
-                and isinstance(lease.get("expires"), (int, float))
-                and lease["expires"] > now
-            ]
+            live = []
+            for lease in leases:
+                if not isinstance(lease, dict):
+                    continue
+                expires = lease.get("expires")
+                if not isinstance(expires, (int, float)):
+                    continue
+                remaining = expires - now
+                if remaining <= 0:
+                    continue
+                # A backwards wall-clock step must not stretch a lease past the
+                # duration it was granted for.
+                granted = lease.get("for")
+                if isinstance(granted, (int, float)) and remaining > granted + 5.0:
+                    continue
+                live.append(lease)
             if live:
                 group["leases"] = live
             else:
                 group.pop("leases", None)
         rate = group.get("rate")
+        if rate is not None and not isinstance(rate, list):
+            group.pop("rate", None)
+            rate = None
         if isinstance(rate, list):
             live_events = [
                 stamp
                 for stamp in rate
-                if isinstance(stamp, (int, float)) and now - stamp < self._rate_window
+                if isinstance(stamp, (int, float))
+                and now - stamp < self._rate_window
+                and stamp <= now + 5.0
             ]
             if live_events:
                 group["rate"] = live_events
@@ -687,7 +733,7 @@ class FirecrawlControls:
 
     @staticmethod
     def _clear_block(group: dict[str, Any]) -> None:
-        for key in ("blocked", "next_check", "remaining", "billing_period_end"):
+        for key in ("blocked", "next_check", "blocked_for", "remaining", "billing_period_end"):
             group.pop(key, None)
 
     async def _recheck_guard(
@@ -870,6 +916,8 @@ class FirecrawlControls:
         # Wall-clock time, not monotonic: this file outlives a host reboot.
         group["blocked"] = reason
         group["next_check"] = time.time() + retry
+        # The duration bounds the cooldown if the wall clock steps backwards.
+        group["blocked_for"] = retry
         group["remaining"] = usage.get("remaining") if usage else None
         group["billing_period_end"] = usage.get("period_end") if usage else None
 

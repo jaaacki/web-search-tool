@@ -1311,6 +1311,31 @@ def test_corrupt_control_state_is_rebuilt_instead_of_blocking_firecrawl():
     assert seen == ["Bearer key-a"], seen
 
 
+def test_malformed_group_fields_do_not_crash_admission():
+    def handler(request):
+        return response(request)
+
+    async def check():
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = controls(tmp, [("first@example.test", "key-a")])
+            instance._write_state(
+                {
+                    "budgets": {
+                        instance._budgets[0].id: {
+                            "last_used": "yesterday",
+                            "leases": "not-a-list",
+                            "rate": {"not": "a list"},
+                        }
+                    }
+                }
+            )
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                result = await instance.request(client, "/v2/search", {"query": "q"}, timeout=1)
+                assert result.status_code == 200
+
+    run(check())
+
+
 def test_parallel_requests_fill_each_key_to_its_concurrency_limit():
     class PoolTransport(httpx.AsyncBaseTransport):
         def __init__(self):
@@ -1466,6 +1491,114 @@ def test_status_keeps_the_owner_error_when_foreign_keys_only_see_404():
         ("/v2/crawl/job-5", "Bearer key-one"),
         ("/v2/crawl/job-5", "Bearer key-two"),
     ], calls
+
+
+def test_credit_guard_rechecks_are_not_counted_as_provider_requests():
+    def handler(request):
+        if request.url.path == fc.CREDIT_USAGE_PATH:
+            return response(request, body={"success": True, "data": {"remainingCredits": 0}})
+        raise AssertionError("a zero-credit guard must not reach the provider")
+
+    async def check():
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "usage.jsonl"
+            instance = controls(tmp, [("first@example.test", "key-a")], usage_path=ledger)
+            instance._write_state(
+                {
+                    "budgets": {
+                        instance._budgets[0].id: {
+                            "blocked": "team_exhausted",
+                            "next_check": time.time() - 1,
+                            "blocked_for": 900,
+                        }
+                    }
+                }
+            )
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                try:
+                    await instance.request(client, "/v2/search", {"query": "q"}, timeout=1)
+                except fc.FirecrawlUnavailable as exc:
+                    assert exc.category == "team_exhausted", exc.category
+                else:
+                    raise AssertionError("zero-credit key served a request")
+            assert not ledger.exists() or ledger.read_text() == "", ledger.read_text()
+
+    run(check())
+
+
+def test_short_retry_after_does_not_loop_on_the_same_key():
+    seen = []
+
+    def handler(request):
+        seen.append(request.headers["Authorization"])
+        return response(request, 429, {"success": False}, {"Retry-After": "1"})
+
+    async def check():
+        with tempfile.TemporaryDirectory() as tmp:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                try:
+                    await controls(tmp, [("first@example.test", "key-a")]).request(
+                        client, "/v2/search", {"query": "q"}, timeout=5
+                    )
+                except fc.FirecrawlUnavailable as exc:
+                    assert exc.category == "rate_limited", exc.category
+                    assert exc.retry_after <= 1.1, exc.retry_after
+                else:
+                    raise AssertionError("rate-limited key returned success")
+
+    run(check())
+    assert seen == ["Bearer key-a"], seen
+
+
+def test_backwards_clock_jump_cannot_stretch_leases_or_cooldowns():
+    def handler(request):
+        if request.url.path == fc.CREDIT_USAGE_PATH:
+            return response(request, body={"success": True, "data": {"remainingCredits": 5}})
+        return response(request)
+
+    async def check():
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = controls(tmp, [("first@example.test", "key-a")], concurrency=1)
+            instance._write_state(
+                {
+                    "budgets": {
+                        instance._budgets[0].id: {
+                            "leases": [
+                                {
+                                    "id": "skewed",
+                                    "expires": time.time() + 3600,
+                                    "for": 180,
+                                }
+                            ]
+                        }
+                    }
+                }
+            )
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                result = await instance.request(client, "/v2/search", {"query": "q"}, timeout=1)
+                assert result.status_code == 200
+
+            instance._write_state(
+                {
+                    "budgets": {
+                        instance._budgets[0].id: {
+                            "blocked": "rate_limited",
+                            "next_check": time.time() + 3600,
+                            "blocked_for": 60,
+                        }
+                    }
+                }
+            )
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                try:
+                    await instance.request(client, "/v2/search", {"query": "q"}, timeout=1)
+                except fc.FirecrawlUnavailable as exc:
+                    assert exc.category == "rate_limited", exc.category
+                    assert exc.retry_after <= 60, exc.retry_after
+                else:
+                    raise AssertionError("skewed cooldown was ignored")
+
+    run(check())
 
 
 def test_rate_limited_pool_reports_the_earliest_cooldown():
