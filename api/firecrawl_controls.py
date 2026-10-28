@@ -560,7 +560,11 @@ class FirecrawlControls:
                     )
                     continue
 
-                credits = 1.0 if endpoint == "/v2/scrape" and status < 500 else 0.0
+                credits = (
+                    1.0
+                    if endpoint == "/v2/scrape" and status != 403 and status < 500
+                    else 0.0
+                )
                 category = (
                     "policy_denied"
                     if status == 403
