@@ -532,7 +532,7 @@ def test_all_skipped_budgets_preserve_the_last_failure_and_safe_metadata():
                             assert exc.retryable is True
                             assert 1 <= exc.retry_after <= fc.USAGE_RECHECK_SECONDS, exc.retry_after
                             if statuses[-1] == 402:
-                                assert exc.retry_after == fc.USAGE_RECHECK_SECONDS, exc.retry_after
+                                assert fc.USAGE_RECHECK_SECONDS - 1 <= exc.retry_after <= fc.USAGE_RECHECK_SECONDS, exc.retry_after
                         else:
                             raise AssertionError("all unavailable budgets returned success")
                     state = json.dumps(controls(tmp, groups)._read_state())
@@ -1087,10 +1087,11 @@ def test_usage_summary_totals_today_and_maps_endpoints():
         ledger.write_text(
             "\n".join(
                 [
+                    # The ledger is append-ordered, so the old day comes first.
+                    json.dumps({"ts": "2020-01-01T00:00:00Z", "endpoint": "/v2/crawl", "status": 200, "credits": 5}),
                     json.dumps({"ts": f"{today}T01:00:00Z", "endpoint": "/v2/search", "status": 200, "credits": 2}),
                     json.dumps({"ts": f"{today}T02:00:00Z", "endpoint": "/v2/scrape", "status": 200, "credits": 1}),
                     json.dumps({"ts": f"{today}T03:00:00Z", "endpoint": "/v2/map", "status": 503, "credits": 0}),
-                    json.dumps({"ts": "2020-01-01T00:00:00Z", "endpoint": "/v2/crawl", "status": 200, "credits": 5}),
                     "not json",
                 ]
             )
@@ -1665,6 +1666,53 @@ def test_status_returns_owner_throttle_instead_of_a_foreign_404():
 
     run(check())
     assert calls == [("/v2/crawl/job-9", "Bearer key-one")], calls
+
+
+def test_usage_summary_scans_past_a_small_chunk_to_the_day_boundary():
+    today = datetime.now(timezone.utc).date().isoformat()
+    with tempfile.TemporaryDirectory() as tmp:
+        ledger = Path(tmp) / "usage.jsonl"
+        old = [
+            json.dumps(
+                {
+                    "ts": "2020-01-01T00:00:00Z",
+                    "endpoint": "/v2/search",
+                    "status": 200,
+                    "credits": 9,
+                }
+            )
+            for _ in range(50)
+        ]
+        fresh = [
+            json.dumps(
+                {"ts": f"{today}T01:00:00Z", "endpoint": "/v2/search", "status": 200, "credits": 2}
+            ),
+            json.dumps(
+                {"ts": f"{today}T02:00:00Z", "endpoint": "/v2/scrape", "status": 200, "credits": 1}
+            ),
+            json.dumps(
+                {
+                    "ts": f"{today}T03:00:00Z",
+                    "endpoint": "/v2/crawl",
+                    "status": 200,
+                    "credits": 7,
+                    "kind": "job_credits",
+                }
+            ),
+        ]
+        ledger.write_text("\n".join(old + fresh) + "\n")
+        instance = controls(tmp, [("first@example.test", "key-a")], usage_path=ledger)
+        with patch.object(fc, "USAGE_SCAN_CHUNK_BYTES", 64):
+            summary = instance.usage_summary()
+        assert summary["requests"] == 2, summary
+        assert summary["credits"] == 10.0, summary
+        assert summary["errors"] == 0, summary
+        assert summary["by_endpoint"] == {
+            "/v2/search": {"requests": 1, "credits": 2.0},
+            "/v2/scrape": {"requests": 1, "credits": 1.0},
+            "/v2/crawl": {"requests": 0, "credits": 7.0},
+        }, summary
+        assert summary["last_request_at"] == f"{today}T02:00:00Z", summary
 
 
 def demo():

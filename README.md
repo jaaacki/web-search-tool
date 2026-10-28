@@ -263,7 +263,8 @@ call, so independent requests run concurrently, up to each key's cap. In-flight 
 as time-limited leases, so a crashed worker releases its slot when the lease expires rather than
 blocking the pool forever. When every key is at capacity, a request waits within its own deadline
 for the next free slot; if none frees in time it returns 503 with `Retry-After` and makes no
-provider call.
+provider call. When every usable key is cooling down instead, it fails fast with that provider
+error and the earliest `Retry-After`, rather than sleeping to its deadline.
 
 Key-scoped failures rotate within the same request: 401 marks that key invalid for 15 minutes,
 429 applies the advertised `Retry-After`, and 402 is rotated past after the non-billable usage
@@ -300,20 +301,21 @@ path instead. An explicit Firecrawl policy denial is not retried through another
 `/crawl` Firecrawl extraction is Markdown-only with PDF/image parsers disabled and Firecrawl cache
 storage disabled; obvious PDF URLs stay local, and any unexpected base64/binary result is discarded.
 `storeInCache: false` is not a zero-data-retention guarantee. Firecrawl document parsing can incur
-per-page charges, so do not add PDF/LLM formats without an explicit budget decision. The shared
-limiter allows one in-flight request per API container across both Uvicorn workers. State and locks
-share the API's `/tmp` tmpfs: worker restarts preserve sharing, but container/host restarts discard
-monotonic-clock deadlines before a new clock epoch can reuse them. Outside this Compose
-configuration, use equivalent ephemeral `/tmp` storage. It does not coordinate multiple API
-containers.
+per-page charges, so do not add PDF/LLM formats without an explicit budget decision. The control
+file and lock live on the API's `/tmp`, shared by both Uvicorn workers. A worker restart preserves
+them; container recreation discards them. Timestamps are wall-clock, so a host reboot neither
+strands slots nor revives stale cooldowns. Outside this Compose configuration, use equivalent
+ephemeral storage shared by all API processes. The file does not coordinate separate API
+containers; each would keep its own view of the pool.
 
 ## Usage log and request IDs
 
 Every HTTP response carries `X-Request-ID` (an incoming valid `X-Request-ID` is echoed; otherwise a
 UUID is generated). The same id appears in log lines and in the Firecrawl usage ledger.
 
-Each Firecrawl search/scrape attempt appends one JSON line to `FIRECRAWL_USAGE_LOG`
-(default `/data/firecrawl-usage.jsonl`, bind-mounted from `./data/api`):
+Each Firecrawl provider request (search, scrape, map, or crawl/batch start) appends one JSON line
+to `FIRECRAWL_USAGE_LOG` (default `/data/firecrawl-usage.jsonl`, bind-mounted from `./data/api`).
+Free credit-guard checks and admission waits are not requests and are not logged:
 
 ```json
 {"ts":"2026-10-25T12:00:00.000+00:00","request_id":"…","endpoint":"/v2/search","label":"primary@example.test","status":200,"credits":2.0,"category":null,"elapsed_ms":612}
@@ -324,8 +326,10 @@ estimate of 2. Scrapes and maps count 1; crawl/batch job starts record 0 because
 is only known after the job runs, but a terminal job status records `creditsUsed` once per job.
 A write failure never fails the request. `/health` returns `data.usage` with today's UTC totals
 (`requests`, `credits`, `errors`, `by_endpoint`, `last_request_at`) only when called with a valid
-`X-API-Key`; the public response is `null`. Set `LOG_FORMAT=json` to make stdout one JSON object
-per line. There is no hard credit or RPM cap: the existing reactive 429/402 guards still apply.
+`X-API-Key`; the public response is `null`. The summary scans the ledger backwards to the start of
+the UTC day, so it stays exact as the file grows, and it is cached for 60 seconds. Set
+`LOG_FORMAT=json` to make stdout one JSON object per line. There is no hard credit or RPM cap
+beyond the per-key admission limits: the reactive 429/402 guards still apply.
 
 ## Crawl stealth defaults
 

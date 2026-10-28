@@ -28,7 +28,8 @@ CREDIT_USAGE_PATH = "/v2/team/credit-usage"
 STATE_PATH = Path("/tmp/websearch-firecrawl-controls.json")
 LOCK_PATH = Path("/tmp/websearch-firecrawl-controls.lock")
 USAGE_RECHECK_SECONDS = 900.0
-USAGE_TAIL_BYTES = 512 * 1024
+USAGE_SCAN_CHUNK_BYTES = 1 << 20
+USAGE_SUMMARY_TTL_SECONDS = 60.0
 MAX_RETRY_AFTER = 86_400.0
 # Firecrawl Free plan: 2 concurrent browsers and 10 requests/minute per team.
 # Keys from separate teams each get their own allowance, so these are per-key
@@ -345,6 +346,7 @@ class FirecrawlControls:
         self._state_path = Path(state_path)
         self._lock_path = Path(lock_path)
         self._usage_path = Path(usage_path) if usage_path else None
+        self._usage_cache: tuple[float, dict[str, Any] | None] | None = None
         self._concurrency = max(
             1,
             concurrency
@@ -652,16 +654,17 @@ class FirecrawlControls:
                     group["last_used"] = now
                     self._write_state(state)
                     return _Lease(budget, lease_id, recheck)
-                if blocked and len(blocked) == len(self._budgets):
-                    if wait_seconds is None or wait_seconds >= remaining:
-                        error = blocked[-1]
-                        if error.category == "rate_limited" and wait_seconds is not None:
-                            # The pool frees at the earliest cooldown, not at the
-                            # last configured key's cooldown.
-                            error = FirecrawlUnavailable(
-                                429, "rate_limited", max(1.0, wait_seconds), True
-                            )
-                        raise error
+                available = len(self._budgets) - (len(exclude) if exclude else 0)
+                if blocked and len(blocked) == available:
+                    # Every usable key has an active cooldown. Waiting inside the
+                    # request would hold it to its deadline and herd every caller
+                    # onto the same expiry, so answer with the earliest retry.
+                    error = blocked[-1]
+                    if wait_seconds is not None:
+                        error = FirecrawlUnavailable(
+                            error.status, error.category, max(1.0, wait_seconds), error.retryable
+                        )
+                    raise error
             finally:
                 self._release_lock(fd)
             wait = remaining if wait_seconds is None else wait_seconds
@@ -1143,43 +1146,45 @@ class FirecrawlControls:
         )
 
     def usage_summary(self) -> dict[str, Any] | None:
-        """Today's (UTC) ledger totals, read from the tail only."""
+        """Today's (UTC) ledger totals, scanned backwards only as far as today."""
         if self._usage_path is None:
             return None
-        try:
-            with self._usage_path.open("rb") as ledger:
-                ledger.seek(0, os.SEEK_END)
-                size = ledger.tell()
-                ledger.seek(max(0, size - USAGE_TAIL_BYTES))
-                raw = ledger.read()
-        except OSError:
+        now = time.monotonic()
+        cached = self._usage_cache
+        if cached is not None and now - cached[0] < USAGE_SUMMARY_TTL_SECONDS:
+            return cached[1]
+        result = self._scan_usage()
+        self._usage_cache = (now, result)
+        return result
+
+    def _scan_usage(self) -> dict[str, Any] | None:
+        if self._usage_path is None:
             return None
-        lines = raw.splitlines()
-        if size > len(raw):
-            lines = lines[1:]  # the first line may be a partial record.
         today = datetime.now(timezone.utc).date().isoformat()
         requests = 0
         credits = 0.0
         errors = 0
         by_endpoint: dict[str, dict[str, float]] = {}
-        last_request_at = None
-        for line in lines:
-            try:
-                entry = json.loads(line)
-            except (TypeError, ValueError):
-                continue
-            if not isinstance(entry, dict) or not str(entry.get("ts", "")).startswith(today):
-                continue
+        last_request_at: str | None = None
+
+        def add(entry: dict[str, Any]) -> None:
+            nonlocal requests, credits, errors, last_request_at
             endpoint = entry.get("endpoint")
             if not isinstance(endpoint, str):
-                continue
+                return
             amount = entry.get("credits")
-            amount = float(amount) if isinstance(amount, (int, float)) and not isinstance(amount, bool) else 0.0
+            amount = (
+                float(amount)
+                if isinstance(amount, (int, float)) and not isinstance(amount, bool)
+                else 0.0
+            )
+            ts = entry.get("ts")
             if entry.get("kind") == "job_credits":
                 credits += amount
-                bucket = by_endpoint.setdefault(endpoint, {"requests": 0, "credits": 0.0})
-                bucket["credits"] += amount
-                continue
+                by_endpoint.setdefault(endpoint, {"requests": 0, "credits": 0.0})[
+                    "credits"
+                ] += amount
+                return
             requests += 1
             credits += amount
             status = entry.get("status")
@@ -1188,9 +1193,51 @@ class FirecrawlControls:
             bucket = by_endpoint.setdefault(endpoint, {"requests": 0, "credits": 0.0})
             bucket["requests"] += 1
             bucket["credits"] += amount
-            ts = entry.get("ts")
-            if isinstance(ts, str):
+            if isinstance(ts, str) and (last_request_at is None or ts > last_request_at):
                 last_request_at = ts
+
+        try:
+            with self._usage_path.open("rb") as ledger:
+                ledger.seek(0, os.SEEK_END)
+                position = ledger.tell()
+                buffer = b""
+                stopped = False
+                while position > 0 and not stopped:
+                    size = min(USAGE_SCAN_CHUNK_BYTES, position)
+                    position -= size
+                    ledger.seek(position)
+                    buffer = ledger.read(size) + buffer
+                    lines = buffer.split(b"\n")
+                    # The first piece may continue into the unread earlier chunk.
+                    buffer = lines.pop(0) if lines else b""
+                    for raw in reversed(lines):
+                        try:
+                            entry = json.loads(raw)
+                        except (TypeError, ValueError):
+                            continue
+                        if not isinstance(entry, dict):
+                            continue
+                        ts = entry.get("ts")
+                        if not isinstance(ts, str):
+                            continue
+                        if not ts.startswith(today):
+                            # The ledger is chronological; everything earlier is old.
+                            stopped = True
+                            break
+                        add(entry)
+                if not stopped and buffer:
+                    try:
+                        entry = json.loads(buffer)
+                    except (TypeError, ValueError):
+                        entry = None
+                    if (
+                        isinstance(entry, dict)
+                        and isinstance(entry.get("ts"), str)
+                        and entry["ts"].startswith(today)
+                    ):
+                        add(entry)
+        except OSError:
+            return None
         return {
             "date": today,
             "requests": requests,
