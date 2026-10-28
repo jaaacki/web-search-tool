@@ -53,7 +53,7 @@ httpx.AsyncClient.__init__ = mock_init
 '''
 
 CLOCK_PROOF = '''
-import asyncio, os, stat, sys
+import asyncio, os, stat, sys, time
 from unittest.mock import patch
 import httpx
 import firecrawl_controls as fc
@@ -75,19 +75,18 @@ async def check():
         try:
             result = await controls.request(client, "/v2/search", {"query": "q"}, timeout=2)
         except fc.FirecrawlUnavailable as exc:
-            assert phase != "fresh" and exc.category == "rate_limited", exc.category
-            if phase == "stale":
-                assert exc.retry_after > 29 * 86400, exc.retry_after
-            else:
-                assert exc.retry_after == 60, exc.retry_after
+            assert phase in {"seed", "share"} and exc.category == "rate_limited", exc.category
+            assert 59 <= exc.retry_after <= 60, exc.retry_after
         else:
-            assert phase == "fresh" and result.status_code == 200
-    assert len(calls) == (1 if phase in {"seed", "fresh"} else 0), calls
+            assert phase in {"stale", "fresh"} and result.status_code == 200
+    assert len(calls) == (0 if phase == "share" else 1), calls
     assert stat.S_IMODE(fc.STATE_PATH.stat().st_mode) == 0o600
     assert stat.S_IMODE(fc.LOCK_PATH.stat().st_mode) == 0o600
 
-# Different processes share one uptime deadline; simulate a new boot at t=1.
-with patch.object(fc.time, "monotonic", return_value=1 if phase in {"stale", "fresh"} else 30 * 86400):
+# Wall-clock cooldowns are shared across workers and expire when time moves on.
+real_time = time.time
+offset = 30 * 86400 if phase == "stale" else 0
+with patch.object(fc.time, "time", side_effect=lambda: real_time() + offset):
     asyncio.run(check())
 print("ok clock", phase)
 '''

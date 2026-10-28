@@ -1092,6 +1092,8 @@ def test_usage_summary_totals_today_and_maps_endpoints():
                     json.dumps({"ts": f"{today}T01:00:00Z", "endpoint": "/v2/search", "status": 200, "credits": 2}),
                     json.dumps({"ts": f"{today}T02:00:00Z", "endpoint": "/v2/scrape", "status": 200, "credits": 1}),
                     json.dumps({"ts": f"{today}T03:00:00Z", "endpoint": "/v2/map", "status": 503, "credits": 0}),
+                    # A future-dated line from a clock step must not hide today.
+                    json.dumps({"ts": "2999-01-01T00:00:00Z", "endpoint": "/v2/search", "status": 200, "credits": 100}),
                     "not json",
                 ]
             )
@@ -1319,20 +1321,24 @@ def test_malformed_group_fields_do_not_crash_admission():
     async def check():
         with tempfile.TemporaryDirectory() as tmp:
             instance = controls(tmp, [("first@example.test", "key-a")])
+            for bad in (
+                {"last_used": "yesterday", "leases": "not-a-list", "rate": {"not": "a list"}},
+                {"leases": None, "rate": None},
+                {"leases": [None], "rate": [None]},
+            ):
+                instance._write_state({"budgets": {instance._budgets[0].id: bad}})
+                async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                    result = await instance.request(client, "/v2/search", {"query": "q"}, timeout=1)
+                    assert result.status_code == 200
+
+            # A malformed lease list must not break the post-response release.
             instance._write_state(
-                {
-                    "budgets": {
-                        instance._budgets[0].id: {
-                            "last_used": "yesterday",
-                            "leases": "not-a-list",
-                            "rate": {"not": "a list"},
-                        }
-                    }
-                }
+                {"budgets": {instance._budgets[0].id: {"leases": [None, "x"]}}}
             )
-            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-                result = await instance.request(client, "/v2/search", {"query": "q"}, timeout=1)
-                assert result.status_code == 200
+            await instance._settle(
+                fc._Lease(instance._budgets[0], "ours", False, time.time())
+            )
+            assert "leases" not in instance._read_state()["budgets"][instance._budgets[0].id]
 
     run(check())
 
@@ -1575,10 +1581,10 @@ def test_backwards_clock_jump_cannot_stretch_leases_or_cooldowns():
                     }
                 }
             )
-            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-                result = await instance.request(client, "/v2/search", {"query": "q"}, timeout=1)
-                assert result.status_code == 200
-
+            state = instance._read_state()
+            group = instance._group_state(state, instance._budgets[0].id)
+            instance._prune_group(group, time.time())
+            assert group["leases"][0]["expires"] - time.time() <= 181, group
             instance._write_state(
                 {
                     "budgets": {
@@ -1591,13 +1597,9 @@ def test_backwards_clock_jump_cannot_stretch_leases_or_cooldowns():
                 }
             )
             async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-                try:
-                    await instance.request(client, "/v2/search", {"query": "q"}, timeout=1)
-                except fc.FirecrawlUnavailable as exc:
-                    assert exc.category == "rate_limited", exc.category
-                    assert exc.retry_after <= 60, exc.retry_after
-                else:
-                    raise AssertionError("skewed cooldown was ignored")
+                # The skew is past the granted cooldown, so the key recovers.
+                result = await instance.request(client, "/v2/search", {"query": "q"}, timeout=1)
+                assert result.status_code == 200
 
     run(check())
 
@@ -1713,6 +1715,185 @@ def test_usage_summary_scans_past_a_small_chunk_to_the_day_boundary():
             "/v2/crawl": {"requests": 0, "credits": 7.0},
         }, summary
         assert summary["last_request_at"] == f"{today}T02:00:00Z", summary
+
+
+def test_local_rate_window_is_reported_as_rate_limited_not_an_outage():
+    seen = []
+
+    def handler(request):
+        seen.append(request.headers["Authorization"])
+        return response(request)
+
+    async def check():
+        with tempfile.TemporaryDirectory() as tmp:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                instance = controls(tmp, [("first@example.test", "key-a")], rpm=1)
+                assert (
+                    await instance.request(client, "/v2/search", {"query": "q"}, timeout=1)
+                ).status_code == 200
+                try:
+                    await instance.request(client, "/v2/search", {"query": "q"}, timeout=1)
+                except fc.FirecrawlUnavailable as exc:
+                    assert exc.category == "rate_limited", exc.category
+                    assert exc.retry_after >= 1, exc.retry_after
+                else:
+                    raise AssertionError("local rate window admitted a second call")
+
+    run(check())
+    assert seen == ["Bearer key-a"], seen
+
+
+def test_ledger_records_each_provider_attempt_not_just_the_last():
+    def handler(request):
+        if request.headers["Authorization"] == "Bearer key-a":
+            return response(request, 429, {"success": False}, {"Retry-After": "1"})
+        return response(request)
+
+    async def check():
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "usage.jsonl"
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                instance = controls(
+                    tmp,
+                    [("first@example.test", "key-a"), ("second@example.test", "key-b")],
+                    usage_path=ledger,
+                )
+                assert (
+                    await instance.request(client, "/v2/search", {"query": "q"}, timeout=2)
+                ).status_code == 200
+            lines = [json.loads(line) for line in ledger.read_text().splitlines()]
+            assert [(line["label"], line["status"]) for line in lines] == [
+                ("first@example.test", 429),
+                ("second@example.test", 200),
+            ], lines
+
+    run(check())
+
+
+def test_malformed_job_owner_timestamp_does_not_fail_a_billable_crawl():
+    def handler(request):
+        return response(request, body={"success": True, "id": "job-3", "data": []})
+
+    async def check():
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = controls(tmp, [("first@example.test", "key-a")])
+            instance._write_state(
+                {
+                    "budgets": {},
+                    "job_owners": {
+                        "old": {"budget": instance._budgets[0].id, "at": "yesterday"}
+                    },
+                }
+            )
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                result = await instance.request(
+                    client, "/v2/crawl", {"url": "https://example.org", "limit": 1}, timeout=1
+                )
+                assert result.status_code == 200
+            owners = instance._read_state()["job_owners"]
+            assert owners["/v2/crawl/job-3"]["budget"] == instance._budgets[0].id, owners
+
+    run(check())
+
+
+def test_a_later_429_does_not_downgrade_a_stronger_guard():
+    group = {
+        "blocked": "team_exhausted",
+        "next_check": time.time() + 900,
+        "blocked_for": 900,
+    }
+    fc.FirecrawlControls._block(group, "rate_limited", None, retry=30)
+    assert group["blocked"] == "team_exhausted", group
+    assert group["blocked_for"] == 900, group
+    assert not fc.FirecrawlControls._block_is_not_newer(
+        {"next_check": 100.0, "blocked_for": 10.0}, 85.0
+    )
+    assert fc.FirecrawlControls._block_is_not_newer(
+        {"next_check": 100.0, "blocked_for": 10.0}, 95.0
+    )
+
+
+def test_status_transport_error_on_a_foreign_key_does_not_stop_the_scan():
+    calls = []
+
+    def handler(request):
+        key = request.headers["Authorization"]
+        calls.append(key)
+        if key == "Bearer key-one":
+            raise httpx.ConnectError("reset", request=request)
+        return response(request, body={"success": True, "status": "completed"})
+
+    async def check():
+        with tempfile.TemporaryDirectory() as tmp:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                instance = controls(
+                    tmp, [("first@example.test", "key-one"), ("second@example.test", "key-two")]
+                )
+                result = await instance.status(client, "/v2/crawl/job-8", timeout=1)
+                assert result.status_code == 200, result.status_code
+
+    run(check())
+    assert calls == ["Bearer key-one", "Bearer key-two"], calls
+
+
+def test_status_foreign_5xx_does_not_mask_the_owner_404():
+    calls = []
+
+    def handler(request):
+        key = request.headers["Authorization"]
+        calls.append((request.url.path, key))
+        if request.url.path == "/v2/crawl":
+            return response(request, body={"success": True, "id": "job-4", "data": []})
+        if key == "Bearer key-one":
+            return response(request, status=404, body={"success": False})
+        return response(request, status=500, body={"success": False})
+
+    async def check():
+        with tempfile.TemporaryDirectory() as tmp:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                instance = controls(
+                    tmp, [("first@example.test", "key-one"), ("second@example.test", "key-two")]
+                )
+                assert (
+                    await instance.request(
+                        client, "/v2/crawl", {"url": "https://example.org", "limit": 1}, timeout=1
+                    )
+                ).status_code == 200
+                calls.clear()
+                result = await instance.status(client, "/v2/crawl/job-4", timeout=1)
+                assert result.status_code == 404, result.status_code
+
+    run(check())
+    assert calls == [
+        ("/v2/crawl/job-4", "Bearer key-one"),
+        ("/v2/crawl/job-4", "Bearer key-two"),
+    ], calls
+
+
+def test_usage_scan_has_no_size_cap_once_a_today_entry_is_seen():
+    today = datetime.now(timezone.utc).date().isoformat()
+    with tempfile.TemporaryDirectory() as tmp:
+        ledger = Path(tmp) / "usage.jsonl"
+        ledger.write_text(
+            "".join(
+                json.dumps(
+                    {
+                        "ts": f"{today}T01:00:00Z",
+                        "endpoint": "/v2/search",
+                        "status": 200,
+                        "credits": 1,
+                    }
+                )
+                + "\n"
+                for _ in range(200)
+            )
+        )
+        instance = controls(tmp, [("first@example.test", "key-a")], usage_path=ledger)
+        with patch.object(fc, "USAGE_SCAN_CHUNK_BYTES", 64), patch.object(
+            fc, "USAGE_SCAN_MAX_BYTES", 128
+        ):
+            summary = instance.usage_summary()
+        assert summary["requests"] == 200, summary
 
 
 def demo():

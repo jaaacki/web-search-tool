@@ -1,6 +1,7 @@
 """Packaged API compatibility checks for the retained dependency upgrade."""
 
 from fastapi.testclient import TestClient
+import httpx
 
 import app
 
@@ -202,6 +203,30 @@ def check_free_surface_contract(client):
     assert bounded[0].extras["omitted"] == ["images"], bounded[0].extras
 
 
+def check_job_key_auth_error_stays_retryable():
+    request = httpx.Request("GET", "https://api.firecrawl.dev/v2/crawl/job-1")
+    try:
+        app._raise_firecrawl_http(httpx.Response(401, request=request), job=True)
+    except app.AppError as exc:
+        assert (exc.status_code, exc.code, exc.retryable) == (
+            503,
+            "upstream_unavailable",
+            True,
+        ), vars(exc)
+    else:
+        raise AssertionError("job 401 was not converted")
+    try:
+        app._raise_firecrawl_http(httpx.Response(401, request=request))
+    except app.AppError as exc:
+        assert (exc.status_code, exc.code, exc.retryable) == (
+            503,
+            "firecrawl_not_configured",
+            False,
+        ), vars(exc)
+    else:
+        raise AssertionError("request 401 was not converted")
+
+
 def demo():
     app.WEBSEARCH_API_KEY = "dependency-contract-test-key"
     with TestClient(app.app) as client:
@@ -209,6 +234,7 @@ def demo():
         check_get_defaults_and_openapi_surfaces(client)
         check_request_id_and_search_filter_contract(client)
         check_free_surface_contract(client)
+    check_job_key_auth_error_stays_retryable()
     print("API dependency contracts: ok")
 
 
