@@ -40,7 +40,7 @@ RATE_WINDOW_SECONDS = 60.0
 # (the longest provider timeout is 45 s) but expire within a few minutes.
 MAX_LEASE_SECONDS = 180.0
 JOB_START_ENDPOINTS = ("/v2/crawl", "/v2/batch/scrape")
-JOB_OWNER_TTL_SECONDS = 3600.0
+JOB_OWNER_TTL_SECONDS = 86_400.0
 MAX_JOB_OWNERS = 500
 JOB_PATH_RE = re.compile(r"/v2/(batch/scrape|crawl)/([A-Za-z0-9_-]{1,200})(?:[/?#]|$)")
 # Firecrawl status pages are chunked at ~10 MB and formats such as screenshot
@@ -563,21 +563,22 @@ class FirecrawlControls:
         """Reserve the least-loaded healthy key, waiting only when every key is busy."""
         loop = asyncio.get_running_loop()
         while True:
-            now = time.monotonic()
-            remaining = deadline - loop.time()
-            if remaining <= 0:
+            if deadline - loop.time() <= 0:
                 raise FirecrawlUnavailable(None, "request_timeout", 1.0, True)
             fd = await self._acquire_lock(deadline)
             wait_seconds: float | None = None
             capacity_limited = False
             blocked: list[FirecrawlUnavailable] = []
             try:
+                now = time.time()
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise FirecrawlUnavailable(None, "request_timeout", 1.0, True)
                 state = self._read_state()
-                now_wall = time.time()
                 candidates: list[tuple[int, float, int, _Budget, bool]] = []
                 for position, budget in enumerate(self._budgets):
                     group = self._group_state(state, budget.id)
-                    self._prune_group(group, now, now_wall)
+                    self._prune_group(group, now)
                     reason = group.get("blocked")
                     recheck = False
                     if reason:
@@ -597,7 +598,7 @@ class FirecrawlControls:
                     rate = group.get("rate")
                     if isinstance(rate, list) and len(rate) >= self._rpm:
                         wait_seconds = _earliest(
-                            wait_seconds, rate[0] + self._rate_window - now_wall
+                            wait_seconds, rate[0] + self._rate_window - now
                         )
                         continue
                     candidates.append(
@@ -619,13 +620,20 @@ class FirecrawlControls:
                     group.setdefault("leases", []).append(
                         {"id": lease_id, "expires": expires}
                     )
-                    group.setdefault("rate", []).append(now_wall)
-                    group["last_used"] = now_wall
+                    group.setdefault("rate", []).append(now)
+                    group["last_used"] = now
                     self._write_state(state)
                     return _Lease(budget, lease_id, recheck)
                 if blocked and len(blocked) == len(self._budgets):
                     if wait_seconds is None or wait_seconds >= remaining:
-                        raise blocked[-1]
+                        error = blocked[-1]
+                        if error.category == "rate_limited" and wait_seconds is not None:
+                            # The pool frees at the earliest cooldown, not at the
+                            # last configured key's cooldown.
+                            error = FirecrawlUnavailable(
+                                429, "rate_limited", max(1.0, wait_seconds), True
+                            )
+                        raise error
             finally:
                 self._release_lock(fd)
             wait = remaining if wait_seconds is None else wait_seconds
@@ -651,7 +659,7 @@ class FirecrawlControls:
             402, "key_cap_or_ambiguous", max(1.0, min(retry_after, USAGE_RECHECK_SECONDS)), True
         )
 
-    def _prune_group(self, group: dict[str, Any], now: float, now_wall: float) -> None:
+    def _prune_group(self, group: dict[str, Any], now: float) -> None:
         leases = group.get("leases")
         if isinstance(leases, list):
             live = [
@@ -670,8 +678,7 @@ class FirecrawlControls:
             live_events = [
                 stamp
                 for stamp in rate
-                if isinstance(stamp, (int, float))
-                and now_wall - stamp < self._rate_window
+                if isinstance(stamp, (int, float)) and now - stamp < self._rate_window
             ]
             if live_events:
                 group["rate"] = live_events
@@ -860,8 +867,9 @@ class FirecrawlControls:
     ) -> None:
         # Keep live leases, rate history, and recency: other callers may still be
         # in flight on this key, and blocking one key must not erase their slots.
+        # Wall-clock time, not monotonic: this file outlives a host reboot.
         group["blocked"] = reason
-        group["next_check"] = time.monotonic() + retry
+        group["next_check"] = time.time() + retry
         group["remaining"] = usage.get("remaining") if usage else None
         group["billing_period_end"] = usage.get("period_end") if usage else None
 
@@ -875,6 +883,7 @@ class FirecrawlControls:
         except OSError as exc:
             raise FirecrawlUnavailable(None, "control_state_error", None, False) from exc
         try:
+            waited = 0.0
             while True:
                 try:
                     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -883,17 +892,31 @@ class FirecrawlControls:
                     remaining = deadline - asyncio.get_running_loop().time()
                     if remaining <= 0:
                         raise FirecrawlUnavailable(None, "team_concurrency", 1.0, True)
-                    await asyncio.sleep(min(0.05, remaining))
+                    # Short critical sections: poll quickly at first instead of
+                    # adding 50 ms to every admission under contention.
+                    delay = 0.001 if waited < 0.05 else 0.05
+                    await asyncio.sleep(min(delay, remaining))
+                    waited += delay
         except BaseException:
-            os.close(fd)
+            try:
+                os.close(fd)
+            except OSError:
+                pass
             raise
 
     @staticmethod
     def _release_lock(fd: int) -> None:
+        # Closing the descriptor releases the flock anyway; a release error must
+        # never turn a successful, already-billed provider response into a 500.
         try:
             fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
         finally:
-            os.close(fd)
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
     def _read_state(self) -> dict[str, Any]:
         try:
@@ -904,20 +927,28 @@ class FirecrawlControls:
             raise FirecrawlUnavailable(None, "control_state_error", None, False) from exc
         try:
             with os.fdopen(fd, "r", encoding="utf-8") as state_file:
-                state = json.load(state_file)
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                try:
+                    state = json.load(state_file)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    # The file is disposable and the next write rebuilds it. A
+                    # damaged guard must not take Firecrawl down with it.
+                    logger.warning("firecrawl control state is unreadable; rebuilding it")
+                    return {}
+        except OSError as exc:
             raise FirecrawlUnavailable(None, "control_state_error", None, False) from exc
         if not isinstance(state, dict):
-            raise FirecrawlUnavailable(None, "control_state_error", None, False)
+            logger.warning("firecrawl control state is not an object; rebuilding it")
+            return {}
         groups = state.get("budgets", {})
         if not isinstance(groups, dict):
-            raise FirecrawlUnavailable(None, "control_state_error", None, False)
+            logger.warning("firecrawl control state has invalid budgets; rebuilding it")
+            return {}
         # Discard removed credentials and pre-pool operator labels, never reuse their guards.
         cleaned = {
             "budgets": {
                 budget.id: groups[budget.id]
                 for budget in self._budgets
-                if budget.id in groups
+                if isinstance(groups.get(budget.id), dict)
             }
         }
         jobs = state.get("jobs")
@@ -964,12 +995,20 @@ class FirecrawlControls:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         last = None
+        owner_response = None
         budgets, pinned = self._ordered_budgets(path)
+
+        def fallback() -> httpx.Response | None:
+            # A foreign key's 404 must not mask the owning key's real error.
+            if pinned and owner_response is not None:
+                return owner_response
+            return last
+
         for index, budget in enumerate(budgets):
             remaining = deadline - loop.time()
             if remaining <= 0:
-                if last is not None:
-                    return last
+                if fallback() is not None:
+                    return fallback()
                 raise FirecrawlUnavailable(None, "transport_timeout", 1.0, True)
             key = budget.keys[0]
             try:
@@ -981,18 +1020,26 @@ class FirecrawlControls:
                     timeout=remaining,
                 )
             except FirecrawlUnavailable as exc:
-                if exc.category == "transport_timeout" and last is not None:
-                    return last
+                if exc.category == "transport_timeout" and fallback() is not None:
+                    return fallback()
                 raise
             if response.status_code == 429 and pinned and index == 0:
                 # Only the owning key can read this job; a 404 from another key
                 # would misreport a throttled poll as a missing job.
                 return response
-            if response.status_code in (401, 402, 403, 404, 429) and index < len(budgets) - 1:
+            if response.status_code in (401, 402, 403, 404, 429):
                 last = response
-                continue
+                if pinned and index == 0:
+                    owner_response = response
+                if index < len(budgets) - 1:
+                    continue
+                ending = fallback()
+                return ending if ending is not None else response
             return response
-        return last
+        ending = fallback()
+        if ending is None:
+            raise FirecrawlUnavailable(None, "transport_timeout", 1.0, True)
+        return ending
 
     async def record_job_credits(self, endpoint: str, job_id: str, credits: Any) -> None:
         """Record a completed job's credits once, keyed by job id.

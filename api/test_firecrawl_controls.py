@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import tempfile
 import time
 from datetime import datetime, timezone
@@ -442,14 +443,14 @@ def test_invalid_auth_fails_over_with_shared_cooldown_and_same_key_recovery():
                         assert result.status_code == 200
                     state = instance._read_state()
                     assert state["budgets"][instance._budgets[0].id]["blocked"] == "invalid_auth", state
-                    state["budgets"][instance._budgets[0].id]["next_check"] = time.monotonic() - 1
+                    state["budgets"][instance._budgets[0].id]["next_check"] = time.time() - 1
                     instance._write_state(state)
                     # Still invalid: one same-key attempt re-blocks, then callers skip it again.
                     for _ in range(2):
                         assert (await instance.request(client, endpoint, payload, timeout=2)).status_code == 200
                     state = instance._read_state()
-                    assert state["budgets"][instance._budgets[0].id]["next_check"] > time.monotonic(), state
-                    state["budgets"][instance._budgets[0].id]["next_check"] = time.monotonic() - 1
+                    assert state["budgets"][instance._budgets[0].id]["next_check"] > time.time(), state
+                    state["budgets"][instance._budgets[0].id]["next_check"] = time.time() - 1
                     instance._write_state(state)
                     primary_status = 200
                     assert (await instance.request(client, endpoint, payload, timeout=2)).status_code == 200
@@ -637,7 +638,7 @@ def test_auth_recovery_does_not_fail_over_after_policy_or_provider_errors():
                     instance = controls(tmp, [("first@example.test", "primary"), ("secondary@example.test", "backup")])
                     assert (await instance.request(client, "/v2/search", {"query": "q"}, timeout=2)).status_code == 200
                     state = instance._read_state()
-                    state["budgets"][instance._budgets[0].id]["next_check"] = time.monotonic() - 1
+                    state["budgets"][instance._budgets[0].id]["next_check"] = time.time() - 1
                     instance._write_state(state)
                     failing[0] = True
                     for _ in range(2):
@@ -722,7 +723,7 @@ def test_positive_balance_blocks_during_cooldown_then_retries_same_key():
                     raise AssertionError("request bypassed the positive-balance cooldown")
 
                 state = instance._read_state()
-                state["budgets"][instance._budgets[0].id]["next_check"] = time.monotonic() - 1
+                state["budgets"][instance._budgets[0].id]["next_check"] = time.time() - 1
                 instance._write_state(state)
                 result = await instance.request(client, "/v2/search", {"query": "q"}, timeout=2)
                 assert result.status_code == 200, result.status_code
@@ -813,7 +814,7 @@ def test_top_up_recovers_exhausted_budget():
                     else:
                         raise AssertionError("zero-credit team was not blocked")
                 state = instance._read_state()
-                state["budgets"][instance._budgets[0].id]["next_check"] = time.monotonic() - 1
+                state["budgets"][instance._budgets[0].id]["next_check"] = time.time() - 1
                 instance._write_state(state)
                 result = await instance.request(client, "/v2/search", {"query": "q"}, timeout=2)
                 assert result.status_code == 200
@@ -1240,10 +1241,10 @@ def test_expired_leases_do_not_hold_a_key_slot():
                 {
                     "budgets": {
                         instance._budgets[0].id: {
-                            "leases": [{"id": "dead", "expires": time.monotonic() - 1}]
+                            "leases": [{"id": "dead", "expires": time.time() - 1}]
                         },
                         instance._budgets[1].id: {
-                            "leases": [{"id": "live", "expires": time.monotonic() + 60}]
+                            "leases": [{"id": "live", "expires": time.time() + 60}]
                         },
                     }
                 }
@@ -1251,6 +1252,60 @@ def test_expired_leases_do_not_hold_a_key_slot():
             async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
                 result = await instance.request(client, "/v2/search", {"query": "q"}, timeout=1)
                 assert result.status_code == 200
+
+    run(check())
+    assert seen == ["Bearer key-a"], seen
+
+
+def test_state_from_before_a_host_reboot_does_not_hold_slots():
+    seen = []
+
+    def handler(request):
+        if request.url.path == fc.CREDIT_USAGE_PATH:
+            return response(request, body={"success": True, "data": {"remainingCredits": 5}})
+        seen.append(request.headers["Authorization"])
+        return response(request)
+
+    async def check():
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = controls(tmp, [("first@example.test", "key-a")], concurrency=1)
+            # A previous boot's monotonic clock is far below wall-clock time.
+            instance._write_state(
+                {
+                    "budgets": {
+                        instance._budgets[0].id: {
+                            "leases": [{"id": "old", "expires": 5_000_000.0}],
+                            "blocked": "team_exhausted",
+                            "next_check": 5_000_000.0,
+                        }
+                    }
+                }
+            )
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                result = await instance.request(client, "/v2/search", {"query": "q"}, timeout=1)
+                assert result.status_code == 200
+
+    run(check())
+    assert seen == ["Bearer key-a"], seen
+
+
+def test_corrupt_control_state_is_rebuilt_instead_of_blocking_firecrawl():
+    seen = []
+
+    def handler(request):
+        seen.append(request.headers["Authorization"])
+        return response(request)
+
+    async def check():
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = controls(tmp, [("first@example.test", "key-a")])
+            instance._state_path.write_text("{not json")
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                with patch.object(fc, "logger") as logs:
+                    result = await instance.request(client, "/v2/search", {"query": "q"}, timeout=1)
+                    assert result.status_code == 200
+                    assert "unreadable" in str(logs.mock_calls), logs.mock_calls
+            assert isinstance(json.loads(instance._state_path.read_text()), dict)
 
     run(check())
     assert seen == ["Bearer key-a"], seen
@@ -1377,6 +1432,75 @@ def test_job_start_records_its_key_and_status_uses_it_first():
 
     run(check())
     assert calls == [("/v2/crawl/job-7", "Bearer key-three")], calls
+
+
+def test_status_keeps_the_owner_error_when_foreign_keys_only_see_404():
+    calls = []
+
+    def handler(request):
+        key = request.headers["Authorization"]
+        calls.append((request.url.path, key))
+        if request.url.path == "/v2/crawl":
+            return response(request, body={"success": True, "id": "job-5", "data": []})
+        if key == "Bearer key-one":
+            return response(request, status=401, body={"success": False})
+        return response(request, status=404, body={"success": False})
+
+    async def check():
+        with tempfile.TemporaryDirectory() as tmp:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                instance = controls(
+                    tmp, [("first@example.test", "key-one"), ("second@example.test", "key-two")]
+                )
+                assert (
+                    await instance.request(
+                        client, "/v2/crawl", {"url": "https://example.org", "limit": 1}, timeout=1
+                    )
+                ).status_code == 200
+                calls.clear()
+                result = await instance.status(client, "/v2/crawl/job-5", timeout=1)
+                assert result.status_code == 401, result.status_code
+
+    run(check())
+    assert calls == [
+        ("/v2/crawl/job-5", "Bearer key-one"),
+        ("/v2/crawl/job-5", "Bearer key-two"),
+    ], calls
+
+
+def test_rate_limited_pool_reports_the_earliest_cooldown():
+    def handler(request):
+        key = request.headers["Authorization"]
+        delay = "5" if key == "Bearer key-a" else "30"
+        return response(request, 429, {"success": False}, {"Retry-After": delay})
+
+    async def check():
+        with tempfile.TemporaryDirectory() as tmp:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                try:
+                    await controls(
+                        tmp, [("first@example.test", "key-a"), ("second@example.test", "key-b")]
+                    ).request(client, "/v2/search", {"query": "q"}, timeout=2)
+                except fc.FirecrawlUnavailable as exc:
+                    assert exc.category == "rate_limited", exc.category
+                    assert 4.9 <= exc.retry_after <= 6, exc.retry_after
+                else:
+                    raise AssertionError("fully rate-limited pool returned success")
+
+    run(check())
+
+
+def test_release_lock_never_raises_or_leaks_the_descriptor():
+    with tempfile.TemporaryDirectory() as tmp:
+        fd = os.open(Path(tmp) / "lock", os.O_CREAT | os.O_RDWR, 0o600)
+        with patch.object(fc.fcntl, "flock", side_effect=OSError("release failed")):
+            fc.FirecrawlControls._release_lock(fd)
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        else:
+            raise AssertionError("release lock leaked the descriptor")
 
 
 def test_status_returns_owner_throttle_instead_of_a_foreign_404():

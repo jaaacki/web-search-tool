@@ -328,7 +328,9 @@ async def get_client() -> httpx.AsyncClient:
                 _shared_client = httpx.AsyncClient(
                     timeout=60,
                     follow_redirects=False,
-                    limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
+                    # The Firecrawl scheduler admits up to 2 calls per key; keep
+                    # the pool above that ceiling so it never becomes the limit.
+                    limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
                 )
     return _shared_client
 
