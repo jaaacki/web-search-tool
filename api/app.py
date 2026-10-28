@@ -3188,6 +3188,17 @@ def _raise_firecrawl_http(response: httpx.Response, *, job: bool = False) -> Non
     if job and response.status_code == 404:
         raise AppError(404, "job_not_found", "Crawl job not found", {"provider": "firecrawl"}, retryable=False)
     if response.status_code == 401:
+        if job:
+            # The key that started this job is invalid, but the pool may still
+            # be healthy; a job poll must not look like a global config error.
+            raise AppError(
+                503,
+                "upstream_unavailable",
+                "Firecrawl rejected the key that owns this job",
+                {"provider": "firecrawl", "status": 401},
+                retryable=True,
+                retry_after=OUTAGE_RETRY_AFTER,
+            )
         raise AppError(
             503,
             "firecrawl_not_configured",
